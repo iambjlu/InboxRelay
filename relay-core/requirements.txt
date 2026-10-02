@@ -1,0 +1,15 @@
+# relay-core/requirements.txt
+python-telegram-bot>=21.0,<23
+discord.py>=2.4,<3
+ijson>=3.2
+openai>=1.40
+trafilatura>=1.12
+lxml_html_clean>=0.4   # 新版 lxml 把 html.clean 拆出去了，trafilatura 需要
+python-docx>=1.1
+openpyxl>=3.1
+python-pptx>=0.6.23
+defusedxml>=0.7
+charset-normalizer>=3.3
+pypdf>=4.0
+pypdfium2>=4.20
+psutil>=5.9
