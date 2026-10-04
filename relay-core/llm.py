@@ -10,6 +10,7 @@ import re
 from openai import AsyncOpenAI
 
 import prompts
+from mdtable import tables_to_bullets
 
 log = logging.getLogger("llm")
 
@@ -67,9 +68,10 @@ class LLM:
         self._interactive_waiting = 0             # 有 AI 對話在等 → 背景工作先讓
 
     def _system(self, use_memory: bool) -> str:
+        base = prompts.get("GUARD") + "\n" + prompts.FORMAT_RULE
         if use_memory and self.memory.strip():
-            return prompts.get("GUARD") + prompts.render("MEMORY_WRAP", memory=self.memory.strip())
-        return prompts.get("GUARD")
+            return base + prompts.render("MEMORY_WRAP", memory=self.memory.strip())
+        return base
 
     async def ping(self) -> list[str]:
         models = await self.client.models.list()
@@ -107,7 +109,7 @@ class LLM:
                 text = resp.choices[0].message.content or ""
             else:
                 text = await self._stream(kwargs, task, max_tokens)
-        return _THINK_RE.sub("", text).strip()
+        return tables_to_bullets(_THINK_RE.sub("", text).strip())
 
     async def chat_messages(self, messages: list[dict], max_tokens: int = 4000, thinking: bool = False,
                             temperature: float = 0.6, progress=None) -> tuple[str, dict]:
@@ -133,7 +135,7 @@ class LLM:
                     text = _THINK_RE.sub("", "".join(parts))
                     if "</think>" in text:
                         text = text.split("</think>", 1)[1]
-                    return text.strip(), {}
+                    return tables_to_bullets(text.strip()), {}
                 resp = await self.client.chat.completions.create(
                     model=self.model, messages=messages, max_tokens=max_tokens, temperature=temperature,
                     extra_body={"chat_template_kwargs": {"enable_thinking": thinking}})
@@ -151,7 +153,7 @@ class LLM:
                 v = getattr(u, k, None)
                 if isinstance(v, int):
                     usage[k] = v
-        return text.strip(), usage
+        return tables_to_bullets(text.strip()), usage
 
     async def _stream(self, kwargs: dict, task, max_tokens: int) -> str:
         """串流接收，邊收邊回報進度（已產生的 token ÷ 這類呼叫平均長度）。"""
