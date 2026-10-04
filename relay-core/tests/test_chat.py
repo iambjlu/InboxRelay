@@ -181,3 +181,79 @@ class TitleTest(unittest.TestCase):
         self.assertEqual(chat.clean_title("標題：「排查網路問題。」\n其他"), "排查網路問題")
         self.assertEqual(chat.clean_title(""), "")
         self.assertLessEqual(len(chat.clean_title("字" * 80)), 30)
+
+
+class BranchTest(unittest.TestCase):
+    def test_branch_copies_visibly_but_llm_reads_only_compacted_part(self):
+        async def go():
+            cfg = N(ch_chat=10, ch_chat_prompt=11, tz="Asia/Taipei", llm_context=131072, chat_compact_pct=90)
+            llm = FakeLLM()
+            c = ChatChannel(cfg, N(client=N(user=N(id=BOT))), llm, {ME})
+            c.memory = N(content="")
+            src_hist = [msg(101, ME, "很久以前的問題"), msg(102, BOT, "很久以前的回答"),
+                        msg(103, BOT, "🗜️ **對話摘要（手動）**\n- 目標：做 InboxRelay"),
+                        msg(104, ME, "接著做 OCR", [Att(7, "x.png", "image/png", b"png", 3)]),
+                        msg(105, BOT, "好\n-# 🧮 上下文 3,000／131,072 tokens（2%）"),
+                        msg(106, BOT, "-# 💬 控制訊息")]
+            for m in src_hist:
+                m.author.display_name = "我"
+
+            class Src:
+                id = 100
+                parent_id = 10
+
+                async def history(self, limit=None, oldest_first=True):
+                    for h in src_hist:
+                        yield h
+
+            posted = []
+
+            class Dst:
+                id = 200
+                parent_id = 10
+                guild = N(filesize_limit=10 * 1024 * 1024)
+
+                async def send(self, content=None, files=(), view=None):
+                    m = msg(300 + len(posted), BOT, content)
+                    m.attachments = [Att(900 + len(posted), f.filename, "image/png", b"png", 3) for f in files]
+                    posted.append(m)
+
+                async def history(self, limit=None, oldest_first=True):
+                    for h in posted:
+                        yield h
+            dst = Dst()
+            for h in await c._collect(Src()):
+                await c._copy_message(dst, h)
+            self.assertEqual(len(posted), 5)                                   # 控制訊息不搬
+            self.assertTrue(posted[0].content.startswith("👤 **我**\n很久以前的問題"))   # 使用者發言帶標記
+            self.assertEqual(len(posted[3].attachments), 1)                    # 圖片一起搬
+            new = msg(400, ME, "再問一題")
+            await c.answer(dst, new)
+            messages, _ = llm.got
+            joined = str(messages)
+            self.assertNotIn("很久以前", joined)                                 # LLM 只讀摘要之後
+            self.assertIn("目標：做 InboxRelay", messages[0]["content"])
+            self.assertEqual([m["role"] for m in messages[1:]], ["user", "assistant", "user"])
+            self.assertEqual(messages[1]["content"][0]["text"].split("\n")[0], "接著做 OCR")
+        asyncio.run(go())
+
+    def test_no_compact_llm_reads_everything(self):
+        async def go():
+            cfg = N(ch_chat=10, ch_chat_prompt=11, tz="Asia/Taipei", llm_context=131072, chat_compact_pct=90)
+            llm = FakeLLM()
+            c = ChatChannel(cfg, N(client=N(user=N(id=BOT))), llm, {ME})
+            c.memory = N(content="")
+            posted = [msg(1, BOT, "👤 **我**\n你好"), msg(2, BOT, "嗨")]
+
+            class Dst:
+                id = 200
+                parent_id = 10
+
+                async def history(self, limit=None, oldest_first=True):
+                    for h in posted:
+                        yield h
+            await c.answer(Dst(), msg(3, ME, "繼續"))
+            messages, _ = llm.got
+            self.assertEqual([m["role"] for m in messages[1:]], ["user", "assistant", "user"])
+            self.assertIn("你好", str(messages))
+        asyncio.run(go())

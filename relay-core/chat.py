@@ -16,6 +16,9 @@
   使用者明確說「記住／以後…」→ 馬上升級；其他的等對話安靜 IDLE_UPGRADE_SEC 秒後一次整理。沒有值得記的就不升級。
 - 「➕ 新對話」按鈕：頻道裡有一則釘選的按鈕訊息，一鍵開新對話串（名稱先用「日期_亂碼」）；第一輪對話後由 AI 依內容
   把名稱改成「日期_標題」。從主頻道直接發訊息開的對話串，也會在第一輪後用 AI 重新命名（自己改過名字的不會被蓋掉）。
+- 按「新對話」開出來的對話串（以及分支出來的）最上面有一則控制訊息，三顆按鈕：➕ 新增聊天、🔀 從這裡分支、🗑️ 刪除此對話。
+  分支＝開新對話串並把目前的對話搬過去（使用者看到完整內容；曾經壓縮過的話，LLM 仍只讀最後一次摘要之後的部分）；
+  刪除會先發一則確認／取消訊息：確認＝刪掉整個對話串，取消＝只刪掉那則確認訊息。
 - 互動功能：不受「外部 LLM」排程限制，而且優先於背景工作。
 - 每則回覆最下面用小字顯示用了多少 context（端點回報的實際 token 數）。
 - 歷史依 context window（設定 LLM_CONTEXT）分配，超過才省略中間較舊的；用到 CHAT_COMPACT_PCT% 時自動壓縮：
@@ -26,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import logging
 import random
 import re
@@ -136,6 +140,73 @@ def clean_title(raw: str) -> str:
     t = re.sub(r"^(標題|Title)\s*[:：]\s*", "", t.strip(), flags=re.I).strip(" \"'「」『』“”`*#")
     t = re.sub(r"[\\/]", "", t).rstrip("。.!！?？,，;；:：")
     return t[:30]
+
+
+USER_HEAD = "👤 **"            # 分支搬移時，使用者的發言由 bot 重貼；開頭標記讓 LLM 仍把它當成使用者說的話
+
+
+def is_copied_user(content: str) -> bool:
+    return (content or "").startswith(USER_HEAD)
+
+
+def copied_user_text(content: str) -> str:
+    return content.split("\n", 1)[1] if "\n" in content else ""
+
+
+class ThreadControlView(discord.ui.View):
+    """對話串裡的控制訊息：新增聊天／從這裡分支／刪除此對話（持久化，bot 重啟後仍有效）。"""
+    def __init__(self, chat: "ChatChannel") -> None:
+        super().__init__(timeout=None)
+        self.chat = chat
+
+    @discord.ui.button(label="新增聊天", emoji="➕", style=discord.ButtonStyle.primary, custom_id="inboxrelay:t_new")
+    async def t_new(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.chat.open_thread(interaction)
+
+    @discord.ui.button(label="從這裡分支", emoji="🔀", style=discord.ButtonStyle.secondary,
+                       custom_id="inboxrelay:t_branch")
+    async def t_branch(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.chat.branch_thread(interaction)
+
+    @discord.ui.button(label="刪除此對話", emoji="🗑️", style=discord.ButtonStyle.danger, custom_id="inboxrelay:t_delete")
+    async def t_delete(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.chat.ask_delete(interaction)
+
+
+class ConfirmDeleteView(discord.ui.View):
+    def __init__(self, chat: "ChatChannel", thread: discord.Thread, requester: int) -> None:
+        super().__init__(timeout=120)
+        self.chat, self.thread, self.requester = chat, thread, requester
+        self.message: discord.Message | None = None
+
+    async def _mine(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester:
+            await interaction.response.send_message("只有按下「刪除此對話」的人可以確認或取消。", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="確認刪除", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if await self._mine(interaction):
+            self.stop()
+            await self.chat.delete_thread(interaction, self.thread)
+
+    @discord.ui.button(label="取消", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if await self._mine(interaction):
+            self.stop()
+            await interaction.response.defer()
+            try:
+                await interaction.message.delete()          # type: ignore[union-attr]
+            except discord.HTTPException:
+                pass
+
+    async def on_timeout(self) -> None:
+        if self.message is not None:
+            try:
+                await self.message.delete()
+            except discord.HTTPException:
+                pass
 
 
 class NewChatView(discord.ui.View):
@@ -286,6 +357,7 @@ class ChatChannel:
         """頻道裡放一則（釘選的）「新對話」按鈕訊息；已經有就沿用。"""
         try:
             self.dc.client.add_view(NewChatView(self))
+            self.dc.client.add_view(ThreadControlView(self))
             ch = await self.dc.channel(self.channel_id)
             async for m in ch.history(limit=100):
                 if m.author.id == self.bot_id and m.content.startswith(BUTTON_MARK):
@@ -298,20 +370,135 @@ class ChatChannel:
         except Exception:
             log.warning("建立「新對話」按鈕失敗（仍可直接發訊息開對話）", exc_info=True)
 
+    def _is_chat_thread(self, ch) -> bool:
+        return isinstance(ch, discord.Thread) and ch.parent_id == self.channel_id
+
+    async def _send_controls(self, thread: discord.Thread, text: str) -> None:
+        await thread.send(f"{NOTE_PREFIX} {text}", view=ThreadControlView(self))
+
     async def open_thread(self, interaction: discord.Interaction) -> None:
         ch = interaction.channel
-        if getattr(ch, "id", None) != self.channel_id:
+        if self._is_chat_thread(ch) or getattr(ch, "id", None) == self.channel_id:
+            parent = await self.dc.channel(self.channel_id)
+        else:
             await interaction.response.send_message("這個按鈕只能在 AI 對話頻道使用。", ephemeral=True)
             return
         try:
-            thread = await ch.create_thread(name=placeholder_name(self._today()),
-                                            type=discord.ChannelType.public_thread, auto_archive_duration=10080)
+            thread = await parent.create_thread(name=placeholder_name(self._today()),  # type: ignore[attr-defined]
+                                                type=discord.ChannelType.public_thread, auto_archive_duration=10080)
         except discord.HTTPException as e:
             await interaction.response.send_message(f"⚠️ 開對話串失敗：{str(e)[:150]}", ephemeral=True)
             return
         self._auto.add(thread.id)
         await interaction.response.send_message(f"✅ 已開新對話：{thread.mention}", ephemeral=True)
-        await thread.send(f"{NOTE_PREFIX} 💬 直接在這裡發訊息就能開始聊；第一輪聊完會自動把對話串名稱改成「日期_標題」。")
+        await self._send_controls(thread, "💬 直接在這裡發訊息就能開始聊；第一輪聊完會自動把對話串名稱改成「日期_標題」。")
+
+    # ------------------------------------------------------------ 分支／刪除
+    async def _collect(self, thread: discord.Thread) -> list[discord.Message]:
+        """對話串裡算進對話的訊息（開頭那則＋整個對話串，不含 bot 的狀態訊息），依時間順序。"""
+        msgs: list[discord.Message] = []
+        starter = await self._starter(thread)
+        if starter is not None:
+            msgs.append(starter)
+        async for h in thread.history(limit=None, oldest_first=True):
+            if h.type not in (discord.MessageType.default, discord.MessageType.reply):
+                continue
+            if starter is not None and h.id == starter.id:
+                continue
+            if h.author.bot and (h.author.id != self.bot_id or h.content.startswith(NOTE_PREFIX)):
+                continue
+            msgs.append(h)
+        return msgs
+
+    async def _copy_message(self, dst: discord.Thread, h: discord.Message) -> bool:
+        """把一則訊息重貼到 dst；使用者的發言加上標記讓 LLM 仍當成使用者說的。回傳是否有貼。"""
+        if h.author.id == self.bot_id and not is_copied_user(h.content):
+            if not h.content.strip():
+                return False
+            await dst.send(h.content)                    # 回覆、對話摘要：原樣（含小字用量）
+            return True
+        if is_copied_user(h.content):                    # 分支再分支：已經是搬過的使用者發言
+            head, text = h.content.split("\n", 1)[0], copied_user_text(h.content)
+        else:
+            name = " ".join(h.author.display_name.replace("*", "").split())[:40] or "使用者"
+            head, text = f"{USER_HEAD}{name}**", h.clean_content.strip()
+        limit = getattr(dst.guild, "filesize_limit", 10 * 1024 * 1024) or 10 * 1024 * 1024
+        files, notes, total = [], [], 0
+        for a in h.attachments:
+            if len(files) >= 10 or total + a.size > limit:
+                notes.append(f"（附件 {a.filename} 太大或太多，沒有搬移）")
+                continue
+            total += a.size
+            files.append(discord.File(io.BytesIO(await a.read()), filename=a.filename))
+        body = "\n".join(x for x in [text, *notes] if x)
+        if not body and not files:
+            return False
+        chunks = daily.split_message(body, limit=1990 - len(head)) if body else [""]
+        for i, chunk in enumerate(chunks):                # 每一段都帶標記，才不會被當成 LLM 的回覆
+            await dst.send(f"{head}\n{chunk}" if chunk else head, files=files if i == 0 else [])
+        files.clear()
+        return True
+
+    async def branch_thread(self, interaction: discord.Interaction) -> None:
+        src = interaction.channel
+        if not self._is_chat_thread(src):
+            await interaction.response.send_message("這個按鈕只能在 AI 對話的對話串裡使用。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            parent = await self.dc.channel(self.channel_id)
+            dst = await parent.create_thread(name=f"🔀 {src.name}"[:100],  # type: ignore[attr-defined]
+                                             type=discord.ChannelType.public_thread, auto_archive_duration=10080)
+        except discord.HTTPException as e:
+            await interaction.edit_original_response(content=f"⚠️ 開對話串失敗：{str(e)[:150]}")
+            return
+        copied = 0
+        try:
+            async with self._locks.setdefault(src.id, asyncio.Lock()):      # 等這個對話串正在進行的回覆做完
+                async with self._locks.setdefault(dst.id, asyncio.Lock()):
+                    msgs = await self._collect(src)
+                    for i, h in enumerate(msgs, 1):
+                        if await self._copy_message(dst, h):
+                            copied += 1
+                        if i % 5 == 0:
+                            await interaction.edit_original_response(content=f"🔀 搬移中… {i}/{len(msgs)}")
+                    await self._send_controls(dst, f"🔀 已從「{src.name}」分支，搬移了 {copied} 則；直接在這裡接著聊。")
+        except Exception as e:
+            log.exception("分支對話串失敗")
+            await interaction.edit_original_response(content=f"⚠️ 分支到一半失敗：{type(e).__name__}：{str(e)[:150]}"
+                                                             f"（已搬 {copied} 則：{dst.mention}）")
+            return
+        await interaction.edit_original_response(content=f"✅ 已分支：{dst.mention}（搬移 {copied} 則）")
+
+    async def ask_delete(self, interaction: discord.Interaction) -> None:
+        thread = interaction.channel
+        if not self._is_chat_thread(thread):
+            await interaction.response.send_message("這個按鈕只能在 AI 對話的對話串裡使用。", ephemeral=True)
+            return
+        view = ConfirmDeleteView(self, thread, interaction.user.id)       # type: ignore[arg-type]
+        await interaction.response.send_message(
+            f"{NOTE_PREFIX} ⚠️ 確定要刪除這個對話串（{thread.name}）嗎？刪除後無法復原。", view=view)
+        view.message = await interaction.original_response()
+
+    async def delete_thread(self, interaction: discord.Interaction, thread: discord.Thread) -> None:
+        await interaction.response.defer()
+        try:
+            await thread.delete()                         # 對話串刪掉，確認訊息也一起消失
+        except discord.Forbidden:
+            await interaction.followup.send("⚠️ 刪不掉：機器人缺少「管理貼文（Manage Threads）」權限。", ephemeral=True)
+            try:
+                await interaction.message.delete()        # type: ignore[union-attr]
+            except discord.HTTPException:
+                pass
+            return
+        except discord.NotFound:
+            pass
+        except discord.HTTPException as e:
+            await interaction.followup.send(f"⚠️ 刪除失敗：{str(e)[:150]}", ephemeral=True)
+            return
+        for d in (self._locks, self._starters):
+            d.pop(thread.id, None)
+        self._auto.discard(thread.id)
 
     def _wants_title(self, thread: discord.Thread) -> bool:
         return (thread.id in self._auto or is_placeholder(thread.name)) and thread.id not in self._retitling
@@ -526,18 +713,7 @@ class ChatChannel:
 
     async def history(self, thread: discord.Thread) -> tuple[str, list[discord.Message]]:
         """回傳 (最近一次壓縮的摘要, 摘要之後的訊息)；沒壓縮過就是 ("", 開頭那則＋整個對話串)。"""
-        msgs: list[discord.Message] = []
-        starter = await self._starter(thread)
-        if starter is not None:
-            msgs.append(starter)
-        async for h in thread.history(limit=None, oldest_first=True):
-            if h.type not in (discord.MessageType.default, discord.MessageType.reply):
-                continue
-            if starter is not None and h.id == starter.id:
-                continue
-            if h.author.bot and (h.author.id != self.bot_id or h.content.startswith(NOTE_PREFIX)):
-                continue
-            msgs.append(h)
+        msgs = await self._collect(thread)
         # 找最後一組摘要（可能分成好幾則）
         idx = [i for i, h in enumerate(msgs) if h.author.id == self.bot_id and h.content.startswith(SUMMARY_HEAD)]
         if not idx:
@@ -549,6 +725,10 @@ class ChatChannel:
         summary = "\n".join(_strip_footer(msgs[i].content.split("\n", 1)[1] if "\n" in msgs[i].content else "")
                             for i in range(start, end + 1))
         return summary.strip(), msgs[end + 1:]
+
+    def _is_bot_turn(self, h: discord.Message) -> bool:
+        """bot 自己的回覆（分支搬移時由 bot 重貼的使用者發言不算）。"""
+        return h.author.id == self.bot_id and not is_copied_user(h.content)
 
     async def _doc_text(self, a) -> str | None:
         from enrich.document import Unsupported, extract_text, is_supported
@@ -597,7 +777,7 @@ class ChatChannel:
         image_ids: list[int] = []
         if self.llm.image_support:
             for h in reversed(msgs):
-                if h.author.id == self.bot_id:
+                if self._is_bot_turn(h):
                     continue
                 for a in reversed(h.attachments):
                     if _is_image(a) and a.size <= MAX_IMAGE_BYTES and len(image_ids) < MAX_IMAGES:
@@ -606,12 +786,12 @@ class ChatChannel:
         user_text = ""
         turns: list[dict] = []
         for h in msgs:
-            if h.author.id == self.bot_id:
+            if self._is_bot_turn(h):
                 body = _strip_footer(h.content)
                 if body.strip():
                     turns.append({"role": "assistant", "content": body})
                 continue
-            text = h.clean_content.strip()
+            text = copied_user_text(h.content).strip() if is_copied_user(h.content) else h.clean_content.strip()
             if h.id == latest_id and not dry:
                 if text.startswith(THINK_PREFIX):
                     thinking, text = True, text[len(THINK_PREFIX):].strip()
