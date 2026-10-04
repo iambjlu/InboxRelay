@@ -177,6 +177,8 @@ class TitleTest(unittest.TestCase):
     def test_placeholder_and_clean(self):
         n = chat.placeholder_name("2026-10-04")
         self.assertTrue(chat.is_placeholder(n))
+        self.assertRegex(n, r"^2026-10-04_.+色-.+-\d{4}$")
+        self.assertTrue(chat.is_placeholder("2026-10-04_k7x2"))              # 舊格式
         self.assertFalse(chat.is_placeholder("2026-10-04_排查網路問題"))
         self.assertEqual(chat.clean_title("標題：「排查網路問題。」\n其他"), "排查網路問題")
         self.assertEqual(chat.clean_title(""), "")

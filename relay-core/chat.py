@@ -14,7 +14,7 @@
 - 記憶自動升級（不算則數）：模型回答時順便判斷「這輪有沒有值得長期記住的事」（使用者要求記住、介紹背景、
   長期偏好、糾正回答方式、進行中的專案、糾正錯誤認知），有的話在回覆最後加一行「〔記憶〕…」（bot 會拿掉、不顯示）。
   使用者明確說「記住／以後…」→ 馬上升級；其他的等對話安靜 IDLE_UPGRADE_SEC 秒後一次整理。沒有值得記的就不升級。
-- 「➕ 新對話」按鈕：頻道裡有一則釘選的按鈕訊息，一鍵開新對話串（名稱先用「日期_亂碼」）；第一輪對話後由 AI 依內容
+- 「➕ 新對話」按鈕：頻道裡有一則釘選的按鈕訊息，一鍵開新對話串（名稱先用「日期_顏色-水果或動物-四位數字」）；第一輪對話後由 AI 依內容
   把名稱改成「日期_標題」。從主頻道直接發訊息開的對話串，也會在第一輪後用 AI 重新命名（自己改過名字的不會被蓋掉）。
 - 按「新對話」開出來的對話串（以及分支出來的）最上面有一則控制訊息，三顆按鈕：➕ 新增聊天、🔀 從這裡分支、🗑️ 刪除此對話。
   分支＝開新對話串並把目前的對話搬過去（使用者看到完整內容；曾經壓縮過的話，LLM 仍只讀最後一次摘要之後的部分）；
@@ -120,15 +120,17 @@ def _strip_footer(text: str) -> str:
 
 NEW_CHAT_ID = "inboxrelay:new_chat"
 BUTTON_MARK = "💬 **開新對話**"
-BUTTON_TEXT = f"{BUTTON_MARK}\n-# 按下面的按鈕開一個新的對話串（名稱第一輪聊完會自動換成「日期_標題」），或直接在這個頻道發訊息。"
-_PLACEHOLDER = re.compile(r"^\d{4}-\d{2}-\d{2}_[a-z0-9]{4}$")
-_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"
+BUTTON_TEXT = BUTTON_MARK
+_COLORS = ["紅色", "橙色", "黃色", "綠色", "藍色", "紫色", "粉色", "白色", "黑色", "灰色", "棕色", "金色", "銀色", "青色"]
+_THINGS = ["蘋果", "香蕉", "葡萄", "西瓜", "芒果", "草莓", "檸檬", "鳳梨", "柚子", "荔枝", "貓咪", "小狗", "兔子", "熊熊",
+           "小鹿", "狐狸", "企鵝", "海豚", "松鼠", "水獺", "貓頭鷹", "無尾熊"]
+_PLACEHOLDER = re.compile(r"^\d{4}-\d{2}-\d{2}_(?:(?:%s)-(?:%s)-\d{4}|[a-z0-9]{4})$" % ("|".join(_COLORS), "|".join(_THINGS)))
 TITLE_PROMPT = ("根據下面這段對話的開頭，取一個簡短的繁體中文標題（8～20 個字，不要標點符號結尾、不要引號、"
                 "不要加日期），只輸出標題本身。")
 
 
 def placeholder_name(day: str) -> str:
-    return f"{day}_{''.join(random.choice(_ALPHABET) for _ in range(4))}"
+    return f"{day}_{random.choice(_COLORS)}-{random.choice(_THINGS)}-{random.randint(0, 9999):04d}"
 
 
 def is_placeholder(name: str) -> bool:
@@ -361,6 +363,8 @@ class ChatChannel:
             ch = await self.dc.channel(self.channel_id)
             async for m in ch.history(limit=100):
                 if m.author.id == self.bot_id and m.content.startswith(BUTTON_MARK):
+                    if m.content != BUTTON_TEXT:
+                        await m.edit(content=BUTTON_TEXT)
                     return
             msg = await ch.send(BUTTON_TEXT, view=NewChatView(self))
             try:
@@ -391,7 +395,7 @@ class ChatChannel:
             return
         self._auto.add(thread.id)
         await interaction.response.send_message(f"✅ 已開新對話：{thread.mention}", ephemeral=True)
-        await self._send_controls(thread, "💬 直接在這裡發訊息就能開始聊；第一輪聊完會自動把對話串名稱改成「日期_標題」。")
+        await self._send_controls(thread, "💬")
 
     # ------------------------------------------------------------ 分支／刪除
     async def _collect(self, thread: discord.Thread) -> list[discord.Message]:
@@ -462,7 +466,7 @@ class ChatChannel:
                             copied += 1
                         if i % 5 == 0:
                             await interaction.edit_original_response(content=f"🔀 搬移中… {i}/{len(msgs)}")
-                    await self._send_controls(dst, f"🔀 已從「{src.name}」分支，搬移了 {copied} 則；直接在這裡接著聊。")
+                    await self._send_controls(dst, f"🔀 已從「{src.name}」分支（{copied} 則）")
         except Exception as e:
             log.exception("分支對話串失敗")
             await interaction.edit_original_response(content=f"⚠️ 分支到一半失敗：{type(e).__name__}：{str(e)[:150]}"
