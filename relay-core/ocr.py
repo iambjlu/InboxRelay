@@ -32,6 +32,8 @@ LEGACY_CUT = 900        # 舊版只存約 1000 字並以「…」結尾 → 重�
 TIMEOUT = 120
 MAX_TRIES = 3          # 同一張圖辨識失敗幾次才標「無法取得圖片」
 PACE_SEC = 0.4          # 每張圖之間稍微停一下，避免 Discord 圖片伺服器限流
+WRITE_AHEAD = 30        # 辨識可以領先 Discord 寫入幾張（寫入慢、辨識快；超過就等寫入追上來）
+WAIT_SEC = 1800         # AI 分析最多等這則的 OCR 多久（安全上限）
 _CARD = re.compile(r"(?<!\d)(?:\d[ -]?){12,18}\d(?!\d)")
 
 
@@ -154,13 +156,81 @@ class OcrWorker:
         self._fails: dict = {}                 # 紀錄 → 辨識失敗次數
         self._retry_keys: set = set()          # 標過「無法取得圖片」但要再試一次的紀錄
         self._backoff = 30.0
+        self._waiters: dict[str, list] = {}    # 鏡像連結 → 等這則辨識完的 Future（AI 分析要拿 OCR 當參考）
+        self._pending: set = set()             # 寫進 #關鍵字庫 還沒完成的工作（辨識不等寫入）
+        self._write_slots = asyncio.Semaphore(WRITE_AHEAD)
+        self.on_text = None                    # callable(entry)：辨識出文字、而且這則已經分析過 → 通知重新分析
 
     # ------------------------------------------------------------ 佇列
-    def submit(self, mirror_url: str) -> None:
-        if mirror_url and mirror_url not in self._queued:
-            self._queued.add(mirror_url)
-            self.queue.append(mirror_url)
-            self._wake.set()
+    def submit(self, mirror_url: str, front: bool = False) -> None:
+        if not mirror_url:
+            return
+        if mirror_url in self._queued:
+            if front and self.queue and self.queue[0] != mirror_url:
+                try:
+                    self.queue.remove(mirror_url)
+                except ValueError:
+                    return
+                self.queue.appendleft(mirror_url)
+            return
+        self._queued.add(mirror_url)
+        (self.queue.appendleft if front else self.queue.append)(mirror_url)
+        self._wake.set()
+
+    def pending_for(self, mirror_url: str) -> bool:
+        """這則鏡像還有圖片的文字沒辨識完（含要重試的）。"""
+        return any(needs_ocr(e.rec) or e.rec.key in self._retry_keys for e in self.index.by_mirror(mirror_url)
+                   if is_image_record(e.rec) or is_link_image_record(e.rec))
+
+    async def ensure(self, mirror_url: str, timeout: float = WAIT_SEC) -> None:
+        """AI 分析前呼叫：這則的圖片還沒辨識完就插隊先辨識，等辨識（含寫入）完成才回來。
+        本機 ANE 車道沒在跑（暫停、還沒到排程、App 還沒連上）就不等，直接分析。"""
+        import lanes
+        lane = lanes.get("ane")
+        if lane is None or lane.state != "running" or not self.pending_for(mirror_url):
+            return
+        fut = asyncio.get_running_loop().create_future()
+        self._waiters.setdefault(mirror_url, []).append(fut)
+        self.submit(mirror_url, front=True)
+        try:
+            await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError:
+            log.info("等圖片文字辨識逾時，先不用 OCR 做分析：%s", mirror_url)
+        finally:
+            ws = self._waiters.get(mirror_url, [])
+            if fut in ws:
+                ws.remove(fut)
+            if not ws:
+                self._waiters.pop(mirror_url, None)
+
+    def _release(self, mirror_url: str) -> None:
+        for fut in self._waiters.pop(mirror_url, []):
+            if not fut.done():
+                fut.set_result(None)
+
+    async def _write(self, key, **changes) -> None:
+        """把辨識結果寫進 #關鍵字庫：丟到背景去寫，辨識不用等 Discord（領先超過 WRITE_AHEAD 張才等）。"""
+        await self._write_slots.acquire()
+
+        async def job() -> None:
+            try:
+                await self.index.update(key, **changes)
+                e = self.index.get(key)
+                if e is not None and self.on_text is not None and useful(changes.get("ocr")) \
+                        and e.rec.enriched and not e.rec.enriched_ocr:
+                    self.on_text(e)                       # 先前分析時沒有 OCR → 補做
+            except Exception:
+                log.exception("寫入圖中文字失敗：TG#%s", key[1])
+            finally:
+                self._write_slots.release()
+
+        t = asyncio.get_running_loop().create_task(job())
+        self._pending.add(t)
+        t.add_done_callback(self._pending.discard)
+
+    async def flush(self, mirror_url: str | None = None) -> None:
+        if self._pending:
+            await asyncio.gather(*list(self._pending), return_exceptions=True)
 
     async def _clear_stale(self, entries) -> None:
         for e in entries:
@@ -211,11 +281,11 @@ class OcrWorker:
 
     @property
     def backlog(self) -> int:
-        return len(self.queue) + len(self.rewrite) + (1 if self._holding else 0)
+        return len(self.queue) + len(self.rewrite) + (1 if self._holding else 0) + len(self._pending)
 
     @property
     def drained(self) -> bool:
-        return not self.queue and not self.rewrite and not self._holding
+        return not self.queue and not self.rewrite and not self._holding and not self._pending
 
     def on_result(self, cmd: dict) -> None:
         fut = self._futures.pop(int(cmd.get("id", 0)), None)
@@ -257,6 +327,9 @@ class OcrWorker:
                     task = activity.start("圖片文字辨識（本機 ANE）")
                 task.set(done=done, total=done + 1 + len(self.queue))
                 ok = await self.process(mirror)
+                if ok:
+                    await self.flush()                       # 等寫入追上來，AI 分析才讀得到這則的 OCR
+                    self._release(mirror)
                 if not ok:                       # 暫時失敗（App 沒回應、下載被限流…）：放回去，等一下再試
                     self.queue.appendleft(mirror)
                     self._queued.add(mirror)
@@ -269,6 +342,7 @@ class OcrWorker:
                 task.set(done=done)
             except Exception:
                 log.exception("圖片文字辨識失敗：%s", mirror)
+                self._release(mirror)
             finally:
                 self._holding = False
 
@@ -322,7 +396,7 @@ class OcrWorker:
         for url in (e.rec.img or "").split():
             self._fails.pop((e.rec.key, url), None)
         text = "\n".join(texts) if texts else (NO_TEXT if got_any else NO_IMAGE)
-        await self.index.update(e.rec.key, ocr=text[:OCR_MAX])
+        await self._write(e.rec.key, ocr=text[:OCR_MAX])
         self.done_total += 1
         day = e.rec.date[:10]
         if texts and self.has_daily is not None and self.has_daily(day):
@@ -358,7 +432,7 @@ class OcrWorker:
                 self._retry_keys.discard(e.rec.key)
                 log.warning("%s：TG#%s %s", "鏡像已刪除" if msg is None else "對不到鏡像附件", e.rec.tg_msg, e.rec.filename)
                 if e.rec.ocr != NO_IMAGE:
-                    await self.index.update(e.rec.key, ocr=NO_IMAGE)
+                    await self._write(e.rec.key, ocr=NO_IMAGE)
                 continue
             await asyncio.sleep(PACE_SEC)
             rid = next(self._ids)
@@ -388,7 +462,7 @@ class OcrWorker:
             self._fails.pop(e.rec.key, None)
             if not res.get("error"):
                 text = clean(str(res.get("text", "")))
-            await self.index.update(e.rec.key, ocr=text)
+            await self._write(e.rec.key, ocr=text)
             self.done_total += 1
             day = e.rec.date[:10]
             if text not in MARKERS and self.has_daily is not None and self.has_daily(day):

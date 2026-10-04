@@ -365,6 +365,7 @@ async def run(check_only: bool) -> int:
                 FeedbackChannel(cfg, dc, llm, recapper, mem, editors, cfg.ch_notify)
                 log.info("通知頻道互動已啟用：%s", cfg.ch_notify)
         queue_backlog(cfg, relayer)
+        queue_ocr_redo(cfg, relayer)
         background.append(asyncio.create_task(poll_new_records(relayer)))
 
         async def heartbeat() -> None:
@@ -424,6 +425,9 @@ async def run(check_only: bool) -> int:
             server.shot = shot_worker
             if relayer.enricher is not None:
                 relayer.enricher.on_link_images = relayer.ocr.submit
+                relayer.enricher.ocr_worker = relayer.ocr
+                enr_, idx_ = relayer.enricher, relayer.index
+                relayer.ocr.on_text = lambda e: enr_.submit([x.rec.key for x in idx_.by_mirror(e.rec.mirror)], e.rec.mirror)
             if recapper is not None:
                 relayer.ocr.has_daily = lambda day: recapper.rc.has("DAILY", day)
                 relayer.ocr.mark_days = relayer.dirty.mark_many
@@ -561,6 +565,22 @@ def status_bar_lines(cfg, act, relayer: Relayer, recapper, tg) -> list[str]:
     line2 = "｜".join([head, doing] + extra)
     line3 = f" {HELP_KEYS.replace('按鍵：', '')}　｜　{tg.chat_title or ''}"
     return [HR, line2, line3]
+
+
+def queue_ocr_redo(cfg, relayer: Relayer) -> None:
+    """圖片先前分析時還沒有圖中文字（enriched: yes，不是 ocr），現在有了 → 用 OCR 重新分析（溯及既往）。"""
+    from ocr import is_image_record, useful
+    if relayer.index is None or relayer.enricher is None or not cfg.enrich_backlog:
+        return
+    redo: dict[str, list] = {}
+    for e in sorted(relayer.index.entries.values(), key=lambda e: e.msg_id):
+        r = e.rec
+        if r.enriched and not r.enriched_ocr and is_image_record(r) and useful(r.ocr):
+            redo.setdefault(r.mirror, []).append(r.key)
+    for mirror, keys in redo.items():
+        relayer.enricher.submit(keys, mirror)
+    if redo:
+        log.info("🔁 %d 則圖片先前分析時沒有圖中文字，已排入重新分析", len(redo))
 
 
 def queue_backlog(cfg, relayer: Relayer) -> None:

@@ -56,6 +56,7 @@ class Enricher:
         self._posted: list = []                  # 這則工作已經發出去的訊息（連不上時收回，避免重做時重複）
         self._holding = False          # 手上有一則正在做（或在等夜間時段）
         self.on_link_images = None     # callable(mirror_url)：有連到圖片的網址時通知文字辨識
+        self.ocr_worker = None         # OcrWorker：分析圖片前先等這則的圖中文字辨識完（本機 ANE 車道在跑時），當分析的參考
         self.shot_worker = None        # ShotWorker：連結截圖車道（有自己的排程；分析時車道開著就先截圖當輔助）
 
     def submit(self, keys: list, mirror_url: str) -> None:
@@ -156,6 +157,8 @@ class Enricher:
         if mirror is None:
             log.info("鏡像已不存在，略過分析：%s", job.mirror_url)
             return
+        if self.ocr_worker is not None:
+            await self.ocr_worker.ensure(job.mirror_url)      # 圖片分析一定要有 OCR 當參考：還沒辨識就插隊先辨識、等它做完
         import records
         full = records.mirror_texts([e.rec for e in self.index.by_mirror(job.mirror_url)], mirror.content or "")
         texts = {k: self.text_cache.get(k) or full.get(k) or self._text(k) for k in keys}   # 摘錄只有 200 字，盡量用全文
@@ -217,6 +220,7 @@ class Enricher:
             activity.step()
 
         reply_url = None
+        old_replies = {self.index.get(k).rec.reply for k in keys if self.index.get(k) and self.index.get(k).rec.reply}
         if parts:
             lines: list[str] = []
             for title, s in parts:
@@ -232,7 +236,12 @@ class Enricher:
             for c in chunks[1:]:
                 self._posted.append(await mirror.channel.send(c, suppress_embeds=True))
             reply_url = reply.jump_url
+            for old in old_replies - {reply_url}:             # 重新分析（舊的是沒有 OCR 時做的）：新回覆發出後才刪舊的
+                await self.dc.delete_by_url(old)
         summaries = "；".join(f"{t}：{s}" for t, s in parts)
+        # 這次分析有沒有拿到 OCR 當參考：沒有 ocr_worker（終端機模式）或圖片都辨識完了才算；之後 OCR 出來會自動補做
+        import ipc
+        ocr_done = (not ipc.enabled()) if self.ocr_worker is None else not self.ocr_worker.pending_for(job.mirror_url)
 
         for k in keys:
             kw, gist = [], ""
@@ -251,7 +260,7 @@ class Enricher:
             if mine:
                 extra["img"] = " ".join(mine)
             await self.index.update(k, kw="、".join(kw) or None, gist=gist or None,
-                                    enriched=True, reply=reply_url, **extra)
+                                    enriched=True, enriched_ocr=ocr_done, reply=reply_url or next(iter(old_replies), None), **extra)
         if img_links and self.on_link_images is not None:
             self.on_link_images(job.mirror_url)          # 連到圖片的網址 → 交給本機文字辨識
         log.info("已分析 %s（%d 則，回覆 %s，佇列剩 %d）", job.mirror_url.rsplit("/", 1)[-1],

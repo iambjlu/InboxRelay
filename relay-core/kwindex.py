@@ -27,7 +27,7 @@ Key = tuple
 
 class _Gap:
     """編輯間隔會自動調整：discord.http 回報被限流（429）就拉長，之後順利時慢慢縮回去。"""
-    value = 1.5
+    value = 1.0
     bumped = False
 
 
@@ -41,7 +41,7 @@ class _RateWatch(logging.Handler):
 
 logging.getLogger("discord.http").addHandler(_RateWatch())
 
-EDIT_GAP_SEC = 1.5      # 同一頻道的編輯最短間隔（OCR／截圖兩條車道共用）；被限流（429）時 _Gap 會自動拉長到最多 10 秒，順利時慢慢縮回
+EDIT_GAP_SEC = 1.0      # 同一頻道的編輯最短間隔（OCR／截圖兩條車道共用）；被限流（429）時 _Gap 會自動拉長到最多 10 秒，順利時慢慢縮回 1 秒
 
 
 @dataclass

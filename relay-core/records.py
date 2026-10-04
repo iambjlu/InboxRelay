@@ -32,6 +32,7 @@ class KwRecord:
     enriched: bool = False
     ocr: str | None = None       # 圖中文字（本機 ANE 辨識）；「（無文字）」等標記代表做過了
     img: str | None = None       # 文字裡「連到圖片」的網址（以空白分隔）：也做圖中文字辨識
+    enriched_ocr: bool = False   # 這次分析是在圖中文字辨識完成後做的（寫成 enriched: ocr）；舊紀錄是 yes＝可能沒參考到 OCR
 
     @property
     def key(self) -> tuple[int, int]:
@@ -116,7 +117,7 @@ def parse_ocr_message(content: str) -> tuple[tuple[int, int], str] | None:
 
 def format_kw(r: KwRecord) -> str:
     lines = _head_lines(r)
-    end = f"enriched: {'yes' if r.enriched else 'no'}"
+    end = f"enriched: {('ocr' if r.enriched_ocr else 'yes') if r.enriched else 'no'}"
     if r.ocr:
         # 主紀錄只記「做過了」：真正的文字放在這張圖自己的 OCR 訊息（一則塞滿）
         lines.append(f"ocr: {r.ocr if r.ocr in OCR_MARKERS else OCR_REF}")
@@ -175,7 +176,8 @@ def from_dict(d: dict[str, str]) -> KwRecord:
         gist=d.get("gist") or None,
         excerpt=d.get("excerpt") or None,
         ocr=(d.get("ocr") or "").replace(OCR_NL, " ") or None,
-        enriched=d.get("enriched", "no") == "yes",
+        enriched=d.get("enriched", "no") in ("yes", "ocr"),
+        enriched_ocr=d.get("enriched", "no") == "ocr",
     )
 
 
