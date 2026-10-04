@@ -154,7 +154,19 @@ def copied_user_text(content: str) -> str:
     return content.split("\n", 1)[1] if "\n" in content else ""
 
 
-class ThreadControlView(discord.ui.View):
+class _LoggedView(discord.ui.View):
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item) -> None:
+        log.error("對話按鈕處理失敗：%s", type(error).__name__, exc_info=error)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(f"⚠️ 操作失敗：{type(error).__name__}", ephemeral=True)
+            else:
+                await interaction.response.send_message(f"⚠️ 操作失敗：{type(error).__name__}", ephemeral=True)
+        except discord.HTTPException:
+            pass
+
+
+class ThreadControlView(_LoggedView):
     """對話串裡的控制訊息：新增聊天／從這裡分支／刪除此對話（持久化，bot 重啟後仍有效）。"""
     def __init__(self, chat: "ChatChannel") -> None:
         super().__init__(timeout=None)
@@ -174,7 +186,7 @@ class ThreadControlView(discord.ui.View):
         await self.chat.ask_delete(interaction)
 
 
-class ConfirmDeleteView(discord.ui.View):
+class ConfirmDeleteView(_LoggedView):
     def __init__(self, chat: "ChatChannel", thread: discord.Thread, requester: int) -> None:
         super().__init__(timeout=120)
         self.chat, self.thread, self.requester = chat, thread, requester
@@ -210,7 +222,7 @@ class ConfirmDeleteView(discord.ui.View):
                 pass
 
 
-class NewChatView(discord.ui.View):
+class NewChatView(_LoggedView):
     def __init__(self, chat: "ChatChannel") -> None:
         super().__init__(timeout=None)
         self.chat = chat
@@ -385,7 +397,13 @@ class ChatChannel:
         return isinstance(ch, discord.Thread) and ch.parent_id == self.channel_id
 
     async def _send_controls(self, thread: discord.Thread, text: str) -> None:
-        await thread.send(f"{NOTE_PREFIX} {text}", view=ThreadControlView(self))
+        for attempt in range(3):          # 剛建立的對話串偶爾還沒就緒 → 稍等重試
+            try:
+                await thread.send(f"{NOTE_PREFIX} {text}", view=ThreadControlView(self))
+                return
+            except discord.HTTPException as e:
+                log.warning("對話串控制按鈕送出失敗（第 %d 次）：%s", attempt + 1, e)
+                await asyncio.sleep(1.5)
 
     async def open_thread(self, interaction: discord.Interaction) -> None:
         ch = interaction.channel
@@ -394,15 +412,23 @@ class ChatChannel:
         else:
             await interaction.response.send_message("這個按鈕只能在 AI 對話頻道使用。", ephemeral=True)
             return
+        await interaction.response.defer()                 # 不發任何回應訊息（避免出現「回覆」或「只有你看得到」的那一行）
         try:
             thread = await parent.create_thread(name=placeholder_name(self._today()),  # type: ignore[attr-defined]
                                                 type=discord.ChannelType.public_thread, auto_archive_duration=10080)
         except discord.HTTPException as e:
-            await interaction.response.send_message(f"⚠️ 開對話串失敗：{str(e)[:150]}", ephemeral=True)
+            await interaction.followup.send(f"⚠️ 開對話串失敗：{str(e)[:150]}", ephemeral=True)
             return
         self._auto.add(thread.id)
-        await interaction.response.send_message(f"✅ 已開新對話：{thread.mention}", ephemeral=True)
         await self._send_controls(thread, "💬")
+        await self._announce(ch, f"✅ 已開新對話\n{thread.mention}")
+
+    async def _announce(self, ch, text: str) -> None:
+        """在按下按鈕的地方發一則普通訊息（不是回覆）；在對話串裡發的要加 -#，才不會算進對話。"""
+        try:
+            await ch.send(f"{NOTE_PREFIX} {text}" if isinstance(ch, discord.Thread) else text)
+        except discord.HTTPException:
+            log.warning("發送通知訊息失敗", exc_info=True)
 
     # ------------------------------------------------------------ 分支／刪除
     async def _collect(self, thread: discord.Thread) -> list[discord.Message]:
@@ -455,13 +481,13 @@ class ChatChannel:
         if not self._is_chat_thread(src):
             await interaction.response.send_message("這個按鈕只能在 AI 對話的對話串裡使用。", ephemeral=True)
             return
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer()
         try:
             parent = await self.dc.channel(self.channel_id)
             dst = await parent.create_thread(name=f"🔀 {src.name}"[:100],  # type: ignore[attr-defined]
                                              type=discord.ChannelType.public_thread, auto_archive_duration=10080)
         except discord.HTTPException as e:
-            await interaction.edit_original_response(content=f"⚠️ 開對話串失敗：{str(e)[:150]}")
+            await interaction.followup.send(f"⚠️ 開對話串失敗：{str(e)[:150]}", ephemeral=True)
             return
         copied = 0
         try:
@@ -471,15 +497,13 @@ class ChatChannel:
                     for i, h in enumerate(msgs, 1):
                         if await self._copy_message(dst, h):
                             copied += 1
-                        if i % 5 == 0:
-                            await interaction.edit_original_response(content=f"🔀 搬移中… {i}/{len(msgs)}")
                     await self._send_controls(dst, f"🔀 已從「{src.name}」分支（{copied} 則）")
         except Exception as e:
             log.exception("分支對話串失敗")
-            await interaction.edit_original_response(content=f"⚠️ 分支到一半失敗：{type(e).__name__}：{str(e)[:150]}"
-                                                             f"（已搬 {copied} 則：{dst.mention}）")
+            await interaction.followup.send(f"⚠️ 分支到一半失敗：{type(e).__name__}：{str(e)[:150]}"
+                                            f"（已搬 {copied} 則：{dst.mention}）", ephemeral=True)
             return
-        await interaction.edit_original_response(content=f"✅ 已分支：{dst.mention}（搬移 {copied} 則）")
+        await self._announce(src, f"🔀 已分支\n{dst.mention}")
 
     async def ask_delete(self, interaction: discord.Interaction) -> None:
         thread = interaction.channel
@@ -487,9 +511,9 @@ class ChatChannel:
             await interaction.response.send_message("這個按鈕只能在 AI 對話的對話串裡使用。", ephemeral=True)
             return
         view = ConfirmDeleteView(self, thread, interaction.user.id)       # type: ignore[arg-type]
-        await interaction.response.send_message(
+        await interaction.response.defer()
+        view.message = await thread.send(
             f"{NOTE_PREFIX} ⚠️ 確定要刪除這個對話串（{thread.name}）嗎？刪除後無法復原。", view=view)
-        view.message = await interaction.original_response()
 
     async def delete_thread(self, interaction: discord.Interaction, thread: discord.Thread) -> None:
         await interaction.response.defer()
