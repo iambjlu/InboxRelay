@@ -196,6 +196,15 @@ async def run(check_only: bool) -> int:
                 else:
                     chans[label] = cid
         relayer.cfg = cfg
+        chat_channel = None
+        if llm and cfg.ch_chat and cfg.ch_chat_prompt:
+            # AI 對話的按鈕處理器要在核心還在載入資料時就先註冊，不然這段時間按按鈕會「未及時回應」
+            from chat import ChatChannel
+            guild0 = dc.guild
+            chat_channel = ChatChannel(
+                cfg, dc, llm, set(cfg.memory_editors) | ({guild0.owner_id} if guild0 and guild0.owner_id else set()),
+                await dc.channel(cfg.ch_notify) if cfg.ch_notify else None)
+            chat_channel.register_views()
         log.info("%d 個頻道權限檢查通過，檔案上限 %.1f MB",
                  len(chans), dc.filesize_limit(cfg.upload_limit_mb) / 1024 / 1024)
         use_test = bool(cfg.ch_ai_test and llm)
@@ -345,11 +354,9 @@ async def run(check_only: bool) -> int:
                 SearchChannel(cfg, dc, llm, relayer.index, rc, live_ids, test_ids, aitest)
                 log.info("搜尋已啟用：正式 #搜尋 %s；測試頻道 %s（搜 AI 測試頻道的內容）",
                          "開" if live_ids else "關（SEARCH_LIVE=false）", "開" if test_ids else "關")
-            if cfg.ch_chat and cfg.ch_chat_prompt:
-                from chat import ChatChannel
+            if chat_channel is not None:
                 try:
-                    await ChatChannel(cfg, dc, llm, editors,
-                                      await dc.channel(cfg.ch_notify) if cfg.ch_notify else None).setup()
+                    await chat_channel.setup()
                 except Exception:
                     log.exception("AI 對話啟用失敗（其他功能照常）")
             elif cfg.ch_chat:

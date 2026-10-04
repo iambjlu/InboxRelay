@@ -289,6 +289,7 @@ class ChatChannel:
         self._sleeping = False
         self._auto: set[int] = set()                         # 這次執行期間自動命名、還沒用 AI 改名的對話串
         self._retitling: set[int] = set()
+        self._views_ready = False
 
     @property
     def bot_id(self) -> int:
@@ -354,11 +355,18 @@ class ChatChannel:
     def _today(self) -> str:
         return datetime.now(ZoneInfo(self.cfg.tz)).strftime("%Y-%m-%d")
 
+    def register_views(self) -> None:
+        """註冊按鈕處理器（持久化 View）。啟動初期就呼叫，不用等到整個核心載入完，按鈕才不會「未及時回應」。"""
+        if self._views_ready:
+            return
+        self.dc.client.add_view(NewChatView(self))
+        self.dc.client.add_view(ThreadControlView(self))
+        self._views_ready = True
+
     async def _ensure_button(self) -> None:
         """頻道裡放一則（釘選的）「新對話」按鈕訊息；已經有就沿用。"""
         try:
-            self.dc.client.add_view(NewChatView(self))
-            self.dc.client.add_view(ThreadControlView(self))
+            self.register_views()
             ch = await self.dc.channel(self.channel_id)
             async for m in ch.history(limit=100):
                 if m.author.id == self.bot_id and m.content.startswith(BUTTON_MARK):
