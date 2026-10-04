@@ -127,6 +127,22 @@ class Enricher:
                 pass
         self._posted = []
 
+    async def _shot_posts(self, keys: list) -> dict:
+        """這幾則紀錄已經拍好的截圖貼文：網址 → 貼文（只讀文字，圖片等摘要那個網址時才下載）。"""
+        from enrich.shotworker import success_links
+        out: dict = {}
+        for k in keys:
+            e = self.index.get(k)
+            for link in success_links(e.rec.shot if e else None):
+                try:
+                    m = await self.dc.fetch_by_url(link)
+                except Exception:
+                    continue
+                if m is not None:
+                    for u in find_urls(m.content.split("\n", 1)[0]):
+                        out.setdefault(u, m)
+        return out
+
     def _text(self, key) -> str:
         e = self.index.get(key)
         return self.text_cache.get(key) or (e.rec.excerpt if e and e.rec.excerpt else "")
@@ -140,41 +156,46 @@ class Enricher:
         if mirror is None:
             log.info("鏡像已不存在，略過分析：%s", job.mirror_url)
             return
-        texts = {k: self._text(k) for k in keys}
+        import records
+        full = records.mirror_texts([e.rec for e in self.index.by_mirror(job.mirror_url)], mirror.content or "")
+        texts = {k: self.text_cache.get(k) or full.get(k) or self._text(k) for k in keys}   # 摘錄只有 200 字，盡量用全文
         parts: list[tuple[str, str]] = []
         # 細部進度：連結摘要＋附件＋每則關鍵字，各算一步
         n_urls = len({u for t in texts.values() for u in find_urls(t)}) if cfg.link_summary else 0
         n_atts = sum(1 for a in mirror.attachments if a.size <= MAX_FILE)
-        activity.begin_item(min(n_urls, 3) + n_atts + (len(keys) if cfg.keywords else 0))
+        activity.begin_item(n_urls + n_atts + (len(keys) if cfg.keywords else 0))
 
         all_urls: list[str] = []
         for t in texts.values():
             for u in find_urls(t):
                 if u not in all_urls:
                     all_urls.append(u)
-        probed: dict = {}
-        if cfg.link_summary:
-            for u in all_urls[:3]:
-                probed[u] = await probe_link(u)      # 先看是網頁、檔案還是圖片
-        shot_png: dict = {}
+        shot_posts: dict = {}
         if cfg.link_summary and all_urls and self.shot_worker is not None:
             lane = lanes.get("shot")
             if lane is not None and lane.allowed():          # 截圖車道現在可以跑：先截圖再摘要，截圖當輔助來源
                 await self.shot_worker.ensure(job.mirror_url)
-            from enrich.refresh import _old_shots
-            shot_png = await _old_shots(self.dc, [e for e in (self.index.get(k) for k in keys) if e is not None])
+            shot_posts = await self._shot_posts(keys)
         img_links: list[str] = []
         if cfg.link_summary:
             caption = " ".join(texts.values())[:300]
-            for u in all_urls[:3]:
-                r = await summarize_probed(self.llm, u, probed[u], embed_preview(mirror, u), shot_png.get(u),
+            for u in all_urls:                                # 每個網址都摘要；一次只抓一個網頁／一張截圖，用完就丟
+                probed = await probe_link(u)
+                png = None
+                post = shot_posts.get(u)
+                if post is not None and post.attachments:
+                    try:
+                        png = await post.attachments[0].read()
+                    except Exception:
+                        png = None
+                r = await summarize_probed(self.llm, u, probed, embed_preview(mirror, u), png,
                                            caption, describe_image=cfg.image_summary)
+                probed, png = None, None
                 parts.append((r.title, r.summary))
                 if r.image is not None:
                     img_links.append(u)
                 activity.step()
-        probed.clear()
-        shot_png.clear()
+        shot_posts.clear()
 
         for a in mirror.attachments:
             name = a.filename
@@ -201,9 +222,9 @@ class Enricher:
             for title, s in parts:
                 lines.append(f"**{title}**")
                 lines += [f"> {x}" for x in s.split("\n") if x.strip()]
-            shot_urls = [u for k in keys for u in (self.index.get(k).rec.shot or "").split()]   # 截圖車道先拍好的
+            from enrich.shotworker import shot_line, success_links
+            shot_urls = [u for k in keys for u in success_links(self.index.get(k).rec.shot)]   # 截圖車道先拍好的
             if shot_urls:
-                from enrich.shotworker import shot_line
                 lines.append(shot_line(list(dict.fromkeys(shot_urls))))
             chunks = daily.split_message("\n".join(lines))
             reply = await mirror.reply(chunks[0], mention_author=False, suppress_embeds=True)

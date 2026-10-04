@@ -130,21 +130,37 @@ async def capture_many(urls: list[str], label: str = "連結截圖",
     return out
 
 
-async def post_screenshots(dc, channel_id: int, urls: list[str], when: str, back_url: str,
-                           back_label: str = "鏡像", pngs: dict | None = None,
-                           links: dict | None = None) -> list[str]:
-    """截圖並發到連結預覽頻道，每個網址一則；回傳貼文連結。pngs 給了就把圖留給呼叫端（網址 → 圖）；
-    links 給了就記下 網址 → 貼文連結（只含成功的）。"""
-    posted: list[str] = []
-    warn: list[tuple[str, str]] = []
-    for u, png in await capture_many(urls, failures=warn):
-        if pngs is not None:
-            pngs[u] = png
-        note = "".join(f"\n{w}" for x, w in warn if x == u and w == CERT_WARN)
-        text = f"📸 {when}｜{u}{note}\n[↗ 跳到{back_label}](<{back_url}>)"
-        msg = await dc.send_file(channel_id, text, "preview.jpg", png)
-        posted.append(msg.jump_url)
-        if links is not None:
-            links[u] = msg.jump_url
-    return posted
+FAIL_MARK = "!"          # 紀錄 shot 欄位裡「無法截圖通知」貼文連結的前綴（成功的截圖沒有前綴）
 
+
+async def _host_resolves(url: str) -> bool:
+    host = urlparse(url).hostname or ""
+    try:
+        await asyncio.get_running_loop().getaddrinfo(host, None)
+        return True
+    except (socket.gaierror, UnicodeError):
+        return False
+
+
+async def post_one(dc, channel_id: int, url: str, when: str, back_url: str,
+                   back_label: str = "鏡像", tries: int = 2) -> tuple[str, bool]:
+    """截一個網址並發到連結預覽頻道；拍不到就改發一則「📸 無法截圖」通知（含原因）。
+    回傳 (貼文連結, 是否成功)。網域查不到就不重試；其他失敗最多試 tries 次。圖只在記憶體裡。"""
+    png, why = None, ""
+    if not await _host_resolves(url):
+        why = "網域不存在（DNS 查不到）"
+    else:
+        for i in range(tries):
+            png, why = await capture_with_reason(url)
+            if png:
+                break
+            if i + 1 < tries:
+                await asyncio.sleep(5)
+    back = f"[↗ 跳到{back_label}](<{back_url}>)"
+    if png:
+        note = f"\n{CERT_WARN}" if why == CERT_WARN else ""
+        msg = await dc.send_file(channel_id, f"📸 {when}｜{url}{note}\n{back}", "preview.jpg", png)
+        png = None
+        return msg.jump_url, True
+    msg = await dc.send(channel_id, f"📸 無法截圖｜{when}｜<{url}>\n-# 原因：{why or '未知'}\n{back}")
+    return msg.jump_url, False

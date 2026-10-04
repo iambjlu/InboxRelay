@@ -1,9 +1,12 @@
 # relay-core/enrich/shotworker.py
 """連結截圖（獨立車道 shot）：不跟著外部 LLM 排程，有自己的排程設定（SHOT_SCHEDULE／SHOT_START／SHOT_END，預設永遠立即執行）。
 
-- 判斷依據是 #關鍵字庫：紀錄文字裡有網頁網址、但 `shot:` 還是空的 → 排進佇列（積欠的舊連結每次開始都會補拍）。
-- 連到圖片／檔案的網址不截圖；拍不到的這一輪重試幾次，下一輪開始時再試。
-- 截圖貼到連結預覽頻道，記在紀錄的 shot 欄位；該則鏡像已有 AI 摘要回覆的話，在回覆最後補上「📸 截圖」連結。
+- 一則訊息裡的每個網址都處理：網頁 → 截圖貼到連結預覽頻道；拍不到（網域不存在、逾時…）→ 改貼一則「📸 無法截圖」通知；
+  連到圖片／檔案、內網被擋的網址不截圖。
+- 紀錄的 shot 欄位依網址順序每個網址一個記號：截圖貼文連結／「!」＋通知貼文連結／「-」（不需要截圖）。
+  記號比網址少＝還有沒處理的 → 排進佇列（積欠的舊連結每次車道開始都會補）。
+- 網址從完整原文找：實時訊息用記憶體裡的原文，其他從鏡像訊息全文切出（摘錄只有 200 字，後面的連結會漏掉）。
+- 該則鏡像已有 AI 摘要回覆的話，回覆最後的「📸 截圖」連結會更新成全部成功的截圖。
 - 截圖只在記憶體處理，不寫硬碟。
 """
 from __future__ import annotations
@@ -13,18 +16,24 @@ import logging
 from collections import deque
 
 import activity
+import records
 from enrich.link import find_urls, probe_link
 
 log = logging.getLogger("shot")
 
-MAX_URLS = 2          # 每則紀錄最多拍幾個網址
 SHOT_WAIT_SEC = 240      # AI 分析最多等截圖多久
-MAX_TRIES = 2         # 同一則這一輪拍不到幾次就先放棄（下一輪再試）
 SHOT_LINE = "📸 截圖："
+SKIP = "-"               # 這個網址不需要截圖（圖片／檔案／內網）；沒有網址的長訊息也記一個，避免每輪重讀鏡像
 
 
 def shot_line(urls: list[str]) -> str:
     return SHOT_LINE + " ".join(f"[↗{i}](<{u}>)" for i, u in enumerate(urls, 1))
+
+
+def success_links(shot: str | None) -> list[str]:
+    """shot 欄位裡成功的截圖貼文連結。"""
+    from enrich.screenshot import FAIL_MARK
+    return [t for t in (shot or "").split() if t != SKIP and not t.startswith(FAIL_MARK)]
 
 
 class ShotWorker:
@@ -37,20 +46,25 @@ class ShotWorker:
         self._queued: set[str] = set()
         self._wake = asyncio.Event()
         self._holding = False
-        self._fails: dict = {}                    # 紀錄 → 這一輪拍不到的次數
-        self._nonweb: set = set()                 # 確認只有圖片／檔案網址的紀錄（行程存活期間不再檢查）
         self._backoff = 30.0
         self.on_drained = None                    # callable()：佇列清空時通知（外部 LLM 車道等截圖做完）
         self._waiters: dict[str, list] = {}       # 鏡像連結 → 等這則截圖做完的 Future（AI 分析要拿截圖當輔助）
 
     # ------------------------------------------------------------ 佇列
-    def _text(self, e) -> str:
-        return self.text_cache.get(e.rec.key) or e.rec.excerpt or ""
-
     def needs_shot(self, e) -> bool:
+        """不讀 Discord 的快速判斷：記號比網址少＝還有沒處理的網址。"""
         r = e.rec
-        return (r.origin != "extra" and not r.shot and r.key not in self._nonweb
-                and bool(find_urls(self._text(e))))
+        if r.origin == "extra":
+            return False
+        tokens = (r.shot or "").split()
+        text = self.text_cache.get(r.key)
+        if text is not None:
+            return len(tokens) < len(find_urls(text))
+        ex = r.excerpt or ""
+        n = len(find_urls(ex))
+        if ex.endswith("…"):                      # 摘錄被截斷：後面可能還有網址，沒處理過就讀鏡像確認
+            return not tokens or len(tokens) < n
+        return len(tokens) < n
 
     def submit(self, mirror_url: str, front: bool = False) -> None:
         if not mirror_url:
@@ -88,18 +102,17 @@ class ShotWorker:
                 fut.set_result(None)
 
     def scan_index(self) -> int:
-        self._fails.clear()
         n = 0
         for e in sorted(self.index.entries.values(), key=lambda e: e.msg_id):
             if self.needs_shot(e) and e.rec.mirror not in self._queued:
                 self.submit(e.rec.mirror)
                 n += 1
         if n:
-            log.info("連結截圖：%d 則鏡像有連結還沒截圖，已排入「連結截圖」佇列", n)
+            log.info("連結截圖：%d 則鏡像有連結還沒處理，已排入「連結截圖」佇列", n)
         return n
 
     async def cycle(self) -> None:
-        """車道每次開始（排程或立即執行）：重新掃描，把所有積欠、沒截到圖的連結排進佇列。"""
+        """車道每次開始（排程或立即執行）：重新掃描，把所有積欠、沒處理到的連結排進佇列。"""
         self.scan_index()
 
     @property
@@ -148,13 +161,27 @@ class ShotWorker:
             finally:
                 self._holding = False
 
+    async def _covered(self, tokens: list[str]) -> dict[str, str]:
+        """舊紀錄已經有的貼文：網址 → 記號（讀貼文第一行的網址），避免重拍。"""
+        out: dict[str, str] = {}
+        for t in tokens:
+            if t == SKIP:
+                continue
+            try:
+                m = await self.dc.fetch_by_url(t.lstrip("!"))
+            except Exception:
+                continue
+            if m is None:
+                continue
+            for u in find_urls(m.content.split("\n", 1)[0]):
+                out.setdefault(u, t)
+        return out
+
     async def process(self, mirror_url: str) -> bool:
-        """回傳 False＝暫時失敗，稍後重試。"""
-        from enrich.screenshot import available, post_screenshots
+        """處理這則鏡像所有紀錄裡還沒處理的網址。回傳 False＝暫時失敗（讀不到鏡像），稍後重試。"""
+        from enrich.screenshot import FAIL_MARK, available, post_one
         entries = [e for e in self.index.by_mirror(mirror_url) if self.needs_shot(e)]
-        if not entries:
-            return True
-        if not available():
+        if not entries or not available():
             return True
         try:
             msg = await self.dc.fetch_by_url(mirror_url)
@@ -163,49 +190,49 @@ class ShotWorker:
             return False
         if msg is None:
             return True
-        full = find_urls(getattr(msg, "content", "") or "")
-        taken: dict[str, str] = {}                      # 網址 → 截圖貼文連結（同一則鏡像重複的網址只拍一次）
+        full = records.mirror_texts([x.rec for x in self.index.by_mirror(mirror_url)], getattr(msg, "content", "") or "")
         for e in entries:
-            urls = []
-            for u in find_urls(self._text(e)):
-                u = next((f for f in full if f.startswith(u)), u)       # 摘要被截斷的網址用鏡像裡的完整版
-                if u not in urls:
-                    urls.append(u)
-            web = []
+            key = e.rec.key
+            text = self.text_cache.get(key) or full.get(key) or e.rec.excerpt or ""
+            urls = find_urls(text)
+            old = (e.rec.shot or "").split()
+            covered = await self._covered(old) if old else {}
+            tokens: list[str] = []
+            ok_links: list[str] = []
             for u in urls:
+                if u in covered:
+                    tokens.append(covered[u])
+                    if not covered[u].startswith(FAIL_MARK):
+                        ok_links.append(covered[u])
+                    continue
                 kind = (await probe_link(u))[1]
-                if kind not in ("image", "file", "private"):
-                    web.append(u)
-            if not web:
-                self._nonweb.add(e.rec.key)
-                continue
-            web = web[:MAX_URLS]
-            need = [u for u in web if u not in taken]
-            if need:
-                await post_screenshots(self.dc, self.cfg.ch_screenshot, need, e.rec.date, mirror_url, links=taken)
-            links = [taken[u] for u in web if u in taken]
-            if not links:
-                tries = self._fails.get(e.rec.key, 0) + 1
-                self._fails[e.rec.key] = tries
-                log.warning("連結截圖失敗（第 %d 次）：TG#%s", tries, e.rec.tg_msg)
-                if tries < MAX_TRIES:
-                    return False
-                continue
-            self._fails.pop(e.rec.key, None)
-            await self.index.update(e.rec.key, shot=" ".join(links))
-            await self._append_to_reply(e.rec.reply, links)
-            log.info("📸 已補截圖：TG#%s（%d 張）", e.rec.tg_msg, len(links))
+                if kind in ("image", "file", "private"):
+                    tokens.append(SKIP)
+                    continue
+                link, ok = await post_one(self.dc, self.cfg.ch_screenshot, u, e.rec.date, mirror_url)
+                tokens.append(link if ok else FAIL_MARK + link)
+                if ok:
+                    ok_links.append(link)
+            extras = [t for t in old if t not in tokens and t != SKIP]      # 對不上網址的舊貼文：留著，刪除同步才刪得到
+            new = " ".join(tokens + extras) or SKIP
+            if new != (e.rec.shot or ""):
+                await self.index.update(key, shot=new)
+            if ok_links:
+                await self._update_reply(e.rec.reply, ok_links)
+            log.info("📸 連結截圖：TG#%s 共 %d 個網址（成功 %d）", e.rec.tg_msg, len(urls), len(ok_links))
         return True
 
-    async def _append_to_reply(self, reply_url: str | None, links: list[str]) -> None:
+    async def _update_reply(self, reply_url: str | None, links: list[str]) -> None:
+        """AI 回覆最後的「📸 截圖」那行換成目前全部成功的截圖。"""
         if not reply_url:
             return
         try:
             rm = await self.dc.fetch_by_url(reply_url)
-            if rm is None or SHOT_LINE in rm.content:
+            if rm is None:
                 return
-            new = f"{rm.content}\n{shot_line(links)}"
-            if len(new) <= 2000:
+            lines = [ln for ln in rm.content.split("\n") if not ln.startswith(SHOT_LINE)]
+            new = "\n".join(lines + [shot_line(links)])
+            if new != rm.content and len(new) <= 2000:
                 await rm.edit(content=new)
         except Exception:
-            log.warning("在 AI 回覆補上截圖連結失敗：%s", reply_url, exc_info=True)
+            log.warning("在 AI 回覆更新截圖連結失敗：%s", reply_url, exc_info=True)

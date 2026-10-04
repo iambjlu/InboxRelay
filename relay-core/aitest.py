@@ -124,7 +124,7 @@ class AiTestChannel:
         urls = find_urls(text)
         if urls:
             e.kind = "連結"
-        for u in urls[:3]:
+        for u in urls:
             e.parts.append((f"🔗 {u}", await summarize_link(self.llm, u)))
         for a in m.attachments:
             name = a.filename
@@ -187,7 +187,7 @@ class AiTestChannel:
             shot_fail: list[tuple[str, str]] = []
             if self.cfg.link_screenshot:
                 from enrich.screenshot import capture_many
-                shots = await capture_many(find_urls(m.content)[:2], failures=shot_fail)   # 實驗頻道的截圖直接貼在這裡
+                shots = await capture_many(find_urls(m.content), failures=shot_fail)   # 實驗頻道的截圖直接貼在這裡
         lines = ["🤖 **AI 分析**"]
         for title, s in e.parts:
             lines.append(f"**{title}**")

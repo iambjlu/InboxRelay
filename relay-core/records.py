@@ -42,6 +42,29 @@ def one_line(text: str) -> str:
     return " ".join(text.split())
 
 
+def mirror_texts(recs: list, content: str) -> dict:
+    """從鏡像訊息全文切出每則紀錄自己的文字（摘錄只有 200 字，後面的連結會漏掉）。
+    去掉日期標頭（# / -# 開頭）、📎 檔案行與來源連結行；用每則的摘錄開頭定位，切到下一則的開頭為止。"""
+    body = " ".join(one_line(ln) for ln in (content or "").splitlines()
+                    if ln.strip() and not ln.startswith(("#", "-#", "📎 ")))
+    marks = []
+    pos = 0
+    for r in sorted(recs, key=lambda r: r.tg_msg):
+        anchor = (r.excerpt or "").rstrip("…")[:60]
+        if not anchor:
+            continue
+        i = body.find(anchor, pos)
+        if i < 0:
+            continue
+        marks.append((i, r.key))
+        pos = i + len(anchor)
+    out = {}
+    for n, (i, key) in enumerate(marks):
+        end = marks[n + 1][0] if n + 1 < len(marks) else len(body)
+        out[key] = body[i:end].strip()
+    return out
+
+
 def make_excerpt(text: str, n: int = 200) -> str:
     t = one_line(text)
     return t if len(t) <= n else t[: n - 1] + "…"
