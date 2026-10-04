@@ -152,7 +152,7 @@ OCR text lives in a separate message `OCR|tg_chat|tg_msg\n<text>` (≤ `OCR_ROOM
 Functions: format_kw, parse_kw, parse_key, from_dict, parse_record, ocr_message, parse_ocr_message, flat_ocr, make_excerpt(200), one_line, mirror_texts(recs, content) (per-record full text cut from the mirror message: drops `#`/`-#` header & src lines and `📎` lines, anchors on each record's excerpt start), parse_message_url.
 
 ### kwindex.py
-`KwIndex`: in-memory map key → `KwEntry(msg_id, rec, ocr_msg, legacy)`; loads whole #關鍵字庫 at startup, `poll_new()` incremental; `update(key, **changes)` edits the record message and syncs its OCR message (`_sync_ocr`); `by_mirror(url)`, `get`, `delete` (also deletes OCR message).
+`KwIndex`: in-memory map key → `KwEntry(msg_id, rec, ocr_msg, legacy)`; loads whole #關鍵字庫 at startup, `poll_new()` incremental; `update(key, **changes)` edits the record message (skipped when the formatted text is unchanged and the entry is not legacy) and syncs its OCR message (`_sync_ocr`); `by_mirror(url)`, `get`, `delete` (also deletes OCR message). All edits go through `_edit` (one `asyncio.Lock`, at least `EDIT_GAP_SEC=1.5` s apart) so the OCR and shot lanes updating records at the same time do not hit Discord's per-channel message-edit rate limit (429).
 
 ### state.py
 #資料庫 fixed records (first line tag, then `key: value`, edited in place): `STATE` (host heartbeat; `HOST_STALE=3 min`), `IMPORT` (import lock/checkpoint; `LOCK_STALE`), `LIVE`, `RECAP_DIRTY` (`DirtyDays`: days to re-summarize), `RECAP_NOTES` (per-day user notes). `DbRecord`, `this_host`, `other_host_active`, `import_lock_active`.

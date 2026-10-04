@@ -9,8 +9,10 @@
 """
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import logging
+import time
 from dataclasses import dataclass, field
 
 import discord
@@ -21,6 +23,8 @@ from records import KwRecord
 log = logging.getLogger("kwindex")
 
 Key = tuple
+
+EDIT_GAP_SEC = 1.5      # 同一頻道的編輯至少間隔這麼久：OCR／截圖兩條車道同時改紀錄時不會撞到 Discord 的編輯頻率限制（429）
 
 
 @dataclass
@@ -37,6 +41,19 @@ class KwIndex:
         self.bot_id = bot_id
         self.entries: dict[Key, KwEntry] = {}
         self.last_msg_id = 0
+        self._edit_lock = asyncio.Lock()
+        self._last_edit = 0.0
+
+    async def _edit(self, message_id: int, content: str) -> None:
+        """編輯訊息：所有編輯排隊、每次至少間隔 EDIT_GAP_SEC（速度由這裡統一控制）。"""
+        async with self._edit_lock:
+            wait = self._last_edit + EDIT_GAP_SEC - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            try:
+                await self.channel.get_partial_message(message_id).edit(content=content)
+            finally:
+                self._last_edit = time.monotonic()
 
     def __contains__(self, key: Key) -> bool:
         return key in self.entries
@@ -109,8 +126,11 @@ class KwIndex:
         e = self.entries.get(key)
         if e is None:
             return None
+        old = records.format_kw(e.rec)
         e.rec = dataclasses.replace(e.rec, **changes)
-        await self.channel.get_partial_message(e.msg_id).edit(content=records.format_kw(e.rec))
+        new = records.format_kw(e.rec)
+        if new != old or e.legacy:                       # 內容沒變就不編輯，少打一次 API（舊格式一定要改寫）
+            await self._edit(e.msg_id, new)
         if "ocr" in changes or e.legacy:
             await self._sync_ocr(e)
         e.legacy = False
@@ -129,7 +149,7 @@ class KwIndex:
             return
         if e.ocr_msg:
             if want != getattr(e, "_ocr_sent", None):
-                await self.channel.get_partial_message(e.ocr_msg).edit(content=want)
+                await self._edit(e.ocr_msg, want)
         else:
             m = await self.channel.send(want)
             e.ocr_msg = m.id
