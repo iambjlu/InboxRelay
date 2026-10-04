@@ -101,7 +101,7 @@ class Config:
     shot_schedule: str = "always"  # 連結截圖（獨立車道，預設永遠立即執行）
     shot_start: str = "03:30"
     shot_end: str = "08:00"
-    llm_wait_shot: bool = False   # 外部 LLM 工作等連結截圖做完才開始（截圖車道正在跑時，LLM 車道先等）
+    llm_wait_shot: bool = True    # 外部 LLM 工作等連結截圖做完才開始（截圖車道正在跑時，LLM 車道先等）
     recap_time: str = "03:30"    # 每天幾點開始跑總結（含補跑積欠的）；按 n 可立即總結、p 暫停
 
     def channel_map(self) -> dict[str, int]:
@@ -164,7 +164,7 @@ def load() -> Config:
         ch_search_test=int(e["DC_CH_SEARCH_TEST"]) if e.get("DC_CH_SEARCH_TEST") else None,
         link_summary=_bool("LINK_SUMMARY", True),
         link_screenshot=_bool("LINK_SCREENSHOT", False),
-        llm_wait_shot=_bool("LLM_WAIT_SHOT", False),
+        llm_wait_shot=_bool("LLM_WAIT_SHOT", True),
         ch_screenshot=int(e["DC_CH_SCREENSHOT"]) if e.get("DC_CH_SCREENSHOT") else None,
         ch_extra=int(e["DC_CH_EXTRA"]) if e.get("DC_CH_EXTRA") else None,
         ch_chat=int(e["DC_CH_CHAT"]) if e.get("DC_CH_CHAT") else None,

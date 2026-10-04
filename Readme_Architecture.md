@@ -72,7 +72,7 @@ Source of values: App settings (Keychain for secrets, UserDefaults or synced-fol
 | MEMORY_EDITORS | memory_editors | ∅ | user ids allowed to post #記憶 / feedback (guild owner always allowed) |
 | LINK_SUMMARY | link_summary | true | |
 | LINK_SCREENSHOT | link_screenshot | false | requires tools/linkshot |
-| LLM_WAIT_SHOT | llm_wait_shot | false | `llm` lane is blocked (`Lane.blocked_by`, state `waiting`, describe "等連結截圖做完") while the `shot` lane is `running` with a non-empty queue; `ShotWorker.on_drained` wakes the llm lane. Needs LINK_SCREENSHOT |
+| LLM_WAIT_SHOT | llm_wait_shot | true | `llm` lane is blocked (`Lane.blocked_by`, state `waiting`, describe "等連結截圖做完") while the `shot` lane is `running` with a non-empty queue; `ShotWorker.on_drained` wakes the llm lane. Needs LINK_SCREENSHOT |
 | SHOT_SCHEDULE / SHOT_START / SHOT_END | shot_schedule / shot_start / shot_end | always / 03:30 / 08:00 | `shot` lane schedule (link summary stays on the `llm` lane) |
 | PRIVATE_URLS | private_urls | true | allow LAN/localhost URLs |
 | IGNORE_CERT_ERRORS | ignore_cert | false | |
