@@ -17,6 +17,19 @@ if pgrep -x InboxRelay >/dev/null 2>&1; then
   pgrep -x InboxRelay >/dev/null 2>&1 && { echo "[install] ⚠️ InboxRelay 還沒結束，請從選單列手動結束後再跑一次"; exit 1; }
 fi
 
+# App 結束後核心可能還在收尾（或卡住）：等它結束，逾時就強制結束，避免新核心因「已有一個在跑」而啟動失敗
+core_pids() { pgrep -f "/Applications/InboxRelay.app/Contents/Resources/core" 2>/dev/null || true; }
+for _ in $(seq 1 20); do
+  [ -z "$(core_pids)" ] && break
+  sleep 1
+done
+if [ -n "$(core_pids)" ]; then
+  echo "[install] 舊的核心行程還沒結束，強制結束：$(core_pids | tr '\n' ' ')"
+  core_pids | xargs kill 2>/dev/null || true
+  sleep 3
+  core_pids | xargs kill -9 2>/dev/null || true
+fi
+
 rm -rf /Applications/InboxRelay.app
 cp -R build/InboxRelay.app /Applications/
 if [ "${1:-}" = "--instant" ]; then
@@ -24,4 +37,14 @@ if [ "${1:-}" = "--instant" ]; then
 else
   open /Applications/InboxRelay.app
 fi
-echo "[install] ✅ 已安裝並打開 /Applications/InboxRelay.app"
+echo "[install] 已安裝並打開 /Applications/InboxRelay.app，確認核心有沒有啟動…"
+for _ in $(seq 1 45); do
+  [ -n "$(core_pids)" ] && pgrep -x InboxRelay >/dev/null 2>&1 && { sleep 5; break; }
+  sleep 1
+done
+if pgrep -x InboxRelay >/dev/null 2>&1 && [ -n "$(core_pids)" ]; then
+  echo "[install] ✅ App 與核心都在運行"
+else
+  echo "[install] ⚠️ 核心沒有在運行（App：$(pgrep -x InboxRelay >/dev/null 2>&1 && echo 在 || echo 不在)）；請看 App 主視窗日誌"
+  exit 1
+fi

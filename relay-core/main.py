@@ -450,6 +450,11 @@ async def run(check_only: bool) -> int:
         await notify(dc, cfg, online_message(cfg, tg, relayer, mem, recapper, ai_status))
         await stop.wait()
         log.info("收到結束訊號，關閉中…")
+        import os
+        import threading
+        killer = threading.Timer(25, lambda: os._exit(0))      # 優雅關閉卡住時強制結束，避免殘留行程佔著單一實例鎖
+        killer.daemon = True
+        killer.start()
         await notify(dc, cfg, f"🔴 **InboxRelay 已離線**（{state.this_host()}，手動結束）\n"
                               "-# 離線期間的 Telegram 訊息會保留 24 小時，下次上線自動補搬")
         try:
