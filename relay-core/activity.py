@@ -189,13 +189,15 @@ class Activity:
         if content == self._last_discord or now - self._last_discord_at < DISCORD_EVERY_SEC:
             return
         try:
-            if self._status_msg is None:
-                self._status_msg = await channel.send(content[:2000])
-            else:
-                await self._status_msg.edit(content=content[:2000])
+            # 有新進度就在頻道最下面發一則新的，再刪掉舊的：進度訊息永遠是最新一則
+            old_msg = self._status_msg
+            self._status_msg = await channel.send(content[:2000], suppress_embeds=True)
             self._last_discord, self._last_discord_at = content, now
-        except discord.NotFound:
-            self._status_msg = None
+            if old_msg is not None:
+                try:
+                    await old_msg.delete()
+                except discord.NotFound:
+                    pass
         except discord.HTTPException as e:
             log.warning("更新進度訊息失敗：%s", e)
 

@@ -24,7 +24,7 @@ class FakeCh:
     def __init__(self):
         self.alive = []
 
-    async def send(self, content):
+    async def send(self, content, **kw):
         m = FakeMsg(self, content)
         self.alive.append(m)
         return m
@@ -46,8 +46,12 @@ class TestActivity(unittest.TestCase):
                 await act._discord(ch)
                 self.assertEqual(len(ch.alive), 1)
                 self.assertIn("每日總結 0/3（0.0%）", ch.alive[0].content)
+                first = ch.alive[0]
                 t.advance(detail="產生 2026-10-01")
                 await act._discord(ch)
+                self.assertEqual(len(ch.alive), 1)                         # 發新的、舊的刪掉
+                self.assertIsNot(ch.alive[0], first)
+                self.assertTrue(first.deleted)
                 self.assertIn("1/3（33.3%）｜產生 2026-10-01", ch.alive[0].content)
                 act.finish(t)
                 await act._discord(ch)

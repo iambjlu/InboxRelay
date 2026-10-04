@@ -56,7 +56,7 @@ Source of values: App settings (Keychain for secrets, UserDefaults or synced-fol
 | DC_CH_NOTIFY | ch_notify | None | 通知與互動 (feedback.py, memory notices) |
 | DC_CH_AI_TEST | ch_ai_test | None | AI 測試 (aitest.py) |
 | DC_CH_SEARCH_TEST | ch_search_test | None | 搜尋測試 |
-| DC_CH_SCREENSHOT | ch_screenshot | None | 連結預覽與進度 (screenshots + activity message) |
+| DC_CH_SCREENSHOT | ch_screenshot | None | 連結預覽與進度 (screenshots) |
 | DC_CH_EXTRA | ch_extra | None | 補充資料 (importer/extra) |
 | DC_CH_CHAT | ch_chat | None | AI 對話 (chat.py) |
 | DC_CH_CHAT_PROMPT | ch_chat_prompt | None | AI 對話 #提示詞／#記憶 |
@@ -114,7 +114,7 @@ Methods: `gate()` (await until allowed), `pause()`, `resume()`, `run_now()`, `go
 `run_lane(lane, drained, cycle=None)`: loop {wait start/trigger → clear `offline` → run `cycle()` then wait `drained()` → stop on close_at / done / offline}. Globals `LANES`, `setup(cfg)` creates `llm` (start=RECAP_TIME, end=LLM_END) and `ane`, `get(name)`.
 
 ### activity.py
-Progress tracking for background work. `Task` (label, done, total, detail, item steps, llm_frac), `Activity` (tasks, Discord progress message `STATUS_HEAD` in 連結預覽與進度 or #關鍵字庫 after `DISCORD_AFTER_SEC=10`, edited every `DISCORD_EVERY_SEC=15`, deleted when idle; `status_lines()` adds lane lines incl. "🔌 外部 LLM 連不上"). Module API: `init, start(label,total,background), finish, bind, bound, step, begin_item, gate(lane_name="llm")`.
+Progress tracking for background work. `Task` (label, done, total, detail, item steps, llm_frac), `Activity` (tasks, Discord progress message `STATUS_HEAD` in #投遞箱鏡像 after `DISCORD_AFTER_SEC=10`; when the text changes (at most every `DISCORD_EVERY_SEC=15`) a new message is posted at the bottom of the channel and the previous one deleted (never edited, so it is always the latest message); deleted when idle; `cleanup_old` at startup removes leftovers in the mirror, 連結預覽與進度 and #關鍵字庫 channels (bot messages in the mirror without a record are ignored by delete-sync and reverse-sync); `status_lines()` adds lane lines incl. "🔌 外部 LLM 連不上"). Module API: `init, start(label,total,background), finish, bind, bound, step, begin_item, gate(lane_name="llm")`.
 
 ### llm.py
 `LLM(base_url, model, api_key, image_support)` over `AsyncOpenAI(timeout=300, max_retries=1)`; single-flight `Semaphore(1)`.
@@ -275,11 +275,11 @@ tools/linkshot.swift: WKWebView with `WKWebsiteDataStore.nonPersistent()`, loads
 
 | Where | Message | Producer |
 |---|---|---|
-| #投遞箱鏡像 | mirror posts (date header, text, files, 📎 lines); AI reply under mirror (`**🔗 url**`, `**🖼️ name/url**`, `**📄 name**` + `> ` lines, `📸 截圖：[↗1](<url>)`) | relay.py, enrich/pipeline.py |
+| #投遞箱鏡像 | mirror posts (date header, text, files, 📎 lines); AI reply under mirror (`**🔗 url**`, `**🖼️ name/url**`, `**📄 name**` + `> ` lines, `📸 截圖：[↗1](<url>)`); progress message (always the last message) | relay.py, enrich/pipeline.py, activity.py |
 | #關鍵字庫 | `KW|v2` records, `OCR|chat|msg` texts, activity message | records.py, kwindex.py, activity.py |
 | #資料庫 | STATE, IMPORT, LIVE, RECAP_DIRTY, RECAP_NOTES, `#記憶 vN｜…`, `#提示詞 NAME vN｜…` | state.py, memory.py |
 | #總結 | `DAILY|…` / `MONTHLY|…` / `YEARLY|…` posts | recap/runner.py |
-| 連結預覽與進度 | `📸 when｜url` + image `preview.jpg`; activity message | enrich/screenshot.py, activity.py |
+| 連結預覽與進度 | `📸 when｜url` + image `preview.jpg` | enrich/screenshot.py, activity.py |
 | AI 對話 | threads; footer `-# 🧮`; `🗜️ **對話摘要` | chat.py |
 | AI 對話提示詞與記憶 | `#提示詞`, `#記憶` | chat.py |
 

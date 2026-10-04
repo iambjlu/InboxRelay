@@ -305,9 +305,9 @@ async def run(check_only: bool) -> int:
             dc.add_message_handler(relayer.reverse.on_message)
             dc.add_edit_handler(relayer.reverse.on_edit)
             log.info("反向同步已啟用：在 #投遞箱鏡像 發的訊息會同步到 Telegram（含編輯、刪除）")
-        # AI 進度訊息放在「連結預覽」頻道；沒設定就放 #關鍵字庫
-        progress_channel = await dc.channel(cfg.ch_screenshot or cfg.ch_keywords)
-        for cid in {cfg.ch_screenshot, cfg.ch_keywords} - {None}:
+        # AI 進度訊息放在 #投遞箱鏡像 最下面（有新進度就發新的、刪舊的）；舊版放的頻道也一併清掉殘留
+        progress_channel = await dc.channel(cfg.ch_inbox_mirror)
+        for cid in {cfg.ch_inbox_mirror, cfg.ch_screenshot, cfg.ch_keywords} - {None}:
             await act.cleanup_old(await dc.channel(cid), dc.client.user.id)  # type: ignore[union-attr]
         background.append(asyncio.create_task(act.reporter(progress_channel)))
         if relayer.enricher:
