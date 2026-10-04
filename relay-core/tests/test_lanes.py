@@ -120,3 +120,18 @@ class OfflineTest(unittest.TestCase):
             self.assertFalse(en.drained)
             L.LANES.clear()
         asyncio.run(go())
+
+
+class BlockedTest(unittest.TestCase):
+    def test_blocked_lane_waits_and_describes(self):
+        async def go():
+            lane = lanes.Lane("llm", "外部 LLM 工作", "always")
+            flag = {"busy": True}
+            lane.blocked_by = lambda: flag["busy"]
+            self.assertFalse(lane.allowed())
+            self.assertEqual(lane.state, "waiting")
+            self.assertEqual(lane.describe(), "等連結截圖做完")
+            flag["busy"] = False
+            self.assertTrue(lane.allowed())
+            await asyncio.wait_for(lane.gate(), 1)
+        asyncio.run(go())

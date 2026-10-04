@@ -40,6 +40,7 @@ class ShotWorker:
         self._fails: dict = {}                    # 紀錄 → 這一輪拍不到的次數
         self._nonweb: set = set()                 # 確認只有圖片／檔案網址的紀錄（行程存活期間不再檢查）
         self._backoff = 30.0
+        self.on_drained = None                    # callable()：佇列清空時通知（外部 LLM 車道等截圖做完）
         self._waiters: dict[str, list] = {}       # 鏡像連結 → 等這則截圖做完的 Future（AI 分析要拿截圖當輔助）
 
     # ------------------------------------------------------------ 佇列
@@ -117,6 +118,8 @@ class ShotWorker:
                 if task is not None:
                     activity.finish(task, f"{done:,} 則鏡像")
                     task, done = None, 0
+                if self.on_drained is not None:
+                    self.on_drained()
                 self._wake.clear()
                 await self._wake.wait()
                 continue

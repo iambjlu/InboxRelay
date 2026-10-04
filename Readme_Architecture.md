@@ -72,6 +72,7 @@ Source of values: App settings (Keychain for secrets, UserDefaults or synced-fol
 | MEMORY_EDITORS | memory_editors | ∅ | user ids allowed to post #記憶 / feedback (guild owner always allowed) |
 | LINK_SUMMARY | link_summary | true | |
 | LINK_SCREENSHOT | link_screenshot | false | requires tools/linkshot |
+| LLM_WAIT_SHOT | llm_wait_shot | false | `llm` lane is blocked (`Lane.blocked_by`, state `waiting`, describe "等連結截圖做完") while the `shot` lane is `running` with a non-empty queue; `ShotWorker.on_drained` wakes the llm lane. Needs LINK_SCREENSHOT |
 | SHOT_SCHEDULE / SHOT_START / SHOT_END | shot_schedule / shot_start / shot_end | always / 03:30 / 08:00 | `shot` lane schedule (link summary stays on the `llm` lane) |
 | PRIVATE_URLS | private_urls | true | allow LAN/localhost URLs |
 | IGNORE_CERT_ERRORS | ignore_cert | false | |
@@ -107,7 +108,7 @@ Functions: single_instance, setup_logging, install_console (terminal keys n/p/r/
 
 ### lanes.py
 `Lane(name, label, mode, start, end, tz)`; `MODES = always|daily|window|manual`; `ALWAYS_CHECK_SEC = 600`.
-State fields: `open`, `manual`, `paused`, `available` (ane: App connected), `offline` (llm unreachable), `next_start`, `close_at`. `state` → `unavailable|paused|offline|running|waiting`. `allowed()` = available ∧ ¬paused ∧ ¬offline ∧ (always ∨ open).
+State fields: `open`, `manual`, `paused`, `available` (ane: App connected), `offline` (llm unreachable), `next_start`, `close_at`. `state` → `unavailable|paused|offline|running|waiting`. `allowed()` = available ∧ ¬paused ∧ ¬offline ∧ (always ∨ open) ∧ ¬`blocked` (`blocked_by` callable, set for llm when LLM_WAIT_SHOT).
 Methods: `gate()` (await until allowed), `pause()`, `resume()`, `run_now()`, `go_offline(why)` (ends current round; work kept; retried next start or after 600 s in always mode), `describe()`.
 `run_lane(lane, drained, cycle=None)`: loop {wait start/trigger → clear `offline` → run `cycle()` then wait `drained()` → stop on close_at / done / offline}. Globals `LANES`, `setup(cfg)` creates `llm` (start=RECAP_TIME, end=LLM_END) and `ane`, `get(name)`.
 

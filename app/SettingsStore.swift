@@ -75,6 +75,7 @@ enum SettingCatalog {
                                                 Choice(value: "manual", label: "手動執行")], "always"), section: "排程"),
         SettingField(key: "SHOT_START", label: "連結截圖開始時間", kind: .time("03:30"), section: "排程"),
         SettingField(key: "SHOT_END", label: "連結截圖暫停時間", kind: .time("08:00"), section: "排程"),
+        SettingField(key: "LLM_WAIT_SHOT", label: "外部 LLM 等連結截圖做完才開始", kind: .toggle(false), section: "排程"),
         SettingField(key: "LINK_SCREENSHOT", label: "連結截圖", kind: .toggle(false), section: "功能"),
         SettingField(key: "PRIVATE_URLS", label: "內網網址也截圖與摘要", kind: .toggle(true), section: "功能"),
         SettingField(key: "IGNORE_CERT_ERRORS", label: "憑證無效也強制開啟（截圖／摘要）", kind: .toggle(false), section: "功能"),
@@ -99,6 +100,7 @@ enum SettingCatalog {
         case "LLM_END": return mode("LLM_SCHEDULE", "daily") == "window"
         case "ANE_START": return ["daily", "window"].contains(mode("ANE_SCHEDULE", "always"))
         case "ANE_END": return mode("ANE_SCHEDULE", "always") == "window"
+        case "LLM_WAIT_SHOT": return ["1", "true", "yes", "on"].contains((values["LINK_SCREENSHOT"] ?? "").lowercased())
         case "SHOT_START": return ["daily", "window"].contains(mode("SHOT_SCHEDULE", "always"))
         case "SHOT_END": return mode("SHOT_SCHEDULE", "always") == "window"
         default: return true

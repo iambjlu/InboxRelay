@@ -55,6 +55,7 @@ class Lane:
         self.offline = False                    # llm：外部 LLM 連不上 → 這一輪先停，下次開始時間再試
         self.next_start: datetime | None = None
         self.close_at: datetime | None = None
+        self.blocked_by: Callable[[], bool] | None = None   # 回傳 True＝暫時不能跑（例如 llm 等連結截圖做完）
         self._changed = asyncio.Event()
         self._trigger = asyncio.Event()
 
@@ -63,7 +64,8 @@ class Lane:
         return datetime.now(self.tz)
 
     def allowed(self) -> bool:
-        return self.available and not self.paused and not self.offline and (self.mode == "always" or self.open)
+        return (self.available and not self.paused and not self.offline and (self.mode == "always" or self.open)
+                and not self.blocked)
 
     @property
     def state(self) -> str:
@@ -75,6 +77,10 @@ class Lane:
         if self.offline:
             return "offline"
         return "running" if self.allowed() else "waiting"
+
+    @property
+    def blocked(self) -> bool:
+        return bool(self.blocked_by and self.blocked_by())
 
     @property
     def queued(self) -> bool:
@@ -124,6 +130,8 @@ class Lane:
         return True
 
     def describe(self) -> str:
+        if self.blocked:
+            return "等連結截圖做完"
         if self.mode == "always":
             return "永遠立即執行"
         if self.mode == "manual":

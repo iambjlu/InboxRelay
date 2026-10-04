@@ -398,7 +398,11 @@ async def run(check_only: bool) -> int:
             background.append(asyncio.create_task(shot_worker.run()))
             background.append(asyncio.create_task(lanes.run_lane(
                 shot_lane, drained=lambda: shot_worker.drained, cycle=shot_worker.cycle)))
-            log.info("📸 連結截圖：%s", shot_lane.describe())
+            if cfg.llm_wait_shot:
+                llm_l = lanes.get("llm")
+                llm_l.blocked_by = lambda: (shot_lane.state == "running" and not shot_worker.drained)
+                shot_worker.on_drained = llm_l.notify          # 截圖做完 → 叫醒外部 LLM 車道
+            log.info("📸 連結截圖：%s%s", shot_lane.describe(), "（外部 LLM 等截圖做完才開始）" if cfg.llm_wait_shot else "")
         else:
             lanes.LANES.pop("shot", None)           # 沒開連結截圖：不顯示這條車道
         if ipc.enabled():
