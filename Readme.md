@@ -124,7 +124,7 @@ AI 對話、搜尋、通知頻道的互動不受排程限制，隨時可用。
 - 圖片、檔案、網頁、截圖都只在記憶體處理，用完就釋放，不落地。
 - 所有資料存在你的 Discord 伺服器；本機只放 Python 環境與少量檔案於
   `~/Library/Application Support/InboxRelay`。
-- 只有「失敗」才寫紀錄檔：`ocr-failures.log`（圖片文字辨識）、`linkshot-last.log`（網頁截圖）。
+- 本機不寫任何紀錄檔；紀錄只在 App 主視窗的日誌（記憶體，最多 500 行）。
 - 網頁截圖使用不保存 Cookie／快取的瀏覽器設定。
 
 ---
@@ -134,8 +134,8 @@ AI 對話、搜尋、通知頻道的互動不受排程限制，隨時可用。
 | 狀況 | 看哪裡 |
 |---|---|
 | App 編譯失敗 | `app/.build.log` |
-| 網頁截圖失敗 | `~/Library/Application Support/InboxRelay/linkshot-last.log` |
-| 圖片顯示「（無法取得圖片）」 | `~/Library/Application Support/InboxRelay/ocr-failures.log` |
+| 網頁截圖失敗 | App 主視窗日誌 |
+| 圖片顯示「（無法取得圖片）」 | 不用處理：每次「本機 ANE」車道開始（排程或立即執行）都會自動重試；原因看 App 主視窗日誌 |
 | 外部 LLM 顯示離線 | 確認端點與模型名稱；恢復後按「立即執行」或等下次開始時間 |
 | 頻道權限錯誤 | 主視窗日誌會列出缺哪個權限 |
 

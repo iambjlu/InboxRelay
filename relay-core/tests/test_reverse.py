@@ -60,8 +60,8 @@ class ReverseTest(unittest.TestCase):
         self.assertEqual(len(split_text("a" * 5000)), 2)
 
     def test_text_only(self):
-        out = asyncio.run(self.rs._send("編輯蝦皮", []))
-        self.assertEqual(self.bot.calls, [("text", "編輯蝦皮")])
+        out = asyncio.run(self.rs._send("編輯報價單", []))
+        self.assertEqual(self.bot.calls, [("text", "編輯報價單")])
         self.assertEqual(out[0][1], "text")
 
     def test_caption_on_first_photo_then_docs(self):

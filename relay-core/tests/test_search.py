@@ -18,7 +18,7 @@ def e(day, msg, text, typ="text", gist=None, fn=None):
     return SimpleNamespace(rec=r)
 
 
-ENTRIES = [e("2026-09-30", 1, "中午吃滿漢大餐泡麵"), e("2026-09-30", 2, "編輯蝦皮"),
+ENTRIES = [e("2026-09-30", 1, "中午吃滿漢大餐泡麵"), e("2026-09-30", 2, "編輯報價單"),
            e("2026-09-29", 3, "晚餐便當"), e("2026-09-30", 4, "", "image", gist="一碗牛肉麵的照片")]
 
 

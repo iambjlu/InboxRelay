@@ -234,7 +234,7 @@ async def run(check_only: bool) -> int:
             await mem.load()
             if not check_only:
                 asyncio.create_task(mem.refresh_once(
-                    "memory-rules-v2", "待確認只留反覆出現、看不懂就會整理錯的縮寫或代號，最多 3 條，沒有就寫「無」；不要放專案或事件的後續、人際關係、一次性的生活事件、只是看看的東西、里程油耗電量金額等數字紀錄。"))
+                    "memory-rules-v2", "待確認只留反覆出現、看不懂就會整理錯的縮寫或代號，最多 3 條，沒有就寫「無」；不要放專案或事件的後續、人際關係、一次性的生活事件、只是看看的東西、電量金額重量等數字紀錄。"))
             if aitest:
                 aitest.memory = mem
                 aitest.prompts = pstore
@@ -400,7 +400,8 @@ async def run(check_only: bool) -> int:
             ane_lane.available = False            # 等 App 回報支援文字辨識（hello）
             relayer.ocr.scan_index()
             background.append(asyncio.create_task(relayer.ocr.run()))
-            background.append(asyncio.create_task(lanes.run_lane(ane_lane, drained=lambda: relayer.ocr.drained)))
+            background.append(asyncio.create_task(lanes.run_lane(ane_lane, drained=lambda: relayer.ocr.drained,
+                                                             cycle=relayer.ocr.cycle)))
             background.append(asyncio.create_task(server.run()))
             log.info("由 InboxRelay.app 管理（IPC 已啟用）")
         if relayer.enricher is not None:

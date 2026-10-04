@@ -3,6 +3,4 @@
 __pycache__/
 app/.build.log
 build/
-tools/.linkshot-build.log
 tools/linkshot
-tools/.linkshot-last.log

@@ -55,25 +55,50 @@ final class OCRService: @unchecked Sendable {
            let o = CGImagePropertyOrientation(rawValue: raw) {
             orientation = o
         }
-        // 先用 Neural Engine；失敗（偶爾會暫時建不起來）就讓 Vision 自己挑 CPU／GPU 再跑一次
+        // 先用 Neural Engine；失敗（偶爾會暫時建不起來）就讓 Vision 自己挑 CPU／GPU 再跑一次；
+        // 還是失敗（CRImageReaderError：色彩空間／位元深度特殊、尺寸過大）→ 重繪成標準 sRGB 8-bit 再試
         var lastError = "辨識失敗"
-        for useANE in [true, false] {
+        for attempt in 0..<3 {
+            let useANE = attempt == 0
+            var target = img
+            if attempt == 2 {
+                guard let n = normalize(img) else { break }
+                target = n
+            }
             let req = VNRecognizeTextRequest()
             req.recognitionLevel = .accurate
             req.usesLanguageCorrection = true
             req.recognitionLanguages = ["zh-Hant", "en-US"]
             if useANE { preferNeuralEngine(req) }
-            let handler = VNImageRequestHandler(cgImage: img, orientation: orientation, options: [:])
+            let handler = VNImageRequestHandler(cgImage: target, orientation: orientation, options: [:])
             do {
                 try handler.perform([req])
             } catch {
-                lastError = (useANE ? "ANE：" : "CPU/GPU：") + error.localizedDescription
+                lastError = (useANE ? "ANE：" : attempt == 1 ? "CPU/GPU：" : "重繪後：") + error.localizedDescription
                 continue
             }
             let lines = (req.results ?? []).compactMap { $0.topCandidates(1).first?.string }
             return (lines.joined(separator: "\n"), nil)
         }
         return (nil, lastError)
+    }
+
+    /// 重繪成標準 sRGB／8-bit／RGBA 點陣圖（長邊最多 4096），避開 Vision 讀不了的特殊格式。
+    private func normalize(_ img: CGImage) -> CGImage? {
+        let maxSide: CGFloat = 4096
+        let w = CGFloat(img.width), h = CGFloat(img.height)
+        guard w > 0, h > 0 else { return nil }
+        let scale = min(1, maxSide / max(w, h))
+        let tw = max(1, Int((w * scale).rounded())), th = max(1, Int((h * scale).rounded()))
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(data: nil, width: tw, height: th, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return nil }
+        ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: tw, height: th))
+        ctx.interpolationQuality = .high
+        ctx.draw(img, in: CGRect(x: 0, y: 0, width: tw, height: th))
+        return ctx.makeImage()
     }
 
     /// 每個運算階段如果支援 Neural Engine 就指定它（macOS 14+）；不支援就讓 Vision 自己選。

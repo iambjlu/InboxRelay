@@ -3,7 +3,7 @@
 
 - 判斷依據是 #關鍵字庫：圖片紀錄沒有 `ocr:` 欄位＝還沒辨識 → 排進佇列（舊圖片自動補做）。
 - 文字存在 #關鍵字庫 裡這張圖自己的 OCR 訊息（OCR|tg_chat|tg_msg，一張圖一則、最多塞滿一則），
-  主紀錄的 `ocr:` 欄位寫「見 OCR 訊息」；沒有字寫「（無文字）」，拿不到圖寫「（無法取得圖片）」，之後不會重做。
+  主紀錄的 `ocr:` 欄位寫「見 OCR 訊息」；沒有字寫「（無文字）」，拿不到圖寫「（無法取得圖片）」；每次開始辨識（排程或立即執行）都會把這些以及未完成的圖片全部重做。
 - 搜尋、關鍵字、每日總結都會用到圖中文字。
 - 辨識出文字的那天如果「已經有每日總結」，會標記「需要重新總結」（RECAP_DIRTY），
   下一次外部 LLM 工作時重寫那天的總結，並連帶更新月／年總結。還沒寫總結的日子不用標，寫的時候自然會用到。
@@ -32,7 +32,6 @@ LEGACY_CUT = 900        # 舊版只存約 1000 字並以「…」結尾 → 重�
 TIMEOUT = 120
 MAX_TRIES = 3          # 同一張圖辨識失敗幾次才標「無法取得圖片」
 PACE_SEC = 0.4          # 每張圖之間稍微停一下，避免 Discord 圖片伺服器限流
-RETRY_FLAG = "ocr-retry-no-image-v2"   # 一次性：舊版誤記成「無法取得圖片」的（下載限流、檔名對不上），全部重試一次
 _CARD = re.compile(r"(?<!\d)(?:\d[ -]?){12,18}\d(?!\d)")
 
 
@@ -136,22 +135,6 @@ def match_attachments(entries: list, attachments: list, content: str = "") -> li
     return [(e, got.get(e.rec.key)) for e in image_entries]
 
 
-def log_failure(why: str, rec, mirror: str, attachments=()) -> None:
-    """只有失敗才寫檔（data_dir/ocr-failures.log），方便查修；超過 1 MB 就從頭開始。"""
-    try:
-        from datetime import datetime
-        from paths import data_dir
-        f = data_dir() / "ocr-failures.log"
-        if f.exists() and f.stat().st_size > 1_000_000:
-            f.unlink()
-        names = "、".join(a.filename for a in attachments) or "（無附件）"
-        with f.open("a", encoding="utf-8") as fh:
-            fh.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}｜{why}｜TG#{rec.tg_msg}｜{rec.type}｜"
-                     f"{rec.filename or '（無檔名）'}｜{mirror}｜鏡像附件：{names}\n")
-    except Exception:
-        log.debug("寫入失敗紀錄失敗", exc_info=True)
-
-
 class OcrWorker:
     def __init__(self, dc, index, send) -> None:
         self.dc = dc
@@ -204,20 +187,14 @@ class OcrWorker:
                 asyncio.get_running_loop().create_task(self._clear_stale(stale))
             except RuntimeError:
                 pass
-        from paths import data_dir
-        flag = data_dir() / RETRY_FLAG
-        if not flag.exists():
-            retry = [e for e in entries if is_image_record(e.rec) and e.rec.ocr == NO_IMAGE]
-            for e in sorted(retry, key=lambda e: e.msg_id):
-                self._retry_keys.add(e.rec.key)
-                self.submit(e.rec.mirror)
-            if retry:
-                log.info("圖片文字辨識：%d 張先前標為「無法取得圖片」的圖片會再試一次", len(retry))
-            try:
-                flag.write_text("done\n")
-            except OSError:
-                pass
-            n += len(retry)
+        retry = [e for e in entries if e.rec.ocr == NO_IMAGE and (is_image_record(e.rec) or is_link_image_record(e.rec))]
+        for e in sorted(retry, key=lambda e: e.msg_id):      # 先前「無法取得圖片」的每次都重試
+            self._retry_keys.add(e.rec.key)
+            self._fails.pop(e.rec.key, None)
+            self.submit(e.rec.mirror)
+        if retry:
+            log.info("圖片文字辨識：%d 張先前無法取得或辨識失敗的圖片會再試一次", len(retry))
+        n += len(retry)
         for e in entries:
             if getattr(e, "legacy", False) and not needs_ocr(e.rec):
                 self.rewrite.append(e.rec.key)
@@ -227,6 +204,10 @@ class OcrWorker:
         if n:
             log.info("圖片文字辨識：%d 張圖片還沒辨識，已排入「本機 ANE」佇列", n)
         return n
+
+    async def cycle(self) -> None:
+        """「本機 ANE」車道每次開始（排程或立即執行）時：重新掃描，把未辨識、未完成、無法取得的圖片全部排進佇列。"""
+        self.scan_index()
 
     @property
     def backlog(self) -> int:
@@ -325,8 +306,7 @@ class OcrWorker:
             if res.get("error"):
                 tries = self._fails.get((e.rec.key, url), 0) + 1
                 self._fails[(e.rec.key, url)] = tries
-                log_failure(f"網址圖片{'下載' if res.get('retry') else '辨識'}失敗（第 {tries} 次）：{res['error']}",
-                            e.rec, url)
+                log.warning("網址圖片%s失敗（第 %d 次）：%s", "下載" if res.get("retry") else "辨識", tries, res["error"])
                 if tries < MAX_TRIES:            # 外部網站可能暫時連不上 → 稍後再試，試滿才放棄
                     if res.get("retry"):
                         wait = float(res.get("retry_after") or 0)
@@ -338,6 +318,7 @@ class OcrWorker:
             t = clean(str(res.get("text", "")))
             if t not in MARKERS:
                 texts.append(t)
+        self._retry_keys.discard(e.rec.key)
         for url in (e.rec.img or "").split():
             self._fails.pop((e.rec.key, url), None)
         text = "\n".join(texts) if texts else (NO_TEXT if got_any else NO_IMAGE)
@@ -375,7 +356,7 @@ class OcrWorker:
                 continue
             if att is None:                      # 鏡像裡真的沒有這張圖（例如當初太大沒搬）
                 self._retry_keys.discard(e.rec.key)
-                log_failure("鏡像已刪除" if msg is None else "對不到鏡像附件", e.rec, mirror_url, atts)
+                log.warning("%s：TG#%s %s", "鏡像已刪除" if msg is None else "對不到鏡像附件", e.rec.tg_msg, e.rec.filename)
                 if e.rec.ocr != NO_IMAGE:
                     await self.index.update(e.rec.key, ocr=NO_IMAGE)
                 continue
@@ -400,7 +381,6 @@ class OcrWorker:
                 tries = self._fails.get(e.rec.key, 0) + 1
                 self._fails[e.rec.key] = tries
                 log.warning("文字辨識失敗（%s，第 %d 次）：%s", att.filename, tries, res["error"])
-                log_failure(f"辨識失敗（第 {tries} 次）：{res['error']}", e.rec, mirror_url, [att])
                 if tries < MAX_TRIES:            # 辨識引擎偶爾會暫時出錯 → 等一下再試，試滿才放棄
                     return False
                 text = NO_IMAGE

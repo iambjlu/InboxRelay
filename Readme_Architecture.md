@@ -13,7 +13,7 @@ Telegram group ──(python-telegram-bot polling)──► relay-core (Python 3
                                                     └─ subprocess tools/linkshot (WebKit screenshot → JPEG on stdout)
 ```
 
-- Persistence: Discord only (records, state, memory, prompts, summaries). Local disk: venv, flags, failure logs (see §5).
+- Persistence: Discord only (records, state, memory, prompts, summaries). Local disk: venv, lock, one-time flags (see §5); no log files are written (the App keeps an in-memory 500-line log buffer).
 - Media (attachments, images, pages, screenshots) handled as in-memory bytes; never written to disk.
 - One core instance per machine (`data_dir/instance.lock`) and per guild (host heartbeat in `#資料庫 STATE`).
 - Two work lanes (`lanes.py`): `llm` (external LLM background work) and `ane` (local OCR via the App). Interactive features (search, chat, feedback, AI test) bypass lanes.
@@ -35,7 +35,7 @@ InboxRelay/
 └── relay-core/               Python core (§3); tests/ (unittest)
 ```
 
-Git-ignored: `.env`, `.venv/`, `__pycache__/`, `app/.build.log`, `build/`, `tools/.linkshot-build.log`, `tools/linkshot`.
+Git-ignored: `.env`, `.venv/`, `__pycache__/`, `app/.build.log`, `build/`, `tools/linkshot`.
 
 ## 2. Configuration (environment variables)
 
@@ -95,7 +95,7 @@ Source of values: App settings (Keychain for secrets, UserDefaults or synced-fol
 
 ### main.py
 Entry point. Subcommands: (none) live core; `--check`; `import --path [--from --to --dry-run --append-out-of-order]`; `import-extra --path [--from --to --dry-run]`; `reset [--yes --memory --chats --prompts --all]`; `recap [--date|--month|--year]`. Exit codes: 0 ok, 2 config/permission, 3 import running, 4 already running on this machine, 5 running on another host.
-`run(check_only)` wiring order: `lanes.setup` → Discord login + permission check → LLM ping (failure → `lanes.get("llm").go_offline`) → `MemoryStore` + `PromptStore.load` → `mem.refresh_once("memory-rules-v2", …)` → Telegram → `Relayer`/`Enricher`/`Prober` → recap (`Recapper`, `run_lane(llm, cycle=recapper.cycle)`) → IPC (`OcrWorker`, `enricher.on_link_images = ocr.submit`, `run_lane(ane)`) → background `_refresh_links` (waits `enricher.drained`, then `enrich.refresh.refresh_links`) → `poll_new_records` every 300 s → `queue_backlog` (un-enriched records: recent live → probe, else enrich).
+`run(check_only)` wiring order: `lanes.setup` → Discord login + permission check → LLM ping (failure → `lanes.get("llm").go_offline`) → `MemoryStore` + `PromptStore.load` → `mem.refresh_once("memory-rules-v2", …)` → Telegram → `Relayer`/`Enricher`/`Prober` → recap (`Recapper`, `run_lane(llm, cycle=recapper.cycle)`) → IPC (`OcrWorker`, `enricher.on_link_images = ocr.submit`, `run_lane(ane, cycle=ocr.cycle)`) → background `_refresh_links` (waits `enricher.drained`, then `enrich.refresh.refresh_links`) → `poll_new_records` every 300 s → `queue_backlog` (un-enriched records: recent live → probe, else enrich).
 Functions: single_instance, setup_logging, install_console (terminal keys n/p/r/s/h), notify, online_message, status_bar_lines, queue_backlog, poll_new_records, run_recap, run_reset_cmd, run_import_extra, run_import.
 
 ### config.py
@@ -181,7 +181,7 @@ Queue: `asyncio.Queue` + `_front` deque (jobs returned after LLM offline, proces
 `find_urls` (`URL_RE`, ASCII only). `fetch_link(url, want_image)` → (text, kind, bytes) with kind `article|og|file|image|""` (HTML ≤ `MAX_BYTES=3MB`, image ≤ `IMAGE_MAX=20MB`, non-HTML only headers read → `file_link_note`). `fetch_text(url)` → (text, kind) (used by chat.py). `probe_link(url)` → (text, kind, bytes, err) with kind `private` when blocked by PRIVATE_URLS. `embed_preview(message, url)` → Discord embed (site/author/title/description). `summarize_probed(llm, url, probed, preview, shot, caption, describe_image)` → `LinkResult(title, summary, image, failed)`; fallback uses prompt `LINK_FALLBACK` and appends `（根據網頁標籤、網頁預覽、截圖）`. `summarize_link(llm, url)` → str (aitest). `sniff_mime`, `human_size`, `UA`.
 
 ### enrich/screenshot.py
-Runs `tools/linkshot <url> --timeout --settle 5 --width 1280 --max-height 4000 [--insecure]`; image from stdout (JPEG/PNG ≤ `MAX_PNG=8MB`); non-persistent WebKit store. `capture`, `capture_with_reason`, `capture_many(urls, label, failures)`, `post_screenshots(dc, channel_id, urls, when, back_url, back_label, pngs=None)` → post urls (and fills `pngs[url]`). Failure only → `data_dir/linkshot-last.log`. `ALLOW_PRIVATE`, `IGNORE_CERT`, `CERT_WARN`, `is_public_url`.
+Runs `tools/linkshot <url> --timeout --settle 5 --width 1280 --max-height 4000 [--insecure]`; image from stdout (JPEG/PNG ≤ `MAX_PNG=8MB`); non-persistent WebKit store. `capture`, `capture_with_reason`, `capture_many(urls, label, failures)`, `post_screenshots(dc, channel_id, urls, when, back_url, back_label, pngs=None)` → post urls (and fills `pngs[url]`). Failures are only logged to the core logger (no file). `ALLOW_PRIVATE`, `IGNORE_CERT`, `CERT_WARN`, `is_public_url`.
 
 ### enrich/refresh.py
 One-time backfill (flag `link-refresh-v1`): for records with `reply` and a URL in the excerpt, fetch the reply message, find blocks `**🔗|🖼️ url**` + `> …` lines whose body `needs_refresh` (無法讀取 / 僅根據網頁標題與描述 / 檔案下載連結+image/), redo with `summarize_probed` (old screenshot from `rec.shot` or a fresh capture, not posted), edit the reply (`join_fit` ≤2000), set `img` and notify OCR. Offline → `go_offline`, wait lane, retry same item. Functions: needs_refresh, parse_segments, join_fit, refresh_one, refresh_links.
@@ -196,7 +196,7 @@ One-time backfill (flag `link-refresh-v1`): for records with `reply` and a URL i
 - Image records: `is_image_record` (type image; album only if filename has `IMAGE_EXT`; files by extension; not origin extra). `match_attachments(entries, attachments, content)`: exact name → normalized name (`_norm`: alnum only, strip SPOILER_) → exclude `📎` missing names (`_missing`) → order when counts match.
 - Link images: `is_link_image_record` (rec.img set, not an image record) → `_link_images` sends each URL directly to the App, joins texts into `ocr`.
 - `_ask(url, name)` → result dict or None (timeout `TIMEOUT=120`); pacing `PACE_SEC=0.4`; backoff for transient download errors (`retry`, `retry_after`); non-transient errors retried until `MAX_TRIES=3` (`_fails`) then `（無法取得圖片）`.
-- `needs_ocr`, `useful`, `clean` (Luhn card masking → `＊＊＊＊1234`), `log_failure` → `data_dir/ocr-failures.log` (≤1 MB). One-time flag `ocr-retry-no-image-v2` retries all NO_IMAGE; `_clear_stale` clears ocr on album videos. Days with new text and an existing daily summary → `mark_days` (RECAP_DIRTY).
+- `needs_ocr`, `useful`, `clean` (Luhn card masking → `＊＊＊＊1234`). No failure log file. `scan_index()` (called at startup and by `cycle()` at every start of the `ane` lane, i.e. schedule or run-now) queues every record with no `ocr`, truncated legacy `ocr`, or `ocr == （無法取得圖片）` (image and link-image records) into `_retry_keys` and resets its `_fails`, so previously failed/unfinished images are redone each round; they end up `（無法取得圖片）` again only after `MAX_TRIES` failures or when no mirror attachment matches. `_clear_stale` clears ocr on album videos. Days with new text and an existing daily summary → `mark_days` (RECAP_DIRTY).
 
 ### ipc.py
 Enabled when `INBOXRELAY_IPC=1`. JSON lines; logs go to stderr.
@@ -246,7 +246,7 @@ unittest, run: `python -m unittest discover -s relay-core/tests`. Files: test_ac
 |---|---|
 | InboxRelayApp.swift | `@main InboxRelayApp`: MenuBarExtra + main window; launch at login via `SMAppService.mainApp` |
 | CoreController.swift | Launches bundled core (`Contents/Resources/core/run.sh`) with env from settings + `INBOXRELAY_IPC=1`; restart with backoff; parses status JSON (`CoreStatus`, `CoreTask`, `LaneStatus{label,mode,state,describe,queued,backlog,next_start}`); lane actions; `handleOCR` (calls OCRService, replies `ocr_result` with retry info); `recapReset`; in-memory `logs` |
-| OCRService.swift | `recognize(urlString:completion:)`: ephemeral URLSession (no cache/cookies), HTTP status check (non-2xx → retry with Retry-After), `VNRecognizeTextRequest` (accurate, zh-Hant + en-US, language correction), Neural Engine first then CPU/GPU fallback; serial queue, image in memory only |
+| OCRService.swift | `recognize(urlString:completion:)`: ephemeral URLSession (no cache/cookies), HTTP status check (non-2xx → retry with Retry-After), `VNRecognizeTextRequest` (accurate, zh-Hant + en-US, language correction), Neural Engine first, then CPU/GPU, then a re-render to standard sRGB 8-bit RGBA (long side ≤ 4096; works around `CRImageReaderError` on unusual formats); serial queue, image in memory only |
 | SettingsStore.swift | `SettingCatalog.fields` (key = env name, label, kind text/secret/toggle/time/choice/number, section 連線/頻道/外部 LLM 設定/排程/功能/…); secrets in Keychain; others in UserDefaults or synced folder `settings.json` (optional secrets there); first run imports `.env` |
 | Views.swift | Menu content (lane cards: colors running green/teal, waiting blue, offline red "LLM 離線", paused orange; run/pause buttons), dashboard, settings (reset button with confirmation, Cancel default), log view |
 | core_run.sh | Bundled launcher: venv in `data_dir/venv` (requirements hash stamp), `INBOXRELAY_ENV=data_dir/.env`, stdout reserved for JSON |
@@ -260,9 +260,7 @@ tools/linkshot.swift: WKWebView with `WKWebsiteDataStore.nonPersistent()`, loads
 | venv/ | first launch / requirements change |
 | .env | optional (App passes env directly) |
 | instance.lock | while core runs |
-| ocr-failures.log | OCR failure only (≤1 MB, then reset) |
-| linkshot-last.log | screenshot failure only |
-| ocr-retry-no-image-v2, link-refresh-v1, memory-rules-v2, chat-memory-rules-v2 | one-time migration flags (content `done`) |
+| link-refresh-v1, memory-rules-v2, chat-memory-rules-v2 | one-time migration flags (content `done`) |
 
 ## 6. Discord data conventions
 

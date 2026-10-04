@@ -103,7 +103,7 @@ class FakeLLM:
 
     async def chat(self, prompt, data=None, **kw):
         if "JSON" in prompt:
-            return '{"kw": ["蝦皮"], "gist": "待辦：編輯蝦皮"}'
+            return '{"kw": ["報價單"], "gist": "待辦：編輯報價單"}'
         return "摘要內容"
 
 
@@ -116,15 +116,15 @@ def rec(msg, mirror="https://discord.com/channels/1/2/3", **kw):
 class TestEnricher(unittest.TestCase):
     def test_text_only_no_reply_and_keywords(self):
         from enrich.pipeline import Enricher
-        mirror = FakeMsg("# 2026-10-02\n編輯蝦皮")
-        idx = FakeIndex([rec(5, excerpt="編輯蝦皮")])
+        mirror = FakeMsg("# 2026-10-02\n編輯報價單")
+        idx = FakeIndex([rec(5, excerpt="編輯報價單")])
         dc = SimpleNamespace(fetch_by_url=lambda u: _ret(mirror))
         cfg = SimpleNamespace(link_summary=True, image_summary=True, document_summary=True, keywords=True,
                               link_screenshot=False, ch_screenshot=None)
         e = Enricher(cfg, dc, FakeLLM(), idx, {}, None)
         asyncio.run(e.process(SimpleNamespace(keys=[(-1, 5)], mirror_url="u")))
         self.assertEqual(mirror.replies, [])                         # 純文字不回覆
-        self.assertEqual(idx.updates[(-1, 5)]["kw"], "蝦皮")
+        self.assertEqual(idx.updates[(-1, 5)]["kw"], "報價單")
         self.assertTrue(idx.updates[(-1, 5)]["enriched"])
 
 

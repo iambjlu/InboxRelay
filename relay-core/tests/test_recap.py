@@ -160,7 +160,7 @@ class TestRecapper(unittest.TestCase):
 
     def test_make_post_fits_one_message(self):
         from recap.runner import make_post
-        body = "\n".join(f"- 重點{i} [↗{i}](<https://discord.com/channels/519696701917757440/1555324160195166300/{i:019d}>)"
+        body = "\n".join(f"- 重點{i} [↗{i}](<https://discord.com/channels/100000000000000000/200000000000000000/{i:019d}>)"
                           for i in range(1, 40))
         post = make_post("DAILY", "2026-10-01", "# 📰 標題", body, "-# 共 39 則訊息")
         self.assertLessEqual(len(post), 1990)

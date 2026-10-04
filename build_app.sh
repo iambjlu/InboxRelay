@@ -25,11 +25,8 @@ rsync -a --exclude '__pycache__' --exclude '*.pyc' --exclude 'tests' relay-core 
 cp app/core_run.sh "$CORE/run.sh"
 chmod +x "$CORE/run.sh"
 if ! swiftc -O -swift-version 5 tools/linkshot.swift -o "$CORE/tools/linkshot" \
-     -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker tools/linkshot-Info.plist \
-     2> tools/.linkshot-build.log; then
-  echo "[build] ⚠️ 截圖小工具編譯失敗（連結截圖會停用），錯誤在 tools/.linkshot-build.log"
-else
-  rm -f tools/.linkshot-build.log
+     -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker tools/linkshot-Info.plist; then
+  echo "[build] ⚠️ 截圖小工具編譯失敗（連結截圖會停用），錯誤訊息見上方"
 fi
 
 # App 圖示（Dock 用）：第一次 build 時產生 build/AppIcon.icns，之後沿用；失敗也不影響 App

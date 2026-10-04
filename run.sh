@@ -26,11 +26,8 @@ if [ "$(uname)" = "Darwin" ] && command -v swiftc >/dev/null 2>&1; then
     echo "[run] 編譯連結截圖小工具 tools/linkshot"
     # 內嵌 Info.plist：允許 http:// 網址（ATS 例外），否則 http 連結會被系統擋掉
     if ! swiftc -O -swift-version 5 tools/linkshot.swift -o tools/linkshot \
-        -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker tools/linkshot-Info.plist \
-        2> tools/.linkshot-build.log; then
-      echo "[run] ⚠️ linkshot 編譯失敗（連結截圖會停用），錯誤訊息在 tools/.linkshot-build.log"
-    else
-      rm -f tools/.linkshot-build.log
+        -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker tools/linkshot-Info.plist; then
+      echo "[run] ⚠️ linkshot 編譯失敗（連結截圖會停用），錯誤訊息見上方"
     fi
   fi
 fi

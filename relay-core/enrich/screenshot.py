@@ -58,17 +58,7 @@ async def is_public_url(url: str) -> bool:
     return bool(ips) and not any(_is_private_ip(ip) for ip in ips)
 
 
-def _last_log() -> Path:
-    from paths import data_dir
-    return data_dir() / "linkshot-last.log"
 SETTLE = 5          # 載入完成後等幾秒才拍
-
-
-def _save_log(url: str, code, err: str) -> None:
-    try:
-        _last_log().write_text(f"{url}\nexit={code}\n{err[-4000:]}\n", encoding="utf-8")
-    except OSError:
-        pass
 
 
 async def capture(url: str, timeout: float = 25) -> bytes | None:
@@ -77,8 +67,7 @@ async def capture(url: str, timeout: float = 25) -> bytes | None:
 
 
 async def capture_with_reason(url: str, timeout: float = 25) -> tuple[bytes | None, str]:
-    """截圖：成功回傳 (PNG, "")；失敗回傳 (None, 原因)。只有失敗時才把 linkshot 的輸出寫到
-    ~/Library/Application Support/InboxRelay/linkshot-last.log（成功不寫檔）。"""
+    """截圖：成功回傳 (PNG, "")；失敗回傳 (None, 原因)。"""
     if not available():
         return None, "找不到 tools/linkshot（重開 App 或 ./run.sh 會自動編譯）"
     if urlparse(url).scheme not in ("http", "https"):
@@ -98,14 +87,12 @@ async def capture_with_reason(url: str, timeout: float = 25) -> tuple[bytes | No
         except ProcessLookupError:
             pass
         log.warning("截圖逾時：%s", url)
-        _save_log(url, "timeout", "")
         return None, "逾時"
     except OSError as e:
         log.warning("無法執行 linkshot：%s", e)
         return None, f"無法執行 linkshot：{e}"
     msg = err.decode(errors="ignore").strip()
     if proc.returncode != 0 or not out.startswith((b"\xff\xd8", b"\x89PNG")) or len(out) > MAX_PNG:
-        _save_log(url, proc.returncode, msg)          # 只有失敗才寫檔（給除錯用）
         last = msg.splitlines()[-1].removeprefix("linkshot: ") if msg else ""
         reason = last or (f"結束碼 {proc.returncode}" if proc.returncode else "沒有輸出圖片")
         if len(out) > MAX_PNG:

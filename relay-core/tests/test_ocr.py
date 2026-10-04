@@ -102,7 +102,6 @@ class OcrVisionRetryTest(unittest.TestCase):
                 return N(attachments=[N(filename="a.jpg", content_type="image/jpeg", url="u")])
             sent = []
             w = OcrWorker(N(fetch_by_url=fetch), Index(), sent.append)
-            _ocr.log_failure = lambda *a, **k: None
             results = []
             for _ in range(_ocr.MAX_TRIES):
                 t = asyncio.create_task(w.process(r.mirror))
@@ -111,6 +110,25 @@ class OcrVisionRetryTest(unittest.TestCase):
                 results.append(await t)
             self.assertEqual(results, [False] * (_ocr.MAX_TRIES - 1) + [True])
             self.assertEqual(updates["ocr"], NO_IMAGE)
+        asyncio.run(go())
+
+
+class OcrRetryEachScanTest(unittest.TestCase):
+    def test_scan_requeues_no_image_every_time(self):
+        async def go():
+            r = __import__("dataclasses").replace(rec(1), ocr=NO_IMAGE)
+            entry = N(rec=r, msg_id=10, legacy=False)
+
+            class Index:
+                entries = {r.key: entry}
+
+            w = OcrWorker(None, Index(), lambda d: None)
+            for _ in range(2):
+                self.assertEqual(w.scan_index(), 1)
+                self.assertEqual(list(w.queue), [r.mirror])
+                self.assertIn(r.key, w._retry_keys)
+                w.queue.clear()
+                w._queued.clear()
         asyncio.run(go())
 
 

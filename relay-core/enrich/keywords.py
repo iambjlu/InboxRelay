@@ -1,5 +1,5 @@
 # relay-core/enrich/keywords.py
-"""關鍵字抽取：回傳 (關鍵字列表, 一句話重點)。短訊息也照樣分析（例如「編輯蝦皮」是待辦）。"""
+"""關鍵字抽取：回傳 (關鍵字列表, 一句話重點)。短訊息也照樣分析（例如「編輯報價單」是待辦）。"""
 from __future__ import annotations
 
 import json

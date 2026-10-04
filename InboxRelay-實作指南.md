@@ -556,7 +556,7 @@ enriched: yes | no
 **狀態：** 已實作，預設關閉（`LINK_SCREENSHOT=true` 開啟）。
 
 - **工具：** `tools/linkshot.swift`，用 macOS 內建 WebKit（WKWebView）在畫面外的透明視窗載入網頁，截第一個畫面（1280×800），PNG 從 stdout 輸出。不出現在 Dock、使用非持久化資料儲存（不寫 Cookie／快取到硬碟），只允許 http/https，擋下載。
-- **編譯：** `run.sh` 偵測到 Xcode 命令列工具（`swiftc`）就自動編譯成 `tools/linkshot`，原始碼更新時重編；失敗訊息在 `tools/.linkshot-build.log`。不需要 SwiftUI App。
+- **編譯：** `run.sh` 偵測到 Xcode 命令列工具（`swiftc`）就自動編譯成 `tools/linkshot`，原始碼更新時重編；失敗訊息直接顯示在編譯輸出。不需要 SwiftUI App。
 - **內網網址：** 預設也截圖與摘要（方便實驗）；`PRIVATE_URLS=false` 時，解析到本機或區網（127.x、10.x、192.168.x、100.64/10、.local…）的網址一律略過。
 - **時機：** 刪除同步確認原訊息還在之後，與 AI 分析同一步驟；每則鏡像最多截 2 個網址。
 - **放哪裡：** 截圖專用頻道（`DC_CH_SCREENSHOT`），每張一則：`📸 日期時間｜網址` ＋「跳到鏡像」連結，並關閉 Discord 自動預覽卡。AI 摘要回覆裡附截圖連結；`#關鍵字庫` 紀錄的 `shot:` 欄位記下截圖貼文，鏡像被刪除或編輯時一併刪除。AI 測試頻道的截圖直接附在實驗頻道的分析回覆裡。截圖產生進度同樣顯示在狀態列與進度訊息。
