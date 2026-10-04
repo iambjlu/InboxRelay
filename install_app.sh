@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # install_app.sh — 編譯 App → 結束舊的 → 換掉 /Applications/InboxRelay.app → 打開新的
-# 用法：cd ~/Downloads/InboxRelay && ./install_app.sh
+# 用法：cd ~/Downloads/InboxRelay && ./install_app.sh [--instant]
+#   --instant：打開後立即執行一次「外部 LLM」與「本機 ANE（OCR）」車道
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -18,5 +19,9 @@ fi
 
 rm -rf /Applications/InboxRelay.app
 cp -R build/InboxRelay.app /Applications/
-open /Applications/InboxRelay.app
+if [ "${1:-}" = "--instant" ]; then
+  open /Applications/InboxRelay.app --args --instant
+else
+  open /Applications/InboxRelay.app
+fi
 echo "[install] ✅ 已安裝並打開 /Applications/InboxRelay.app"

@@ -44,6 +44,7 @@ final class CoreController: ObservableObject {
     @Published var state: State = .stopped
     @Published var status = CoreStatus()
     @Published var logs: [String] = []
+    private var instantPending = CommandLine.arguments.contains("--instant")   // 啟動後立即執行 LLM 與 OCR 車道一次
     @Published var lastError: String = ""
     /// 按下按鈕後、核心回報新狀態前（最多 6 秒）先鎖住，避免連點送出重複指令
     @Published private(set) var pendingAction: String? = nil
@@ -330,6 +331,13 @@ final class CoreController: ObservableObject {
                let obj = try? JSONDecoder().decode(CoreStatus.self, from: d) {
                 if pendingAction != "restart" { pendingAction = nil }   // 核心回報新狀態 → 解鎖
                 status = obj
+                if instantPending, let lanes = obj.lanes, lanes["llm"] != nil,
+                   let ane = lanes["ane"], ane.state != "unavailable" {
+                    instantPending = false
+                    for name in ["llm", "ane"] {
+                        sendAny(["type": "lane", "lane": name, "action": "run_now"])
+                    }
+                }
                 if state != .running {
                     state = .running
                     failures = 0

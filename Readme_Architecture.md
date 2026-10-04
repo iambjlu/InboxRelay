@@ -29,7 +29,7 @@ InboxRelay/
 ├── CLAUDE.md                 rules for AI agents working on this repo
 ├── run.sh                    dev launcher: .venv + deps + compile tools/linkshot → python relay-core/main.py "$@"
 ├── build_app.sh              swiftc app/*.swift → build/InboxRelay.app; bundles relay-core (no tests) + core_run.sh + linkshot + icon
-├── install_app.sh            build_app.sh → quit running app → replace /Applications/InboxRelay.app → open
+├── install_app.sh            build_app.sh → quit running app → replace /Applications/InboxRelay.app → open (`--instant`: open with `--args --instant`)
 ├── app/                      SwiftUI menu-bar app (§4)
 ├── tools/                    linkshot.swift (+ Info.plist ATS exception), make_icon.swift
 └── relay-core/               Python core (§3); tests/ (unittest)
@@ -245,7 +245,7 @@ unittest, run: `python -m unittest discover -s relay-core/tests`. Files: test_ac
 | File | Role |
 |---|---|
 | InboxRelayApp.swift | `@main InboxRelayApp`: MenuBarExtra + main window; launch at login via `SMAppService.mainApp` |
-| CoreController.swift | Launches bundled core (`Contents/Resources/core/run.sh`) with env from settings + `INBOXRELAY_IPC=1`; restart with backoff; parses status JSON (`CoreStatus`, `CoreTask`, `LaneStatus{label,mode,state,describe,queued,backlog,next_start}`); lane actions; `handleOCR` (calls OCRService, replies `ocr_result` with retry info); `recapReset`; in-memory `logs` |
+| CoreController.swift | Launches bundled core (`Contents/Resources/core/run.sh`) with env from settings + `INBOXRELAY_IPC=1`; restart with backoff; parses status JSON (`CoreStatus`, `CoreTask`, `LaneStatus{label,mode,state,describe,queued,backlog,next_start}`); lane actions; launch arg `--instant` → once status shows `llm` and a connected `ane` lane, sends `run_now` to both; `handleOCR` (calls OCRService, replies `ocr_result` with retry info); `recapReset`; in-memory `logs` |
 | OCRService.swift | `recognize(urlString:completion:)`: ephemeral URLSession (no cache/cookies), HTTP status check (non-2xx → retry with Retry-After), `VNRecognizeTextRequest` (accurate, zh-Hant + en-US, language correction), Neural Engine first, then CPU/GPU, then a re-render to standard sRGB 8-bit RGBA (long side ≤ 4096; works around `CRImageReaderError` on unusual formats); serial queue, image in memory only |
 | SettingsStore.swift | `SettingCatalog.fields` (key = env name, label, kind text/secret/toggle/time/choice/number, section 連線/頻道/外部 LLM 設定/排程/功能/…); secrets in Keychain; others in UserDefaults or synced folder `settings.json` (optional secrets there); first run imports `.env` |
 | Views.swift | Menu content (lane cards: colors running green/teal, waiting blue, offline red "LLM 離線", paused orange; run/pause buttons), dashboard, settings (reset button with confirmation, Cancel default), log view |
