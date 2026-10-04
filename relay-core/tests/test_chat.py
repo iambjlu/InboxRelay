@@ -322,6 +322,61 @@ class ThreadDeleteAndTitleTest(EditRegenTest):
         asyncio.run(go())
 
 
+class QueueTest(EditRegenTest):
+    def test_queued_messages_answered_once_and_late_one_answered_next(self):
+        async def go():
+            cfg = N(ch_chat=10, ch_chat_prompt=11, tz="Asia/Taipei", llm_context=131072, chat_compact_pct=90)
+            gate, calls = asyncio.Event(), []
+
+            class SlowLLM(FakeLLM):
+                async def chat_messages(self, messages, max_tokens=4000, thinking=False, progress=None):
+                    calls.append(messages)
+                    if len(calls) == 1:
+                        await gate.wait()                                         # 第一次回覆生成中
+                    return f"回覆{len(calls)}", {}
+            hist = []
+            th = self._make(hist)
+            orig_send = th.send
+            nid = [100]
+
+            async def send(content=None, **kw):
+                m = msg(nid[0], BOT, content)
+                nid[0] += 1
+                m.type = discord.MessageType.default
+                hist.append(m)
+                th.sent.append(content)
+                return m
+            th.send = send
+
+            def user(i, text):
+                m = msg(i, ME, text)
+                m.type = discord.MessageType.default
+                m.channel = th
+                hist.append(m)
+                return m
+            c = ChatChannel(cfg, N(client=N(user=N(id=BOT))), SlowLLM(), {ME})
+            c.memory = N(content="")
+            c._wants_title = lambda t: False
+            m1, m2, m3 = user(1, "問題一"), user(2, "問題二"), user(3, "問題三")
+            tasks = [asyncio.create_task(c.on_message(m)) for m in (m1, m2, m3)]
+            await asyncio.sleep(0.05)                                             # 2、3 在排隊
+            m4 = user(4, "生成中才傳的問題四")                                    # 第一次回覆的歷史快照之後才來
+            tasks.append(asyncio.create_task(c.on_message(m4)))
+            await asyncio.sleep(0.05)
+            gate.set()
+            await asyncio.wait_for(asyncio.gather(*tasks), 3)
+            self.assertEqual(len(calls), 2)                                       # 一～三合併回一次；第四則另外回
+            first = str(calls[0])
+            self.assertTrue("問題一" in first and "問題二" in first and "問題三" in first)
+            self.assertNotIn("問題四", first)
+            second = calls[1]
+            roles = [x["role"] for x in second if x["role"] != "system"]
+            self.assertEqual(roles, ["user", "assistant", "user"])                # 問題四排在第一次回覆之後
+            self.assertIn("問題四", str(second[-1]))
+            self.assertEqual(len(th.sent), 2)
+        asyncio.run(go())
+
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -332,6 +332,9 @@ class ChatChannel:
         self._auto: set[int] = set()                         # 這次執行期間自動命名、還沒用 AI 改名的對話串
         self._retitling: set[int] = set()
         self._views_ready = False
+        self._seen: dict[int, int] = {}                    # 對話串 ID → 最近一次已發出的回覆，當時看到的最後一則使用者訊息 ID
+        self._snap: dict[int, int] = {}                    # 對話串 ID → 正在生成的這次，看到的最後一則使用者訊息 ID
+        self._last_reply: dict[int, set] = {}              # 對話串 ID → 最近一次回覆的訊息 ID（可能分好幾則）
         self._work: dict[int, set] = {}                    # 對話串 ID → 正在處理它的 task（刪掉對話串時一起取消）
         self._edited: dict[int, str] = {}                  # 訊息 ID → 已處理過的編輯時間（同一次編輯不重複觸發）
 
@@ -669,6 +672,10 @@ class ChatChannel:
                         log.exception("壓縮失敗")
                         await thread.send(f"{NOTE_PREFIX} ⚠️ 壓縮失敗：{type(e).__name__}：{str(e)[:200]}")
                     return
+                if m.id <= self._seen.get(thread.id, 0):
+                    # 排隊期間，上一次回覆已經看到並一起回答了這則（歷史是整個對話串）→ 不重複回
+                    log.info("💬 這則已被上一次回覆一併回答，略過（對話串 %s）", thread.id)
+                    return
                 res = await self._respond(thread, m)
             if res is not None:
                 await self._remember(*res)
@@ -754,6 +761,8 @@ class ChatChannel:
                     return
                 for h in mine:
                     await _safe_delete(h)
+                self._seen.pop(thread.id, None)                  # 舊回覆刪了：之前「已回答」的記錄作廢
+                self._last_reply.pop(thread.id, None)
                 log.info("💬 編輯最後一則訊息：刪掉 %d 則舊回覆，重新生成（對話串 %s）", len(mine), thread.id)
                 res = await self._respond(thread, m)
             if res is not None:
@@ -776,8 +785,13 @@ class ChatChannel:
                   f"（{100 * used / ctx:.0f}%）")
         chunks = daily.split_message(reply or "（模型沒有回覆內容）", limit=1990 - len(footer) - 1)
         chunks[-1] = f"{chunks[-1]}\n{footer}"
+        sent_ids = set()
         for chunk in chunks:
-            await thread.send(chunk)
+            sent = await thread.send(chunk)
+            if sent is not None and getattr(sent, "id", None) is not None:
+                sent_ids.add(sent.id)
+        self._seen[thread.id] = max(self._seen.get(thread.id, 0), self._snap.get(thread.id, 0))
+        self._last_reply[thread.id] = sent_ids
         if reply and self._wants_title(thread):
             asyncio.create_task(self._retitle(thread, user_text, reply))
         if used >= ctx * self.cfg.chat_compact_pct / 100:
@@ -971,6 +985,20 @@ class ChatChannel:
                 out.append(f"【連結 {u} 的內容】\n{page[:LINK_CHARS]}")
         return out
 
+    def _reorder_late(self, thread_id: int, msgs: list) -> list:
+        """上一次回覆生成期間才傳的使用者訊息（ID 比回覆小，但回覆當時沒看到）：排到那則回覆之後，才是「回覆之後的新問題」。"""
+        ids = self._last_reply.get(thread_id)
+        seen = self._seen.get(thread_id, 0)
+        if not ids:
+            return msgs
+        last = max(ids)
+        late = [h for h in msgs if not self._is_bot_turn(h) and seen < h.id < last]
+        if not late:
+            return msgs
+        rest = [h for h in msgs if not any(h is x for x in late)]
+        pos = max((i for i, h in enumerate(rest) if h.id in ids), default=len(rest) - 1)
+        return rest[:pos + 1] + late + rest[pos + 1:]
+
     async def answer(self, thread: discord.Thread, latest: discord.Message | None,
                      dry: bool = False) -> tuple[str, str, dict, list[dict]]:
         """組好「提示詞＋記憶＋摘要＋歷史」交給模型。回傳 (回覆, 使用者這次說的話, 用量, 送出的 messages)。
@@ -978,6 +1006,9 @@ class ChatChannel:
         summary, msgs = await self.history(thread)
         if latest is not None and latest.id not in {x.id for x in msgs}:
             msgs.append(latest)
+        if not dry:
+            msgs = self._reorder_late(thread.id, msgs)
+            self._snap[thread.id] = max([h.id for h in msgs if not self._is_bot_turn(h)] or [0])
         latest_id = latest.id if latest is not None else (msgs[-1].id if msgs else 0)
         # 哪些圖片要以圖片交給模型：最近 MAX_IMAGES 張
         image_ids: list[int] = []
