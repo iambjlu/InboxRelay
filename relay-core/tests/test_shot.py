@@ -96,6 +96,20 @@ class ShotTest(unittest.TestCase):
             self.assertEqual(list(w.queue), [MIRROR])
         asyncio.run(go())
 
+    def test_ensure_jumps_queue_and_waits(self):
+        async def go():
+            idx = Index([rec(1, "https://a.example/x")])
+            w = ShotWorker(N(ch_screenshot=5), None, idx, {})
+            w.submit("other")
+            waiter = asyncio.create_task(w.ensure(MIRROR, timeout=5))
+            await asyncio.sleep(0.01)
+            self.assertEqual(list(w.queue), [MIRROR, "other"])      # 插隊到最前面
+            self.assertFalse(waiter.done())
+            w._release(MIRROR)
+            await asyncio.wait_for(waiter, 1)
+            await asyncio.wait_for(ShotWorker(N(), None, Index([rec(2, "沒連結")]), {}).ensure(MIRROR), 1)
+        asyncio.run(go())
+
 
 if __name__ == "__main__":
     unittest.main()

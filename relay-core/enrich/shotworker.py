@@ -18,6 +18,7 @@ from enrich.link import find_urls, probe_link
 log = logging.getLogger("shot")
 
 MAX_URLS = 2          # 每則紀錄最多拍幾個網址
+SHOT_WAIT_SEC = 240      # AI 分析最多等截圖多久
 MAX_TRIES = 2         # 同一則這一輪拍不到幾次就先放棄（下一輪再試）
 SHOT_LINE = "📸 截圖："
 
@@ -39,6 +40,7 @@ class ShotWorker:
         self._fails: dict = {}                    # 紀錄 → 這一輪拍不到的次數
         self._nonweb: set = set()                 # 確認只有圖片／檔案網址的紀錄（行程存活期間不再檢查）
         self._backoff = 30.0
+        self._waiters: dict[str, list] = {}       # 鏡像連結 → 等這則截圖做完的 Future（AI 分析要拿截圖當輔助）
 
     # ------------------------------------------------------------ 佇列
     def _text(self, e) -> str:
@@ -49,11 +51,40 @@ class ShotWorker:
         return (r.origin != "extra" and not r.shot and r.key not in self._nonweb
                 and bool(find_urls(self._text(e))))
 
-    def submit(self, mirror_url: str) -> None:
-        if mirror_url and mirror_url not in self._queued:
+    def submit(self, mirror_url: str, front: bool = False) -> None:
+        if not mirror_url:
+            return
+        if mirror_url in self._queued:
+            if front and self.queue and self.queue[0] != mirror_url:
+                self.queue.remove(mirror_url)
+                self.queue.appendleft(mirror_url)
+        else:
             self._queued.add(mirror_url)
-            self.queue.append(mirror_url)
-            self._wake.set()
+            (self.queue.appendleft if front else self.queue.append)(mirror_url)
+        self._wake.set()
+
+    async def ensure(self, mirror_url: str, timeout: float = SHOT_WAIT_SEC) -> None:
+        """AI 分析前呼叫：這則鏡像的連結還沒截圖就插隊先拍，等拍完（或逾時）才回來。"""
+        if not any(self.needs_shot(e) for e in self.index.by_mirror(mirror_url)):
+            return
+        fut = asyncio.get_running_loop().create_future()
+        self._waiters.setdefault(mirror_url, []).append(fut)
+        self.submit(mirror_url, front=True)
+        try:
+            await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError:
+            log.info("等截圖逾時，先不用截圖做摘要：%s", mirror_url)
+        finally:
+            ws = self._waiters.get(mirror_url, [])
+            if fut in ws:
+                ws.remove(fut)
+            if not ws:
+                self._waiters.pop(mirror_url, None)
+
+    def _release(self, mirror_url: str) -> None:
+        for fut in self._waiters.pop(mirror_url, []):
+            if not fut.done():
+                fut.set_result(None)
 
     def scan_index(self) -> int:
         self._fails.clear()
@@ -105,10 +136,12 @@ class ShotWorker:
                     self._backoff = min(self._backoff * 2, 900)
                     continue
                 self._backoff = 30.0
+                self._release(mirror)
                 done += 1
                 task.set(done=done)
             except Exception:
                 log.exception("連結截圖失敗：%s", mirror)
+                self._release(mirror)
             finally:
                 self._holding = False
 

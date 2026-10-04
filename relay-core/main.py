@@ -392,7 +392,7 @@ async def run(check_only: bool) -> int:
             from enrich.shotworker import ShotWorker
             shot_worker = ShotWorker(cfg, dc, relayer.index, relayer.text_cache)
             if relayer.enricher is not None:
-                relayer.enricher.on_shot = shot_worker.submit
+                relayer.enricher.shot_worker = shot_worker
             shot_lane = lanes.get("shot")
             shot_worker.scan_index()
             background.append(asyncio.create_task(shot_worker.run()))

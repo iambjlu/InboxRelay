@@ -56,15 +56,15 @@ class Enricher:
         self._posted: list = []                  # 這則工作已經發出去的訊息（連不上時收回，避免重做時重複）
         self._holding = False          # 手上有一則正在做（或在等夜間時段）
         self.on_link_images = None     # callable(mirror_url)：有連到圖片的網址時通知文字辨識
-        self.on_shot = None            # callable(mirror_url)：通知連結截圖車道（截圖有自己的排程）
+        self.shot_worker = None        # ShotWorker：連結截圖車道（有自己的排程；分析時車道開著就先截圖當輔助）
 
     def submit(self, keys: list, mirror_url: str) -> None:
         if mirror_url in self._queued:
             return
         self._queued.add(mirror_url)
         self.queue.put_nowait(EnrichJob(list(keys), mirror_url))
-        if self.on_shot is not None:
-            self.on_shot(mirror_url)
+        if self.shot_worker is not None:
+            self.shot_worker.submit(mirror_url)
 
     @property
     def backlog(self) -> int:
@@ -156,17 +156,25 @@ class Enricher:
         if cfg.link_summary:
             for u in all_urls[:3]:
                 probed[u] = await probe_link(u)      # 先看是網頁、檔案還是圖片
+        shot_png: dict = {}
+        if cfg.link_summary and all_urls and self.shot_worker is not None:
+            lane = lanes.get("shot")
+            if lane is not None and lane.allowed():          # 截圖車道現在可以跑：先截圖再摘要，截圖當輔助來源
+                await self.shot_worker.ensure(job.mirror_url)
+            from enrich.refresh import _old_shots
+            shot_png = await _old_shots(self.dc, [e for e in (self.index.get(k) for k in keys) if e is not None])
         img_links: list[str] = []
         if cfg.link_summary:
             caption = " ".join(texts.values())[:300]
             for u in all_urls[:3]:
-                r = await summarize_probed(self.llm, u, probed[u], embed_preview(mirror, u), None,
+                r = await summarize_probed(self.llm, u, probed[u], embed_preview(mirror, u), shot_png.get(u),
                                            caption, describe_image=cfg.image_summary)
                 parts.append((r.title, r.summary))
                 if r.image is not None:
                     img_links.append(u)
                 activity.step()
         probed.clear()
+        shot_png.clear()
 
         for a in mirror.attachments:
             name = a.filename

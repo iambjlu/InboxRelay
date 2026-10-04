@@ -108,7 +108,7 @@ class OfflineTest(unittest.TestCase):
                 en._posted.append(Msg())
                 raise openai.APIConnectionError(request=httpx.Request("POST", "http://x"))
             en.process = process
-            en.on_shot = None
+            en.shot_worker = None
             en.submit = Enricher.submit.__get__(en)
             en.submit([(1, 1)], "m1")
             t = asyncio.create_task(en.run())
