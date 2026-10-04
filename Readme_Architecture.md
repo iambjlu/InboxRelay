@@ -121,6 +121,7 @@ Progress tracking for background work. `Task` (label, done, total, detail, item 
 - `chat(prompt, data=None, image=None, image_mime, max_tokens, thinking, use_memory)` → str. System = `GUARD` + `MEMORY_WRAP(memory)`. Background calls (bound activity task) stream for progress and yield to interactive callers (`_interactive_waiting`). `<think>` stripped.
 - `chat_messages(messages, max_tokens, thinking, temperature, progress=None)` → (text, usage) for multi-turn chat; `progress(n_tokens)` enables streaming.
 - `ping()` → model ids. `memory`, `memory_version` set by MemoryStore.
+- `test_connection(base_url, model, api_key)` → `{ok, message, ms}`: standalone client (timeout 20 s, no retry) for the settings-page test; lists models (model missing → not ok), then asks for a tiny reply; maps 401/connection/status errors to readable messages. Does not touch the running `LLM`.
 - `is_offline_error(e)`: openai.APIConnectionError / InternalServerError / NotFoundError, httpx.ConnectError / TimeoutException, ConnectionError → treat as "LLM offline" (keep work).
 
 ### prompts.py
@@ -206,8 +207,8 @@ One-time backfill (flag `link-refresh-v1`): for records with `reply` and a URL i
 
 ### ipc.py
 Enabled when `INBOXRELAY_IPC=1`. JSON lines; logs go to stderr.
-- App → core (stdin): `{"type":"lane","lane":"llm|ane|shot","action":"run_now|pause|resume"}`, `{"type":"hello","ocr":true}` (ane available), `{"type":"ocr_result","id":N,"text":"…","ms":N}` or with `"error","retry","retry_after"`, `{"type":"recap_reset"}`, `{"type":"stop"}`; legacy `recap_now|pause|resume`.
-- core → App (stdout): `{"type":"status", paused, tasks[{label,done,total,detail,line,progress}], backlog, probe_pending, summarized_until, recap_enabled, recap_phase, recap_time, next_recap_hours, ai_status, chat_title, rss_mb, running, lanes{llm|ane|shot:{label,mode,state,describe,queued,backlog,next_start}}}` every 2 s on change; `{"type":"ocr_request","id":N,"url":"…","name":"…"}`.
+- App → core (stdin): `{"type":"lane","lane":"llm|ane|shot","action":"run_now|pause|resume"}`, `{"type":"hello","ocr":true}` (ane available), `{"type":"ocr_result","id":N,"text":"…","ms":N}` or with `"error","retry","retry_after"`, `{"type":"recap_reset"}`, `{"type":"llm_test","id":N,"server","model","key"}` (tests the form values via `llm.test_connection`; if it is the running server+model and succeeds, `ai_status` → connected and an offline `llm` lane is reset), `{"type":"stop"}`; legacy `recap_now|pause|resume`.
+- core → App (stdout): `{"type":"status", paused, tasks[{label,done,total,detail,line,progress}], backlog, probe_pending, summarized_until, recap_enabled, recap_phase, recap_time, next_recap_hours, ai_status, chat_title, rss_mb, running, lanes{llm|ane|shot:{label,mode,state,describe,queued,backlog,next_start}}}` every 2 s on change; `{"type":"ocr_request","id":N,"url":"…","name":"…"}`, `{"type":"llm_test_result","id":N,"ok":bool,"message":"…","ms":N}`.
 `IpcServer(act, relayer, get_recapper, tg, cfg, ai_status, stop)`, `lanes_status()`, `emit()`.
 
 ### recap/runner.py / recap/daily.py
@@ -253,10 +254,10 @@ unittest, run: `python -m unittest discover -s relay-core/tests`. Files: test_ac
 | File | Role |
 |---|---|
 | InboxRelayApp.swift | `@main InboxRelayApp`: MenuBarExtra + main window; launch at login via `SMAppService.mainApp` |
-| CoreController.swift | Launches bundled core (`Contents/Resources/core/run.sh`) with env from settings + `INBOXRELAY_IPC=1`; restart with backoff; parses status JSON (`CoreStatus`, `CoreTask`, `LaneStatus{label,mode,state,describe,queued,backlog,next_start}`); lane actions (`llm|ane|shot`; `LaneRow` shows the `shot` row only when the core reports that lane); launch arg `--instant` → once status shows `llm` and a connected `ane` lane, sends `run_now` to `llm`, `ane` and `shot` (if present); `handleOCR` (calls OCRService, replies `ocr_result` with retry info); `recapReset`; in-memory `logs` |
+| CoreController.swift | Launches bundled core (`Contents/Resources/core/run.sh`) with env from settings + `INBOXRELAY_IPC=1`; restart with backoff; parses status JSON (`CoreStatus`, `CoreTask`, `LaneStatus{label,mode,state,describe,queued,backlog,next_start}`); lane actions (`llm|ane|shot`; `LaneRow` shows the `shot` row only when the core reports that lane); launch arg `--instant` → once status shows `llm` and a connected `ane` lane, sends `run_now` to `llm`, `ane` and `shot` (if present); `handleOCR` (calls OCRService, replies `ocr_result` with retry info); `recapReset`; `testLLM()` (sends `llm_test` with current form values, `llmTesting`/`llmTestResult`, 25 s timeout); in-memory `logs` |
 | OCRService.swift | `recognize(urlString:completion:)`: ephemeral URLSession (no cache/cookies), HTTP status check (non-2xx → retry with Retry-After), `VNRecognizeTextRequest` (accurate, zh-Hant + en-US, language correction), Neural Engine first, then CPU/GPU, then a re-render to standard sRGB 8-bit RGBA (long side ≤ 4096; works around `CRImageReaderError` on unusual formats); serial queue, image in memory only |
 | SettingsStore.swift | `SettingCatalog.fields` (incl. `SHOT_SCHEDULE/START/END`; time fields visible per mode; key = env name, label, kind text/secret/toggle/time/choice/number, section 連線/頻道/外部 LLM 設定/排程/功能/…); secrets in Keychain; others in UserDefaults or synced folder `settings.json` (optional secrets there); first run imports `.env` |
-| Views.swift | Menu content (lane cards: colors running green/teal, waiting blue, offline red "LLM 離線", paused orange; run/pause buttons), dashboard, settings (reset button with confirmation, Cancel default), log view |
+| Views.swift | Menu content (lane cards: colors running green/teal, waiting blue, offline red "LLM 離線", paused orange; run/pause buttons), dashboard, settings (「測試連線」 button under 外部 LLM 設定 with ✅/❌ result; reset button with confirmation, Cancel default), log view |
 | core_run.sh | Bundled launcher: venv in `data_dir/venv` (requirements hash stamp), `INBOXRELAY_ENV=data_dir/.env`, stdout reserved for JSON |
 
 tools/linkshot.swift: WKWebView with `WKWebsiteDataStore.nonPersistent()`, loads URL, settles, full-page snapshot → JPEG on stdout; `--insecure` bypass prints `CERT_BYPASSED`. tools/make_icon.swift: generates app icon at build.

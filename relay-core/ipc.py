@@ -4,10 +4,11 @@
 - 啟動時環境變數 INBOXRELAY_IPC=1 才啟用。
 - App → 核心：stdin 每行一個 JSON：
   {"type": "lane", "lane": "llm|ane|shot", "action": "run_now|pause|resume"}、{"type": "hello", "ocr": true}、
-  {"type": "ocr_result", "id": 1, "text": "…", "ms": 120}、{"type": "stop"}；
+  {"type": "ocr_result", "id": 1, "text": "…", "ms": 120}、{"type": "llm_test", "id": 1, "server", "model", "key"}、{"type": "stop"}；
   舊指令 recap_now／pause／resume 仍可用（＝外部 LLM 車道）。
 - 核心 → App：stdout 每行一個 JSON：狀態（type=status，每 2 秒、有變化才送）、
-  文字辨識請求 {"type": "ocr_request", "id": 1, "url": "…", "name": "a.jpg"}。日誌一律走 stderr。
+  文字辨識請求 {"type": "ocr_request", "id": 1, "url": "…", "name": "a.jpg"}、
+  LLM 測試結果 {"type": "llm_test_result", "id": 1, "ok": true, "message": "…", "ms": 85}。日誌一律走 stderr。
 """
 from __future__ import annotations
 
@@ -87,6 +88,23 @@ class IpcServer:
             }
         return out
 
+    async def _llm_test(self, cmd: dict) -> None:
+        """設定頁的「測試連線」：測表單目前的值；若測的就是執行中的那組且成功，順便讓離線的外部 LLM 車道恢復。"""
+        from llm import test_connection
+        server, model, key = str(cmd.get("server") or ""), str(cmd.get("model") or ""), str(cmd.get("key") or "")
+        r = await test_connection(server, model, key)
+        log.info("🧪 測試外部 LLM（%s／%s）：%s", server, model, r["message"])
+        same = (server.rstrip("/") == self.cfg.ai_server.rstrip("/") and model == self.cfg.ai_model)
+        if r["ok"] and same:
+            self.ai_status = "✅ 已連線"
+            lane = lanes.get("llm")
+            if lane is not None and lane.offline:
+                lane.offline = False
+                lane.notify()
+                r["message"] += "；外部 LLM 工作已恢復"
+        emit({"type": "llm_test_result", "id": cmd.get("id"), **r})
+        self._last = ""
+
     def handle(self, line: str) -> None:
         try:
             cmd = json.loads(line)
@@ -116,6 +134,9 @@ class IpcServer:
                         log.info("🧾 App 要求外部 LLM 立即執行（分析＋總結）")
                 elif lane.run_now():
                     log.info("🔤 App 要求%s立即執行", lane.label)
+        elif t == "llm_test":
+            asyncio.get_running_loop().create_task(self._llm_test(cmd))
+            return
         elif t == "recap_reset" and rc is not None:
             log.info("🧹 App 要求清空並重新總結")
             asyncio.get_running_loop().create_task(rc.reset_all())

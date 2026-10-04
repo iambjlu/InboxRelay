@@ -23,6 +23,40 @@ def is_offline_error(e: BaseException) -> bool:
     return isinstance(e, (openai.APIConnectionError, openai.InternalServerError, openai.NotFoundError,
                           httpx.ConnectError, httpx.TimeoutException, ConnectionError))
 
+async def test_connection(base_url: str, model: str, api_key: str) -> dict:
+    """設定頁「測試連線」：用表單目前的值（不動執行中的 LLM）列模型清單，再要一句很短的回覆確認真的能用。
+    回傳 {"ok": bool, "message": str, "ms": int}。"""
+    import time
+    import openai
+    if not base_url.strip():
+        return {"ok": False, "message": "尚未填寫端點", "ms": 0}
+    client = AsyncOpenAI(base_url=base_url.strip().rstrip("/"), api_key=api_key or "none", timeout=20, max_retries=0)
+    t0 = time.monotonic()
+
+    def ms() -> int:
+        return int((time.monotonic() - t0) * 1000)
+    try:
+        models = [m.id for m in (await client.models.list()).data]
+        if model and models and model not in models:
+            return {"ok": False, "ms": ms(),
+                    "message": f"已連線，但找不到模型「{model}」（可用：{', '.join(models[:5])}）"}
+        resp = await client.chat.completions.create(
+            model=model, messages=[{"role": "user", "content": "回覆「OK」兩個字就好"}], max_tokens=16,
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}})
+        reply = _THINK_RE.sub("", resp.choices[0].message.content or "").strip()
+        return {"ok": True, "ms": ms(), "message": f"連線成功（{ms()} ms）：模型「{model}」回覆「{reply[:30]}」"}
+    except openai.AuthenticationError:
+        return {"ok": False, "ms": ms(), "message": "API Key 不正確（401/403）"}
+    except openai.APIConnectionError as e:
+        return {"ok": False, "ms": ms(), "message": f"連不上 {base_url}：{type(e.__cause__ or e).__name__}"}
+    except openai.APIStatusError as e:
+        return {"ok": False, "ms": ms(), "message": f"伺服器回應 {e.status_code}：{str(e.message)[:120]}"}
+    except Exception as e:
+        return {"ok": False, "ms": ms(), "message": f"{type(e).__name__}: {str(e)[:120]}"}
+    finally:
+        await client.close()
+
+
 class LLM:
     def __init__(self, base_url: str, model: str, api_key: str, image_support: bool = True) -> None:
         self.model = model

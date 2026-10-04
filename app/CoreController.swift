@@ -46,6 +46,10 @@ final class CoreController: ObservableObject {
     @Published var logs: [String] = []
     private var instantPending = CommandLine.arguments.contains("--instant")   // 啟動後立即執行 LLM 與 OCR 車道一次
     @Published var lastError: String = ""
+    /// 設定頁「測試連線」：nil＝沒在測；結果由核心回傳
+    @Published var llmTesting = false
+    @Published var llmTestResult: (ok: Bool, message: String)? = nil
+    private var llmTestId = 0
     /// 按下按鈕後、核心回報新狀態前（最多 6 秒）先鎖住，避免連點送出重複指令
     @Published private(set) var pendingAction: String? = nil
 
@@ -195,6 +199,29 @@ final class CoreController: ObservableObject {
         sendAny(["type": "lane", "lane": name, "action": l.state == "paused" ? "resume" : "pause"])
     }
 
+    /// 用設定頁目前填的值測試外部 LLM（不必先儲存、重啟）。核心沒在跑就直接說明。
+    func testLLM() {
+        guard !llmTesting else { return }
+        guard isRunning else {
+            llmTestResult = (false, "核心沒有在運行，請先啟動核心再測試")
+            return
+        }
+        llmTestId += 1
+        let id = llmTestId
+        llmTesting = true
+        llmTestResult = nil
+        sendAny(["type": "llm_test", "id": id,
+                 "server": settings.values["LOCAL_AI_SERVER"] ?? "",
+                 "model": settings.values["LOCAL_AI_MODEL"] ?? "",
+                 "key": settings.values["LOCAL_AI_API_KEY"] ?? ""] as [String: Any])
+        Task { @MainActor [weak self] in          // 核心 25 秒內沒回就當逾時
+            try? await Task.sleep(nanoseconds: 25_000_000_000)
+            guard let self = self, self.llmTesting, self.llmTestId == id else { return }
+            self.llmTesting = false
+            self.llmTestResult = (false, "測試逾時，核心沒有回應")
+        }
+    }
+
     private func handleOCR(_ obj: [String: Any]) {
         guard let id = obj["id"] as? Int, let url = obj["url"] as? String else { return }
         ocr.recognize(urlString: url) { [weak self] text, error, ms, retry, wait in
@@ -328,6 +355,13 @@ final class CoreController: ObservableObject {
                let json = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
                (json["type"] as? String) == "ocr_request" {
                 handleOCR(json)
+            } else if !isErr, line.hasPrefix("{"), let d = line.data(using: .utf8),
+               let json = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+               (json["type"] as? String) == "llm_test_result" {
+                if (json["id"] as? Int) == llmTestId {
+                    llmTesting = false
+                    llmTestResult = ((json["ok"] as? Bool) ?? false, (json["message"] as? String) ?? "")
+                }
             } else if !isErr, line.hasPrefix("{"), let d = line.data(using: .utf8),
                let obj = try? JSONDecoder().decode(CoreStatus.self, from: d) {
                 if pendingAction != "restart" { pendingAction = nil }   // 核心回報新狀態 → 解鎖

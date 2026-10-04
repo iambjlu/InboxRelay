@@ -388,6 +388,7 @@ struct SettingsView: View {
                     }) { f in
                         fieldRow(f)
                     }
+                    if sec == "外部 LLM 設定" { llmTestRow }
                 }
             }
             Section {
@@ -413,6 +414,24 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
+    }
+
+    /// 測試外部 LLM 連線：用上面目前填的值（不必先儲存），結果顯示在按鈕旁
+    private var llmTestRow: some View {
+        HStack(spacing: 8) {
+            Button { core.testLLM() } label: {
+                Label(core.llmTesting ? "測試中…" : "測試連線", systemImage: "bolt.horizontal")
+            }
+            .disabled(core.llmTesting)
+            .help("用目前填的端點、模型、API Key 連線一次並請模型回一句話，不需要先儲存")
+            if let r = core.llmTestResult {
+                Image(systemName: r.ok ? "checkmark.circle.fill" : "xmark.octagon.fill")
+                    .foregroundStyle(r.ok ? .green : .red)
+                Text(r.message).font(.caption).foregroundStyle(r.ok ? Color.secondary : Color.red)
+                    .textSelection(.enabled)
+            }
+            Spacer()
+        }
     }
 
     @ViewBuilder
