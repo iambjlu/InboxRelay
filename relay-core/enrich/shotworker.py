@@ -13,17 +13,51 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections import deque
+from datetime import datetime, timezone
 
 import activity
 import records
-from enrich.link import find_urls, probe_link
+from enrich.link import find_urls, probe_kind
+from enrich.screenshot import NetworkDown
 
 log = logging.getLogger("shot")
 
 SHOT_WAIT_SEC = 240      # AI 分析最多等截圖多久
 SHOT_LINE = "📸 截圖："
 SKIP = "-"               # 這個網址不需要截圖（圖片／檔案／內網）；沒有網址的長訊息也記一個，避免每輪重讀鏡像
+RETRY_MAX = 3            # 失敗的網址最多試幾次（含第一次），之後記成最終失敗
+RETRY_AFTER_SEC = 6 * 3600   # 失敗後隔多久才再試（算從失敗通知發出的時間）
+RETRY_FLAG = "shot-retry-v1"
+
+
+def parse_token(t: str) -> tuple[str, int, str]:
+    """shot 欄位的一個記號 → (種類, 失敗次數, 貼文連結)。種類：skip／ok／fail（最終失敗）／retry（還會再試）。"""
+    from enrich.screenshot import FAIL_MARK, RETRY_MARK
+    if t == SKIP:
+        return "skip", 0, ""
+    if t.startswith(FAIL_MARK):
+        return "fail", RETRY_MAX, t[1:]
+    if t.startswith(RETRY_MARK):
+        m = re.match(r"\?(\d+)(.*)", t)
+        if m:
+            return "retry", int(m.group(1)), m.group(2)
+    return "ok", 0, t
+
+
+def retry_due(t: str) -> bool:
+    kind, n, link = parse_token(t)
+    if kind != "retry" or n >= RETRY_MAX:
+        return False
+    if n == 0:                      # 清理舊失敗時標的：馬上重試
+        return True
+    ids = records.parse_message_url(link)
+    if not ids:
+        return True
+    import discord
+    age = (datetime.now(timezone.utc) - discord.utils.snowflake_time(ids[1])).total_seconds()
+    return age >= RETRY_AFTER_SEC
 
 
 def shot_line(urls: list[str]) -> str:
@@ -32,8 +66,7 @@ def shot_line(urls: list[str]) -> str:
 
 def success_links(shot: str | None) -> list[str]:
     """shot 欄位裡成功的截圖貼文連結。"""
-    from enrich.screenshot import FAIL_MARK
-    return [t for t in (shot or "").split() if t != SKIP and not t.startswith(FAIL_MARK)]
+    return [t for t in (shot or "").split() if parse_token(t)[0] == "ok"]
 
 
 class ShotWorker:
@@ -57,6 +90,8 @@ class ShotWorker:
         if r.origin == "extra":
             return False
         tokens = (r.shot or "").split()
+        if any(retry_due(t) for t in tokens):          # 之前拍失敗、現在該再試了
+            return True
         text = self.text_cache.get(r.key)
         if text is not None:
             return len(tokens) < len(find_urls(text))
@@ -155,20 +190,73 @@ class ShotWorker:
                 self._release(mirror)
                 done += 1
                 task.set(done=done)
+            except NetworkDown:
+                self.queue.appendleft(mirror)
+                self._queued.add(mirror)
+                await self._wait_network(task)
             except Exception:
                 log.exception("連結截圖失敗：%s", mirror)
                 self._release(mirror)
             finally:
                 self._holding = False
 
+    async def _wait_network(self, task) -> None:
+        """網路中斷：不發失敗通知，每 30 秒（逐次加到 5 分鐘）檢查 google.com，通了才繼續。"""
+        from enrich.screenshot import network_ok
+        log.warning("🔌 連結截圖：網路中斷（連不上 google.com），暫停到網路恢復")
+        delay = 30.0
+        while not await network_ok():
+            if task is not None:
+                task.set(detail="網路中斷，等待恢復")
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 300)
+        if task is not None:
+            task.set(detail="")
+        log.info("🌐 網路已恢復，繼續連結截圖")
+
+    async def retry_old_failures(self) -> None:
+        """一次性：把舊的「無法截圖」通知（內網、不是 http、圖片太大以外）改成「馬上重試」，之後照一般流程重拍。"""
+        from paths import data_dir
+        from enrich.screenshot import RETRY_MARK, is_permanent
+        flag = data_dir() / RETRY_FLAG
+        if flag.exists():
+            return
+        n = 0
+        for e in sorted(self.index.entries.values(), key=lambda e: e.msg_id):
+            toks = (e.rec.shot or "").split()
+            if not any(parse_token(t)[0] == "fail" for t in toks):
+                continue
+            out, changed = [], False
+            for t in toks:
+                kind, _, link = parse_token(t)
+                if kind == "fail":
+                    try:
+                        m = await self.dc.fetch_by_url(link)
+                    except Exception:
+                        out.append(t)
+                        continue
+                    body = getattr(m, "content", "") if m is not None else ""
+                    why = body.split("原因：", 1)[1].split("\n", 1)[0] if "原因：" in body else ""
+                    if m is None or not is_permanent(why):
+                        t, changed = f"{RETRY_MARK}0{link}", True
+                    await asyncio.sleep(0.2)
+                out.append(t)
+            if changed:
+                await self.index.update(e.rec.key, shot=" ".join(out))
+                n += 1
+        flag.write_text("done")
+        log.info("📸 連結截圖：%d 則紀錄的舊失敗改成重試", n)
+        self.scan_index()
+
     async def _covered(self, tokens: list[str]) -> dict[str, str]:
         """舊紀錄已經有的貼文：網址 → 記號（讀貼文第一行的網址），避免重拍。"""
         out: dict[str, str] = {}
         for t in tokens:
-            if t == SKIP:
+            kind, _, link = parse_token(t)
+            if kind == "skip":
                 continue
             try:
-                m = await self.dc.fetch_by_url(t.lstrip("!"))
+                m = await self.dc.fetch_by_url(link)
             except Exception:
                 continue
             if m is None:
@@ -179,7 +267,7 @@ class ShotWorker:
 
     async def process(self, mirror_url: str) -> bool:
         """處理這則鏡像所有紀錄裡還沒處理的網址。回傳 False＝暫時失敗（讀不到鏡像），稍後重試。"""
-        from enrich.screenshot import FAIL_MARK, available, post_one
+        from enrich.screenshot import FAIL_MARK, RETRY_MARK, NetworkDown, available, is_permanent, post_one
         entries = [e for e in self.index.by_mirror(mirror_url) if self.needs_shot(e)]
         if not entries or not available():
             return True
@@ -193,33 +281,56 @@ class ShotWorker:
         full = records.mirror_texts([x.rec for x in self.index.by_mirror(mirror_url)], getattr(msg, "content", "") or "")
         for e in entries:
             key = e.rec.key
-            text = self.text_cache.get(key) or full.get(key) or e.rec.excerpt or ""
+            text = self.text_cache.get(key) or full.get(key) or ""
+            if not text:
+                text = e.rec.excerpt or ""
+                if text.endswith("…"):                     # 找不到全文、摘錄又被截斷：200 字之後的連結會漏掉
+                    log.warning("📸 找不到 TG#%s 的全文（只有 200 字摘錄），後面的連結可能漏拍：%s", e.rec.tg_msg, mirror_url)
             urls = find_urls(text)
             old = (e.rec.shot or "").split()
             covered = await self._covered(old) if old else {}
             tokens: list[str] = []
             ok_links: list[str] = []
+            down = False
+            replaced: set[str] = set()
             for u in urls:
+                prev_n, prev_link = 0, ""
                 if u in covered:
-                    tokens.append(covered[u])
-                    if not covered[u].startswith(FAIL_MARK):
-                        ok_links.append(covered[u])
-                    continue
-                kind = (await probe_link(u))[1]
-                if kind in ("image", "file", "private"):
+                    kind, n, link = parse_token(covered[u])
+                    if kind == "retry" and retry_due(covered[u]):
+                        prev_n, prev_link = n, link             # 該再試了：重拍，成功／失敗後換掉舊通知
+                        replaced.add(covered[u])
+                    else:
+                        tokens.append(covered[u])
+                        if kind == "ok":
+                            ok_links.append(covered[u])
+                        continue
+                if (await probe_kind(u)) in ("image", "file", "private"):
                     tokens.append(SKIP)
                     continue
-                link, ok = await post_one(self.dc, self.cfg.ch_screenshot, u, e.rec.date, mirror_url)
-                tokens.append(link if ok else FAIL_MARK + link)
+                try:
+                    link, ok, why = await post_one(self.dc, self.cfg.ch_screenshot, u, e.rec.date, mirror_url)
+                except NetworkDown:
+                    down = True                                  # 網路中斷：這個網址還沒處理，先存已做完的，再整則重排
+                    break
                 if ok:
+                    tokens.append(link)
                     ok_links.append(link)
-            extras = [t for t in old if t not in tokens and t != SKIP]      # 對不上網址的舊貼文：留著，刪除同步才刪得到
+                else:
+                    nn = prev_n + 1
+                    final = is_permanent(why) or nn >= RETRY_MAX
+                    tokens.append(f"{FAIL_MARK}{link}" if final else f"{RETRY_MARK}{nn}{link}")
+                if prev_link:
+                    await self.dc.delete_by_url(prev_link)
+            extras = [t for t in old if t not in tokens and t not in replaced and t != SKIP]      # 對不上網址的舊貼文：留著，刪除同步才刪得到
             new = " ".join(tokens + extras) or SKIP
             if new != (e.rec.shot or ""):
                 await self.index.update(key, shot=new)
             if ok_links:
                 await self._update_reply(e.rec.reply, ok_links)
             log.info("📸 連結截圖：TG#%s 共 %d 個網址（成功 %d）", e.rec.tg_msg, len(urls), len(ok_links))
+            if down:
+                raise NetworkDown()
         return True
 
     async def _update_reply(self, reply_url: str | None, links: list[str]) -> None:

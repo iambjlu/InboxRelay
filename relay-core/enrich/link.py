@@ -137,6 +137,27 @@ async def probe_link(url: str) -> tuple[str, str, bytes | None, str]:
         return "", "", None, type(e).__name__
 
 
+async def probe_kind(url: str) -> str:
+    """只看回應標頭就判斷種類（截圖車道用，不下載內文）：private／image／file／""（一般網頁或讀不到，交給截圖）。"""
+    from enrich import screenshot
+    if not screenshot.ALLOW_PRIVATE and not await screenshot.is_public_url(url):
+        return "private"
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=10, headers={"User-Agent": UA},
+                                     verify=not screenshot.IGNORE_CERT) as c:
+            async with c.stream("GET", url) as r:
+                ctype = r.headers.get("content-type", "")
+                if r.status_code >= 400:
+                    return ""
+                if ctype.startswith("image/") and "svg" not in ctype:
+                    return "image"
+                if "html" not in ctype and "xml" not in ctype:
+                    return "file"
+    except Exception:
+        pass
+    return ""
+
+
 def embed_preview(message, url: str) -> str:
     """Discord 幫鏡像訊息產生的網頁預覽（標題、描述、網站名稱）。"""
     embeds = list(getattr(message, "embeds", None) or [])

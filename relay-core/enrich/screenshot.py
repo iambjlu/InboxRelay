@@ -58,15 +58,15 @@ async def is_public_url(url: str) -> bool:
     return bool(ips) and not any(_is_private_ip(ip) for ip in ips)
 
 
-SETTLE = 5          # 載入完成後等幾秒才拍
+SETTLE = 3          # 載入完成後等幾秒才拍
 
 
-async def capture(url: str, timeout: float = 25) -> bytes | None:
+async def capture(url: str, timeout: float = 20) -> bytes | None:
     png, _ = await capture_with_reason(url, timeout)
     return png
 
 
-async def capture_with_reason(url: str, timeout: float = 25) -> tuple[bytes | None, str]:
+async def capture_with_reason(url: str, timeout: float = 20) -> tuple[bytes | None, str]:
     """截圖：成功回傳 (PNG, "")；失敗回傳 (None, 原因)。"""
     if not available():
         return None, "找不到 tools/linkshot（重開 App 或 ./run.sh 會自動編譯）"
@@ -130,7 +130,8 @@ async def capture_many(urls: list[str], label: str = "連結截圖",
     return out
 
 
-FAIL_MARK = "!"          # 紀錄 shot 欄位裡「無法截圖通知」貼文連結的前綴（成功的截圖沒有前綴）
+FAIL_MARK = "!"          # 紀錄 shot 欄位裡「無法截圖通知」貼文連結的前綴：最終失敗，不再重試（成功的截圖沒有前綴）
+RETRY_MARK = "?"         # 「?<第幾次失敗><連結>」：還會再試的失敗通知（內網、不是 http、圖片太大以外的原因）
 
 
 async def _host_resolves(url: str) -> bool:
@@ -142,10 +143,32 @@ async def _host_resolves(url: str) -> bool:
         return False
 
 
+class NetworkDown(Exception):
+    """截圖失敗，而且連 google.com 也連不上：是網路中斷，不是網站的問題（不發失敗通知，等網路恢復再做）。"""
+
+
+PERMANENT_WHY = ("內網", "不是 http", "圖片太大")      # 這幾種原因重試也沒用
+
+
+def is_permanent(why: str) -> bool:
+    return any(k in (why or "") for k in PERMANENT_WHY)
+
+
+async def network_ok(host: str = "www.google.com", timeout: float = 6) -> bool:
+    """網路通不通：連得上 google.com:443 就算通。"""
+    try:
+        _, w = await asyncio.wait_for(asyncio.open_connection(host, 443), timeout)
+        w.close()
+        return True
+    except (OSError, asyncio.TimeoutError):
+        return False
+
+
 async def post_one(dc, channel_id: int, url: str, when: str, back_url: str,
-                   back_label: str = "鏡像", tries: int = 2) -> tuple[str, bool]:
+                   back_label: str = "鏡像", tries: int = 1) -> tuple[str, bool, str]:
     """截一個網址並發到連結預覽頻道；拍不到就改發一則「📸 無法截圖」通知（含原因）。
-    回傳 (貼文連結, 是否成功)。網域查不到就不重試；其他失敗最多試 tries 次。圖只在記憶體裡。"""
+    回傳 (貼文連結, 是否成功, 失敗原因)。失敗不在這裡反覆重試（交給車道之後排程重試）；
+    失敗時若 google.com 也連不上 → 是網路中斷，丟 NetworkDown（不發通知）。圖只在記憶體裡。"""
     png, why = None, ""
     if not await _host_resolves(url):
         why = "網域不存在（DNS 查不到）"
@@ -155,12 +178,14 @@ async def post_one(dc, channel_id: int, url: str, when: str, back_url: str,
             if png:
                 break
             if i + 1 < tries:
-                await asyncio.sleep(5)
+                await asyncio.sleep(3)
+    if not png and not is_permanent(why) and not await network_ok():
+        raise NetworkDown(why or "網路中斷")
     back = f"[↗ 跳到{back_label}](<{back_url}>)"
     if png:
         note = f"\n{CERT_WARN}" if why == CERT_WARN else ""
         msg = await dc.send_file(channel_id, f"📸 {when}｜{url}{note}\n{back}", "preview.jpg", png)
         png = None
-        return msg.jump_url, True
+        return msg.jump_url, True, ""
     msg = await dc.send(channel_id, f"📸 無法截圖｜{when}｜<{url}>\n-# 原因：{why or '未知'}\n{back}")
-    return msg.jump_url, False
+    return msg.jump_url, False, why or "未知"

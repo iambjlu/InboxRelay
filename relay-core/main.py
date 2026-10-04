@@ -402,6 +402,7 @@ async def run(check_only: bool) -> int:
             shot_lane = lanes.get("shot")
             shot_worker.scan_index()
             background.append(asyncio.create_task(shot_worker.run()))
+            background.append(asyncio.create_task(shot_worker.retry_old_failures()))
             background.append(asyncio.create_task(lanes.run_lane(
                 shot_lane, drained=lambda: shot_worker.drained, cycle=shot_worker.cycle)))
             if cfg.llm_wait_shot:

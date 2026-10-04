@@ -53,17 +53,22 @@ class Posts:
         return self.posts.get(url)
 
 
+def now_id():
+    import time
+    return int((time.time() * 1000 - 1420070400000)) << 22      # 現在的 Discord 訊息 ID
+
+
 def fake_post_one(dc):
     async def post_one(dc_, ch, url, when, back, **k):
-        link = f"https://discord.com/channels/1/5/{len(dc.posts) + 1}"
+        link = f"https://discord.com/channels/1/5/{now_id() + len(dc.posts) + 1}"
         ok = "dead" not in url
-        dc.posts[link] = N(content=(f"📸 {when}｜{url}" if ok else f"📸 無法截圖｜{when}｜<{url}>") + "\n…")
-        return link, ok
+        dc.posts[link] = N(content=(f"📸 {when}｜{url}" if ok else f"📸 無法截圖｜{when}｜<{url}>\n-# 原因：網域不存在") + "\n…")
+        return link, ok, ("" if ok else "網域不存在（DNS 查不到）")
     return post_one
 
 
 async def probe(u):
-    return ("", "image" if u.endswith(".png") else "article", None, "")
+    return "image" if u.endswith(".png") else ""
 
 
 class ShotTest(unittest.TestCase):
@@ -90,7 +95,7 @@ class ShotTest(unittest.TestCase):
                 async def edit(self, content):
                     edits.append(content)
             dc = Posts("# 2025-07-16\n" + LONG + "\n-# [src](<https://t.me/c/1/2>)", Reply())
-            with mock.patch.object(shotworker, "probe_link", probe), \
+            with mock.patch.object(shotworker, "probe_kind", probe), \
                  mock.patch.object(screenshot, "available", lambda: True), \
                  mock.patch.object(screenshot, "post_one", fake_post_one(dc)):
                 w = ShotWorker(N(ch_screenshot=5), dc, idx, {})
@@ -98,14 +103,50 @@ class ShotTest(unittest.TestCase):
                 self.assertTrue(await w.process(MIRROR))
             tokens = idx.updates[r.key]["shot"].split()
             self.assertEqual(len(tokens), 4)                                   # 4 個網址各一個記號（不含 t.me 來源）
-            self.assertTrue(tokens[0].startswith("!") and tokens[1].startswith("!"))   # 網域不存在 → 無法截圖通知
+            self.assertTrue(tokens[0].startswith("?1") and tokens[1].startswith("?1"))   # 網域不存在 → 無法截圖通知（之後會再試）
             self.assertEqual(tokens[2], SKIP)                                  # 圖片網址不截圖
-            self.assertFalse(tokens[3].startswith("!"))                        # 成功
+            self.assertFalse(tokens[3].startswith(("!", "?")))                 # 成功
             self.assertEqual(len(dc.posts), 3)
             self.assertFalse(w.needs_shot(idx.entries[r.key]))                 # 全部處理過 → 不再排隊
             self.assertEqual(edits[-1].count("📸 截圖："), 1)                   # 回覆的截圖行換成新的
             self.assertTrue(edits[-1].endswith(f"[↗1](<{tokens[3]}>)"))
         asyncio.run(go())
+
+    def test_failed_link_retried_then_final(self):
+        async def go():
+            text = "https://dead.example/x"
+            dc = Posts(text)
+            dc.deleted = []
+
+            async def delete_by_url(u):
+                dc.deleted.append(u)
+            dc.delete_by_url = delete_by_url
+            old = "https://discord.com/channels/1/5/50"
+            dc.posts[old] = N(content="📸 無法截圖｜2025-07-16 13:12｜<https://dead.example/x>\n-# 原因：網域不存在\n…")
+            idx = Index([rec(1, text, shot="?0" + old)])                       # 清理舊失敗標的「馬上重試」
+            with mock.patch.object(shotworker, "probe_kind", probe), \
+                 mock.patch.object(screenshot, "available", lambda: True), \
+                 mock.patch.object(screenshot, "post_one", fake_post_one(dc)):
+                w = ShotWorker(N(ch_screenshot=5), dc, idx, {})
+                self.assertTrue(w.needs_shot(idx.entries[(-1, 1)]))
+                await w.process(MIRROR)
+                tok = idx.updates[(-1, 1)]["shot"]
+                self.assertTrue(tok.startswith("?1"))                            # 又失敗：第 1 次
+                self.assertEqual(dc.deleted, [old])                              # 舊通知換掉
+                self.assertEqual(len(tok.split()), 1)
+                self.assertFalse(w.needs_shot(idx.entries[(-1, 1)]))             # 剛失敗，要隔一段時間才再試
+                idx.entries[(-1, 1)].rec = dataclasses.replace(idx.entries[(-1, 1)].rec, shot="?2" + old)
+                with mock.patch.object(shotworker, "retry_due", lambda t: True):
+                    await w.process(MIRROR)
+            self.assertTrue(idx.updates[(-1, 1)]["shot"].startswith("!"))        # 第 3 次還是失敗 → 最終失敗
+        asyncio.run(go())
+
+    def test_parse_token(self):
+        self.assertEqual(shotworker.parse_token("-"), ("skip", 0, ""))
+        self.assertEqual(shotworker.parse_token("!https://x/1/2/3"), ("fail", shotworker.RETRY_MAX, "https://x/1/2/3"))
+        self.assertEqual(shotworker.parse_token("?2https://x/1/2/3"), ("retry", 2, "https://x/1/2/3"))
+        self.assertEqual(shotworker.parse_token("https://x/1/2/3"), ("ok", 0, "https://x/1/2/3"))
+        self.assertEqual(shotworker.success_links("-  !a ?1b https://x/1/2/3"), ["https://x/1/2/3"])
 
     def test_old_partial_record_reuses_existing_shot(self):
         async def go():
@@ -113,7 +154,7 @@ class ShotTest(unittest.TestCase):
             dc = Posts(text)
             dc.posts["https://discord.com/channels/1/5/99"] = N(content="📸 2025-07-16 13:12｜https://b.example/2\n…")
             idx = Index([rec(1, text, shot="https://discord.com/channels/1/5/99")])     # 舊版只拍了第二個
-            with mock.patch.object(shotworker, "probe_link", probe), \
+            with mock.patch.object(shotworker, "probe_kind", probe), \
                  mock.patch.object(screenshot, "available", lambda: True), \
                  mock.patch.object(screenshot, "post_one", fake_post_one(dc)):
                 w = ShotWorker(N(ch_screenshot=5), dc, idx, {})
