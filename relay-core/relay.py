@@ -34,8 +34,15 @@ def plan_groups(atts: list, limit: int) -> list[list]:
     groups: list[list] = []
     cur: list = []
     size = 0
+    from enrich.image import is_heic_name
     for a in atts:
         est = a.file_size or limit // 2
+        if is_heic_name(a.file_name):             # HEIC 會另附一份 JPEG：自己一批，容量才夠放兩份
+            if cur:
+                groups.append(cur)
+                cur, size = [], 0
+            groups.append([a])
+            continue
         if cur and (len(cur) == 10 or size + est > limit):
             groups.append(cur)
             cur, size = [], 0
@@ -115,6 +122,17 @@ class Relayer:
         data = bytes(await f.download_as_bytearray())
         return None if len(data) > limit else data
 
+    async def _add_jpeg_copy(self, files: list, name: str, data: bytes, limit: int) -> None:
+        """HEIC 另附一份 JPEG（和原檔同一則；兩份加起來不超過上限）。轉不出來就只留原檔。"""
+        from enrich.image import MIN_ROOM, heic_to_jpeg, is_heic_name
+        if not is_heic_name(name) or limit - len(data) < MIN_ROOM:
+            return
+        jpg = await asyncio.to_thread(heic_to_jpeg, data, limit - len(data))
+        if jpg is None:
+            log.warning("HEIC 轉 JPEG 失敗，只搬原檔：%s", name)
+            return
+        files.append((name + ".jpg", jpg))
+
     async def _collect_files(self, pieces: list[TgPiece], limit: int) -> tuple[list, list]:
         files: list[tuple[str, bytes]] = []
         oversize: list[str] = []
@@ -130,6 +148,7 @@ class Relayer:
                 oversize.append(p.attachment.file_name)
             else:
                 files.append((p.attachment.file_name, data))
+                await self._add_jpeg_copy(files, p.attachment.file_name, data, limit)
         return files, oversize
 
     # ------------------------------------------------------------------ 新訊息
@@ -167,6 +186,7 @@ class Relayer:
                     late.append(a.file_name)
                 else:
                     files.append((a.file_name, data))
+                    await self._add_jpeg_copy(files, a.file_name, data, limit)
             if gi == 0:
                 text = formatting.build_mirror_content(
                     date_str, body, oversize + late, pieces[0].src_url, cfg.header_style, with_header=first_of_day)

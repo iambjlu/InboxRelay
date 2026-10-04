@@ -115,8 +115,9 @@ def _missing(content: str) -> set[str]:
 
 def match_attachments(entries: list, attachments: list, content: str = "") -> list[tuple]:
     """紀錄 ↔ 鏡像附件：先比檔名（原樣→去掉特殊字元），剩下的扣掉確定沒搬的，數量對得上就依順序對。"""
-    imgs = [a for a in attachments
-            if (a.content_type or "").startswith("image/") or a.filename.lower().endswith(IMAGE_EXT)]
+    from enrich.image import is_converted_copy
+    imgs = [a for a in attachments if not is_converted_copy(a.filename)
+            and ((a.content_type or "").startswith("image/") or a.filename.lower().endswith(IMAGE_EXT))]
     image_entries = [e for e in sorted(entries, key=lambda e: e.rec.tg_msg) if is_image_record(e.rec)]
     got: dict = {}
     free = list(imgs)

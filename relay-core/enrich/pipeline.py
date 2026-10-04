@@ -22,7 +22,7 @@ from ocr import useful
 from config import Config
 from dc_output import DiscordOut
 from enrich.document import LEGACY_EXT, ext_of, is_supported, summarize_document
-from enrich.image import MIME, summarize_image
+from enrich.image import MIME, is_converted_copy, summarize_image
 from enrich.keywords import extract_keywords
 from enrich.link import embed_preview, find_urls, probe_link, summarize_probed
 from kwindex import KwIndex
@@ -165,7 +165,7 @@ class Enricher:
         parts: list[tuple[str, str]] = []
         # 細部進度：連結摘要＋附件＋每則關鍵字，各算一步
         n_urls = len({u for t in texts.values() for u in find_urls(t)}) if cfg.link_summary else 0
-        n_atts = sum(1 for a in mirror.attachments if a.size <= MAX_FILE)
+        n_atts = sum(1 for a in mirror.attachments if a.size <= MAX_FILE and not is_converted_copy(a.filename))
         activity.begin_item(n_urls + n_atts + (len(keys) if cfg.keywords else 0))
 
         all_urls: list[str] = []
@@ -202,7 +202,7 @@ class Enricher:
 
         for a in mirror.attachments:
             name = a.filename
-            if a.size > MAX_FILE:
+            if a.size > MAX_FILE or is_converted_copy(name):      # HEIC 的 JPEG 副本不重複分析
                 continue
             is_img = (a.content_type or "").startswith("image/") or ext_of(name) in MIME
             if is_img and cfg.image_summary:
