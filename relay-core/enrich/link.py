@@ -105,9 +105,10 @@ async def fetch_link(url: str, want_image: bool = False) -> tuple[str, str, byte
                     break
             page = buf.decode(r.encoding or "utf-8", errors="ignore")
     text = await asyncio.to_thread(_extract, page)
-    if len(text) >= 80:
-        return text, "article", None
     og = _og(page)
+    if len(text) >= 80:
+        # 正文可能混到導覽列、廣告：連同網頁標籤（標題、描述）一起給，兩邊互相佐證
+        return (f"網頁標籤：\n{og}\n\n正文：\n{text}" if og else text), "article", None
     return (og, "og", None) if og else ("", "", None)
 
 
@@ -174,7 +175,9 @@ async def summarize_probed(llm: LLM, url: str, probed: tuple[str, str, bytes | N
     if kind == "file":
         return LinkResult(f"🔗 {url}", text)
     if kind == "article":
-        s = await llm.chat(prompts.get("LINK"), f"網址：{url}\n\n{text[:12000]}", max_tokens=300)
+        extra = f"\n\n網頁預覽：\n{preview}" if preview and preview not in text else ""
+        hint = "（正文可能混有導覽列或廣告文字，請以網頁標籤與整體內容判斷這個網頁真正在講什麼）\n\n" if "網頁標籤：" in text else ""
+        s = await llm.chat(prompts.get("LINK"), f"網址：{url}\n\n{hint}{text[:12000]}{extra}", max_tokens=300)
         return LinkResult(f"🔗 {url}", s)
     # 讀不到正文（只有 og 標籤或完全讀不到）→ 用網頁預覽與截圖
     material = "\n".join(x for x in (text and f"網頁標籤：\n{text}", preview and f"網頁預覽：\n{preview}") if x)
