@@ -70,6 +70,11 @@ class Config:
     link_summary: bool = True
     link_screenshot: bool = False   # 連結截圖預覽（需要 tools/linkshot，run.sh 會自動編譯）
     ch_screenshot: int | None = None  # 截圖專用頻道
+    ch_extra: int | None = None       # 補充資料（發票、日記…）
+    ch_chat: int | None = None        # AI 對話（像 ChatGPT，每個對話一個對話串）
+    ch_chat_prompt: int | None = None # AI 對話的提示詞與記憶
+    llm_context: int = 131072         # 外部 LLM 的 context window（token）
+    chat_compact_pct: int = 90        # AI 對話用到 context 的幾 % 就自動壓縮
     private_urls: bool = True       # 內網／本機網址也截圖、也做連結摘要（實驗用）
     ignore_cert: bool = False       # 憑證無效的網站也強制開啟（截圖、連結摘要；只讀取，不送任何資料）
     reverse_sync: bool = True       # 在 #投遞箱鏡像 直接發訊息 → 也發到 Telegram（編輯、刪除同步）
@@ -87,6 +92,12 @@ class Config:
     search_live: bool = True    # 正式 #搜尋 頻道（搜 #關鍵字庫＋#總結）
     search_thinking: bool = False  # 搜尋回答時讓 Qwen 先思考（較準、較慢）
     recap_wait_hours: float = 12
+    # 排程（第 12.3 節）：always 永遠立即執行／daily 每天自動開始到做完為止／window 每天自動開始與暫停／manual 手動執行
+    llm_schedule: str = "daily"   # 外部 LLM：開始時間＝recap_time
+    llm_end: str = "08:00"         # 只有 window 模式會用到
+    ane_schedule: str = "always"  # 本機 ANE（圖片文字辨識，在選單列 App 裡跑）
+    ane_start: str = "03:30"
+    ane_end: str = "08:00"
     recap_time: str = "03:30"    # 每天幾點開始跑總結（含補跑積欠的）；按 n 可立即總結、p 暫停
 
     def channel_map(self) -> dict[str, int]:
@@ -150,6 +161,11 @@ def load() -> Config:
         link_summary=_bool("LINK_SUMMARY", True),
         link_screenshot=_bool("LINK_SCREENSHOT", False),
         ch_screenshot=int(e["DC_CH_SCREENSHOT"]) if e.get("DC_CH_SCREENSHOT") else None,
+        ch_extra=int(e["DC_CH_EXTRA"]) if e.get("DC_CH_EXTRA") else None,
+        ch_chat=int(e["DC_CH_CHAT"]) if e.get("DC_CH_CHAT") else None,
+        ch_chat_prompt=int(e["DC_CH_CHAT_PROMPT"]) if e.get("DC_CH_CHAT_PROMPT") else None,
+        llm_context=int(e.get("LLM_CONTEXT") or 131072),
+        chat_compact_pct=min(max(int(e.get("CHAT_COMPACT_PCT") or 90), 30), 98),
         private_urls=_bool("PRIVATE_URLS", True),
         ignore_cert=_bool("IGNORE_CERT_ERRORS", False),
         reverse_sync=_bool("REVERSE_SYNC", True),
@@ -168,4 +184,9 @@ def load() -> Config:
         search_thinking=_bool("SEARCH_THINKING", False),
         recap_wait_hours=float(e.get("RECAP_WAIT_HOURS") or 12),
         recap_time=e.get("RECAP_TIME") or "03:30",
+        llm_schedule=(e.get("LLM_SCHEDULE") or ("daily" if _bool("AI_NIGHT_ONLY", True) else "always")).strip(),
+        llm_end=(e.get("LLM_END") or "08:00").strip(),
+        ane_schedule=(e.get("ANE_SCHEDULE") or "always").strip(),
+        ane_start=(e.get("ANE_START") or "03:30").strip(),
+        ane_end=(e.get("ANE_END") or "08:00").strip(),
     )

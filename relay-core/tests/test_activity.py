@@ -58,6 +58,10 @@ class TestActivity(unittest.TestCase):
 
     def test_pause_blocks_gate(self):
         async def go():
+            import lanes
+            from types import SimpleNamespace as N
+            lanes.setup(N(llm_schedule="always", recap_time="03:30", llm_end="", ane_schedule="always",
+                          ane_start="03:30", ane_end="", tz="Asia/Taipei"))
             act = activity.Activity()
             act.pause()
             waiter = asyncio.create_task(act.gate())
@@ -65,7 +69,7 @@ class TestActivity(unittest.TestCase):
             self.assertFalse(waiter.done())
             act.resume()
             await asyncio.wait_for(waiter, 1)
-            self.assertIn("⏸ 背景工作已暫停", (act.pause(), act.status_lines())[1][0])
+            self.assertIn("⏸ 外部 LLM 工作已暫停", (act.pause(), act.status_lines())[1][0])
         asyncio.run(go())
 
 
@@ -94,6 +98,9 @@ class TestIpc(unittest.TestCase):
         import ipc
 
         async def go():
+            import lanes
+            lanes.setup(N(llm_schedule="always", recap_time="03:30", llm_end="", ane_schedule="always",
+                          ane_start="03:30", ane_end="", tz="Asia/Taipei"))
             act = activity.Activity()
             t = act.start("每日總結", total=4)
             t.advance(detail="產生 2026-10-01")

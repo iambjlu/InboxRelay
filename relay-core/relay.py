@@ -70,6 +70,7 @@ class Relayer:
         self.dirty = None       # state.DirtyDays
         self.lock = asyncio.Lock()   # 實時搬移與反向同步輪流處理，避免順序錯亂
         self.reverse = None     # dc_reverse.ReverseSync
+        self.ocr = None         # ocr.OcrWorker（選單列 App 管理時才有）
 
     async def load_state(self) -> None:
         self.last_header_date = await self.dc.last_header_date(self.cfg.ch_inbox_mirror)
@@ -224,6 +225,8 @@ class Relayer:
 
     def after_relay(self, keys: list, mirror_url: str) -> None:
         """搬完 → 刪除同步探測（5 分鐘後）→ 分析；沒開刪除同步就直接分析。"""
+        if getattr(self, "ocr", None) is not None:
+            self.ocr.submit_entries([e for e in (self.index.get(k) for k in keys) if e is not None])
         if self.prober is not None:
             self.prober.schedule(keys, mirror_url)
         elif self.enricher is not None:
@@ -299,6 +302,17 @@ class Relayer:
                 if e.msg_id == message_id:
                     self.index.entries.pop(k, None)   # 紀錄被手動刪 → 程式也忘掉它
                     log.info("#關鍵字庫 紀錄被手動刪除：TG #%s", k[1])
+            return
+        if channel_id == getattr(cfg, "ch_extra", None):
+            suffix = f"/{message_id}"
+            for e in [e for e in self.index.entries.values() if e.rec.mirror.endswith(suffix)]:
+                for u in [e.rec.reply] + (e.rec.shot or "").split():
+                    if u:
+                        await self.dc.delete_by_url(u)
+                await self.index.delete(e.rec.key)
+                log.info("#補充資料 %s 被手動刪除，紀錄一併刪除", e.rec.date[:10])
+                if self.dirty is not None:
+                    await self.dirty.mark(e.rec.date[:10])
             return
         if channel_id != cfg.ch_inbox_mirror:
             return

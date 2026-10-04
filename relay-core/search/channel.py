@@ -70,7 +70,7 @@ class SearchChannel:
         if self.rc is None:
             return out
         for (kind, key), parts in self.rc.posts.items():
-            if kind == "DAILY" and parts:
+            if kind == "DAILY" and parts and self.rc.has(kind, key):      # 跳過佔位
                 first = parts[min(parts)]
                 out[key] = (first.content.split("\n", 2)[-1], first.jump_url)
         return out

@@ -1,5 +1,5 @@
 # relay-core/activity.py
-"""本地 AI 工作追蹤：現在在做什麼、進度多少；以及手動暫停背景工作。
+"""外部 LLM 工作追蹤：現在在做什麼、進度多少；以及手動暫停背景工作。
 
 - 終端機：每 15 秒（或進度跳 5%）印一行「⏳ AI 分析 120/7045（1.7%）」。
 - Discord：有工作做超過 10 秒，就在 #關鍵字庫 發一則進度訊息並持續編輯；全部做完就刪掉。
@@ -17,9 +17,11 @@ from dataclasses import dataclass, field
 
 import discord
 
+import lanes
+
 log = logging.getLogger("activity")
 
-STATUS_HEAD = "⏳ **本地 AI 工作中**"
+STATUS_HEAD = "⏳ **背景工作中（外部 LLM／本機 ANE）**"
 DISCORD_AFTER_SEC = 10
 DISCORD_EVERY_SEC = 15
 TERMINAL_EVERY_SEC = 15
@@ -98,8 +100,6 @@ class Activity:
     def __init__(self) -> None:
         self.tasks: dict[int, Task] = {}
         self._ids = itertools.count(1)
-        self.running = asyncio.Event()      # set = 背景工作可以跑
-        self.running.set()
         self._status_msg: discord.Message | None = None
         self._last_discord = ""
         self._last_discord_at = 0.0
@@ -122,26 +122,38 @@ class Activity:
         if _bound.get() is t:
             _bound.set(None)
 
+    # ------------------------------------------------------------ 暫停（＝外部 LLM 車道）
     @property
     def paused(self) -> bool:
-        return not self.running.is_set()
+        lane = lanes.get("llm")
+        return bool(lane and lane.paused)
 
     def pause(self) -> None:
-        self.running.clear()
-        log.info("⏸  已暫停背景 AI 工作（補分析、總結、記憶升級）；搜尋與測試頻道照常。按 r 繼續")
+        lane = lanes.get("llm")
+        if lane:
+            lane.pause()
 
     def resume(self) -> None:
-        self.running.set()
-        log.info("▶️  繼續背景 AI 工作")
+        lane = lanes.get("llm")
+        if lane:
+            lane.resume()
 
-    async def gate(self) -> None:
-        """背景工作在每個項目之前呼叫；暫停時會在這裡等。"""
-        await self.running.wait()
+    async def gate(self, lane_name: str = "llm") -> None:
+        """背景工作在每個項目之前呼叫；該車道暫停或不在執行時段時會在這裡等。"""
+        lane = lanes.get(lane_name)
+        if lane is not None:
+            await lane.gate()
 
     def status_lines(self) -> list[str]:
         lines = [t.line() for t in sorted(self.tasks.values(), key=lambda t: t.id)]
-        if self.paused:
-            lines.insert(0, "⏸ 背景工作已暫停")
+        for ln in lanes.LANES.values():
+            if ln.state == "paused":
+                lines.insert(0, f"⏸ {ln.label}已暫停")
+            elif ln.state == "offline":
+                when = ln.next_start.strftime("%m/%d %H:%M") if ln.next_start else "下次開始時間"
+                lines.insert(0, f"🔌 外部 LLM 連不上：沒做完的留著，{when} 再試")
+            elif ln.state == "waiting":
+                lines.insert(0, f"🌙 {ln.label}等待中（{ln.describe()}）")
         return lines
 
     # ------------------------------------------------------------ 顯示
@@ -190,7 +202,7 @@ class Activity:
     async def cleanup_old(self, channel, bot_id: int) -> None:
         """刪掉上次沒刪到的進度訊息（例如程式當掉）。"""
         async for m in channel.history(limit=50):
-            if m.author.id == bot_id and m.content.startswith(STATUS_HEAD):
+            if m.author.id == bot_id and m.content.startswith((STATUS_HEAD, "⏳ **本地 AI 工作中**", "⏳ **外部 LLM 工作中**")):   # 含舊版標題
                 try:
                     await m.delete()
                 except discord.HTTPException:
@@ -268,6 +280,7 @@ def finish(t, note: str = "") -> None:
         current.finish(t, note)
 
 
-async def gate() -> None:
+async def gate(lane_name: str = "llm") -> None:
     if current:
-        await current.gate()
+        await current.gate(lane_name)
+

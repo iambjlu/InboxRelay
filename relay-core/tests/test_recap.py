@@ -29,18 +29,29 @@ class TestMarkers(unittest.TestCase):
 class FakeRC:
     def __init__(self):
         self.posts = {}
+        self.pending = set()
+        self.placed = []          # 佔位的發文順序
 
     def has(self, k, key):
+        return (k, key) in self.posts and (k, key) not in self.pending
+
+    def exists(self, k, key):
         return (k, key) in self.posts
 
     def keys(self, k):
-        return {key for (t, key) in self.posts if t == k}
+        return {key for (t, key) in self.posts if t == k and (t, key) not in self.pending}
 
     def first(self, k, key):
         return SimpleNamespace(content=self.posts[(k, key)][0], jump_url=f"https://discord.com/channels/1/9/{key}")
 
+    async def placeholder(self, k, key, text):
+        self.posts[(k, key)] = [text]
+        self.pending.add((k, key))
+        self.placed.append(f"{k}:{key}")
+
     async def publish(self, k, key, chunks):
         self.posts[(k, key)] = chunks
+        self.pending.discard((k, key))
 
 
 class FakeState:
@@ -107,6 +118,55 @@ class TestRecapper(unittest.TestCase):
         self.assertEqual(order, ["DAILY:2026-08-30", "DAILY:2026-08-31", "MONTHLY:2026-08",
                                  "DAILY:2026-09-01", "DAILY:2026-09-02", "MONTHLY:2026-09"])
 
+    def test_year_after_december(self):
+        r = make([entry("2025-11-30", 1), entry("2025-12-01", 2), entry("2026-01-02", 3)])
+        order = []
+        orig = r.rc.publish
+
+        async def pub(k, key, chunks):
+            order.append(f"{k}:{key}")
+            await orig(k, key, chunks)
+        r.rc.publish = pub
+        asyncio.run(r._tick(NOW))
+        self.assertEqual(order, ["DAILY:2025-11-30", "MONTHLY:2025-11", "DAILY:2025-12-01", "MONTHLY:2025-12",
+                                 "YEARLY:2025", "DAILY:2026-01-02", "MONTHLY:2026-01"])   # 今年（2026）不做年總結
+        self.assertTrue(r.rc.posts[("YEARLY", "2025")][0].startswith("YEARLY|2025\n# 🎆 2025 年總結"))
+
+    def test_cycle_waits_for_analysis_then_in_order(self):
+        r = make([entry("2025-12-30", 1), entry("2026-01-02", 2, enriched=False), entry("2026-01-03", 3)], backlog=1)
+        order = []
+        orig = r.rc.publish
+
+        async def pub(k, key, chunks):
+            order.append(f"{k}:{key}")
+            await orig(k, key, chunks)
+        r.rc.publish = pub
+        r.enricher.drained = False
+
+        import recap.runner as rr
+        rr.DRAIN_POLL_SEC = 0.01
+
+        async def go():
+            t = asyncio.create_task(r.cycle())
+            await asyncio.sleep(0.05)
+            self.assertEqual(order, [])                 # 分析還沒做完：一篇都不發
+            for e in r.index.entries.values():
+                e.rec.enriched = True
+            r.enricher.drained, r.enricher.backlog = True, 0
+            await asyncio.wait_for(t, 5)
+        asyncio.run(go())
+        self.assertEqual(order, ["DAILY:2025-12-30", "MONTHLY:2025-12", "YEARLY:2025",
+                                 "DAILY:2026-01-02", "DAILY:2026-01-03", "MONTHLY:2026-01"])
+
+    def test_make_post_fits_one_message(self):
+        from recap.runner import make_post
+        body = "\n".join(f"- 重點{i} [↗{i}](<https://discord.com/channels/519696701917757440/1555324160195166300/{i:019d}>)"
+                          for i in range(1, 40))
+        post = make_post("DAILY", "2026-10-01", "# 📰 標題", body, "-# 共 39 則訊息")
+        self.assertLessEqual(len(post), 1990)
+        self.assertTrue(post.startswith("DAILY|2026-10-01\n# 📰 標題"))
+        self.assertIn("[↗1](<", post)                          # 前面的連結保留，後面的改成純編號
+
     def test_wait_for_analysis(self):
         r = make([entry("2026-08-01", 1, enriched=False), entry("2026-10-01", 2, enriched=False)], backlog=5)
         asyncio.run(r._tick(NOW))
@@ -148,13 +208,17 @@ class RecapPhaseTest(unittest.TestCase):
         from recap.runner import Recapper
 
         async def go():
+            import lanes
+            from types import SimpleNamespace as N
+            lanes.setup(N(llm_schedule="daily", recap_time="03:30", llm_end="", ane_schedule="always",
+                          ane_start="03:30", ane_end="", tz="Asia/Taipei"))
             r = Recapper.__new__(Recapper)
             r._lock, r._trigger = _a.Lock(), None
             self.assertEqual(r.phase, "")
             self.assertTrue(r.trigger_now())
             self.assertEqual(r.phase, "queued")
             self.assertFalse(r.trigger_now())          # 排隊中不能再按
-            r._trigger.clear()
+            lanes.get("llm")._trigger.clear()
             async with r._lock:
                 self.assertEqual(r.phase, "running")
                 self.assertFalse(r.trigger_now())      # 總結中不能再按

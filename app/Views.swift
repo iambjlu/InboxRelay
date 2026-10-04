@@ -3,30 +3,62 @@
 import AppKit
 import SwiftUI
 
-struct StateBadge: View {
-    @ObservedObject var core: CoreController
-
-    var body: some View {
-        HStack(spacing: 6) {
-            Circle().fill(color).frame(width: 9, height: 9)
-            Text(text).font(.headline)
-        }
-    }
-
-    private var color: Color {
-        switch core.state {
-        case .running: return core.status.paused ? .orange : .green
+extension CoreController {
+    var stateColor: Color {
+        switch state {
+        case .running: return status.paused ? .orange : .green
         case .starting, .restarting: return .yellow
         case .stopped: return .red
         }
     }
 
-    private var text: String {
-        switch core.state {
-        case .running: return core.status.paused ? "背景 AI 已暫停" : "運行中"
+    var stateLabel: String {
+        switch state {
+        case .running: return status.paused ? "已暫停" : "運行中"
         case .starting: return "啟動中…"
-        case .restarting(let s): return "核心停止，\(s) 秒後重試"
+        case .restarting(let s): return "\(s) 秒後重試"
         case .stopped: return "已停止"
+        }
+    }
+}
+
+/// 小膠囊標籤（狀態用）
+@MainActor
+func confirmRecapReset(_ core: CoreController) {
+    let alert = NSAlert()
+    alert.messageText = "清空 #總結 並重新總結？"
+    alert.informativeText = "會刪掉 #總結 裡所有每日／月／年總結。之後等外部 LLM 把分析全部做完，"
+        + "再依日期順序一次重新發完。你在通知頻道給過的總結修正要求會保留。"
+    alert.alertStyle = .critical
+    alert.addButton(withTitle: "取消")                       // 預設按鈕＝取消（按 Enter 不會誤清）
+    let go = alert.addButton(withTitle: "清空並重新總結")
+    go.hasDestructiveAction = true
+    go.keyEquivalent = ""
+    NSApp.activate(ignoringOtherApps: true)
+    if alert.runModal() == .alertSecondButtonReturn { core.recapReset() }
+}
+
+struct StatusPill: View {
+    let text: String
+    let color: Color
+
+    var body: some View {
+        Text(text)
+            .font(.caption2.weight(.semibold))
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2)
+            .foregroundStyle(color)
+            .background(color.opacity(0.16), in: Capsule())
+    }
+}
+
+struct StateBadge: View {
+    @ObservedObject var core: CoreController
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Circle().fill(core.stateColor).frame(width: 9, height: 9)
+            Text(core.stateLabel).font(.headline)
         }
     }
 }
@@ -45,21 +77,84 @@ func confirmIfBusy(_ core: CoreController, _ what: String, then action: () -> Vo
     if alert.runModal() == .alertFirstButtonReturn { action() }
 }
 
-struct ControlButtons: View {
+/// 一條背景工作（外部 LLM／本機 ANE）的卡片：圖示、狀態、待處理、立即執行、暫停／繼續
+struct LaneRow: View {
     @ObservedObject var core: CoreController
-    var long = false      // 主視窗用較長的文字
+    let name: String          // llm / ane
+    let title: String
+
+    private var icon: String { name == "llm" ? "brain" : "text.viewfinder" }
 
     var body: some View {
-        Button(core.recapButtonTitle) { core.recapNow() }
-            .disabled(!core.canRecapNow)
-            .help(core.recapHelp)
-        if core.status.paused {
-            Button(long ? "繼續背景 AI" : "繼續") { core.resume() }
-                .disabled(!core.canPauseResume)
-        } else {
-            Button(long ? "暫停背景 AI" : "暫停") { core.pause() }
-                .disabled(!core.canPauseResume)
-                .help("暫停 AI 分析與總結（搬移照常）")
+        let l = core.lane(name)
+        let tint = color(l)
+        HStack(spacing: 10) {
+            Image(systemName: icon)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(tint)
+                .frame(width: 30, height: 30)
+                .background(tint.opacity(0.15), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(title).font(.callout.weight(.semibold)).lineLimit(1)
+                    StatusPill(text: pill(l), color: tint)
+                }
+                Text(detail(l)).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Spacer(minLength: 6)
+            HStack(spacing: 2) {
+                Button { core.laneRun(name) } label: {
+                    Image(systemName: l?.queued == true ? "hourglass" : "bolt.fill").frame(width: 22, height: 22)
+                }
+                .help(core.runTitle(name) + "｜" + core.runHelp(name))
+                .disabled(!core.canRun(name))
+                Button { core.laneToggle(name) } label: {
+                    Image(systemName: l?.state == "paused" ? "play.fill" : "pause.fill").frame(width: 22, height: 22)
+                }
+                .help(core.toggleHelp(name))
+                .disabled(!core.canToggle(name))
+            }
+            .buttonStyle(.borderless)
+            .font(.system(size: 13))
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    private func color(_ l: LaneStatus?) -> Color {
+        switch l?.state {
+        case "running": return (l?.backlog ?? 0) > 0 ? .green : .teal
+        case "waiting": return .blue
+        case "offline": return .red
+        case "paused": return .orange
+        default: return .gray
+        }
+    }
+
+    private func pill(_ l: LaneStatus?) -> String {
+        switch l?.state {
+        case "running": return (l?.backlog ?? 0) > 0 ? "執行中" : "待命"
+        case "waiting": return "等待"
+        case "offline": return "LLM 離線"
+        case "paused": return "已暫停"
+        case "unavailable": return "連線中"
+        default: return "—"
+        }
+    }
+
+    private func detail(_ l: LaneStatus?) -> String {
+        guard let l = l else { return "核心啟動後顯示" }
+        let left = "待處理 \(l.backlog.formatted())"
+        switch l.state {
+        case "waiting":
+            return (l.next_start.isEmpty ? l.describe : "\(l.next_start) 開始") + " · " + left
+        case "offline":
+            return (l.next_start.isEmpty ? "連不上，下次開始時間再試" : "連不上，\(l.next_start) 再試") + " · " + left
+        case "paused":
+            return left + " · 按 ▶︎ 繼續"
+        default:
+            return l.backlog > 0 ? left + " · " + l.describe : l.describe
         }
     }
 }
@@ -69,7 +164,7 @@ struct TaskRows: View {
 
     var body: some View {
         if tasks.isEmpty {
-            Text("本地 AI 閒置").foregroundStyle(.secondary)
+            Text("目前沒有背景工作").foregroundStyle(.secondary)
         } else {
             ForEach(tasks, id: \.self) { t in
                 VStack(alignment: .leading, spacing: 2) {
@@ -90,54 +185,88 @@ struct MenuContent: View {
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            StateBadge(core: core)
-            if !core.status.chat_title.isEmpty {
-                Text("投遞箱：\(core.status.chat_title)｜AI：\(core.status.ai_status)")
-                    .font(.caption).foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 12) {
+            // 標題列
+            HStack(spacing: 10) {
+                Image(systemName: "tray.and.arrow.down.fill")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: 32, height: 32)
+                    .background(LinearGradient(colors: [.blue, .cyan], startPoint: .bottom, endPoint: .top),
+                                in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("InboxRelay").font(.headline)
+                    Text(subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+                Spacer()
+                StatusPill(text: core.stateLabel, color: core.stateColor)
             }
-            Divider()
-            TaskRows(tasks: core.status.tasks)
-            Text(summaryLine).font(.caption).foregroundStyle(.secondary)
+
+            // 目前工作（有才顯示）
+            if !core.status.tasks.isEmpty {
+                VStack(alignment: .leading, spacing: 8) { TaskRows(tasks: core.status.tasks) }
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            }
+
+            // 背景工作
+            VStack(alignment: .leading, spacing: 6) {
+                Text("背景工作").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                LaneRow(core: core, name: "llm", title: "外部 LLM")
+                LaneRow(core: core, name: "ane", title: "本機 ANE")
+            }
+
+            if !summaryLine.isEmpty {
+                Text(summaryLine).font(.caption).foregroundStyle(.secondary)
+            }
             if !core.lastError.isEmpty {
-                Text(core.lastError).font(.caption).foregroundStyle(.red)
+                Label(core.lastError, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption).foregroundStyle(.red)
             }
+
             Divider()
-            HStack { ControlButtons(core: core) }
-            HStack {
-                Button("開啟主視窗") {
+
+            // 底部動作
+            HStack(spacing: 14) {
+                Button {
                     NSApp.activate(ignoringOtherApps: true)
                     openWindow(id: "main")
-                }
+                } label: { Label("主視窗", systemImage: "macwindow") }
                 switch core.state {
                 case .stopped:
-                    Button("啟動核心") { core.start() }
+                    Button { core.start() } label: { Label("啟動核心", systemImage: "play.circle") }
                 case .restarting:
-                    Button("立即重試") { core.restart() }
+                    Button { core.restart() } label: { Label("立即重試", systemImage: "arrow.clockwise") }
                 default:
-                    Button(core.state == .starting ? "啟動中…" : "重新啟動") {
-                        confirmIfBusy(core, "重新啟動") { core.restart() }
+                    Button { confirmIfBusy(core, "重新啟動") { core.restart() } } label: {
+                        Label("重新啟動", systemImage: "arrow.clockwise")
                     }
                     .disabled(!core.canRestart)
                 }
+                Spacer()
+                Button { confirmIfBusy(core, "結束 InboxRelay") { NSApp.terminate(nil) } } label: {
+                    Label("結束", systemImage: "power")
+                }
             }
-            Divider()
-            Button("結束 InboxRelay") { confirmIfBusy(core, "結束 InboxRelay") { NSApp.terminate(nil) } }
+            .buttonStyle(.borderless)
+            .font(.callout)
         }
         .padding(14)
-        .frame(width: 340)
+        .frame(width: 360)
+    }
+
+    private var subtitle: String {
+        if core.status.chat_title.isEmpty { return core.state == .running ? "已連線" : "正在啟動核心…" }
+        return "\(core.status.chat_title) · AI \(core.status.ai_status)"
     }
 
     private var summaryLine: String {
         var parts: [String] = []
-        if core.status.backlog > 0 { parts.append("待分析 \(core.status.backlog)") }
-        if core.status.probe_pending > 0 { parts.append("待確認刪除 \(core.status.probe_pending)") }
         if !core.status.summarized_until.isEmpty { parts.append("總結到 \(core.status.summarized_until)") }
-        if core.status.rss_mb > 0 { parts.append("記憶體 \(core.status.rss_mb)MB") }
-        if let h = core.status.next_recap_hours {
-            parts.append(String(format: "下次總結 %@（%.1f 小時後）", core.status.recap_time, h))
-        }
-        return parts.joined(separator: "｜")
+        if core.status.probe_pending > 0 { parts.append("待確認刪除 \(core.status.probe_pending)") }
+        if core.status.rss_mb > 0 { parts.append("記憶體 \(core.status.rss_mb) MB") }
+        return parts.joined(separator: " · ")
     }
 }
 
@@ -169,20 +298,27 @@ struct DashboardView: View {
                     VStack(alignment: .leading, spacing: 8) { TaskRows(tasks: core.status.tasks) }
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
+                GroupBox("背景工作") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        LaneRow(core: core, name: "llm", title: "外部 LLM（分析、總結、記憶）")
+                        Divider()
+                        LaneRow(core: core, name: "ane", title: "本機 ANE（圖片文字辨識）")
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
                 GroupBox("概況") {
                     Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 6) {
                         GridRow { Text("投遞箱"); Text(core.status.chat_title) }
-                        GridRow { Text("本地 AI"); Text(core.status.ai_status) }
+                        GridRow { Text("外部 LLM"); Text(core.status.ai_status) }
                         GridRow { Text("待分析"); Text("\(core.status.backlog) 則") }
                         GridRow { Text("待確認刪除"); Text("\(core.status.probe_pending) 則") }
                         GridRow { Text("每日總結完成到"); Text(core.status.summarized_until.isEmpty ? "—" : core.status.summarized_until) }
-                        GridRow { Text("每天總結時間"); Text(core.status.recap_time) }
+                        GridRow { Text("每日總結時間"); Text(core.status.recap_time) }
                         GridRow { Text("核心記憶體"); Text("\(core.status.rss_mb) MB") }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 HStack {
-                    ControlButtons(core: core, long: true)
                     Button(core.state == .stopped ? "啟動核心" : "重新啟動核心") {
                         if core.state == .stopped { core.start() } else { confirmIfBusy(core, "重新啟動") { core.restart() } }
                     }
@@ -208,11 +344,11 @@ struct SettingsView: View {
         Form {
             Section("設定儲存位置") {
                 Picker("儲存在", selection: $settings.storage) {
-                    ForEach(SettingsStore.Storage.allCases) { Text($0.rawValue).tag($0) }
+                    ForEach(SettingsStore.Storage.allCases) { Text($0.label).tag($0) }
                 }
                 if settings.storage == .folder {
                     HStack {
-                        TextField("資料夾（自己選，例如 iCloud Drive 裡的資料夾）", text: $settings.folderPath)
+                        TextField("資料夾", text: $settings.folderPath)
                         Button("選擇…") { chooseFolder() }
                     }
                     Toggle("Token 也存到這個資料夾", isOn: $settings.tokensInFolder)
@@ -232,7 +368,6 @@ struct SettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section("一般") {
-                TextField("專案資料夾（每台電腦各自設定）", text: $settings.projectPath)
                 Toggle("登入時自動啟動 InboxRelay", isOn: $loginItem)
                     .onChange(of: loginItem) { _, on in
                         if let err = LoginItem.set(on) {
@@ -243,7 +378,9 @@ struct SettingsView: View {
             }
             ForEach(SettingCatalog.sections, id: \.self) { sec in
                 Section(sec) {
-                    ForEach(SettingCatalog.fields.filter { $0.section == sec }) { f in
+                    ForEach(SettingCatalog.fields.filter {
+                        $0.section == sec && SettingCatalog.isVisible($0, values: settings.values)
+                    }) { f in
                         fieldRow(f)
                     }
                 }
@@ -253,16 +390,19 @@ struct SettingsView: View {
                     Button("儲存並重新啟動核心") {
                         confirmIfBusy(core, "儲存並重新啟動") {
                             settings.save()
-                            message = "已儲存（Token 存在鑰匙圈）"
+                            message = settings.storage == .folder && settings.tokensInFolder
+                                ? "已儲存（Token 也寫進設定資料夾）" : "已儲存（Token 存在鑰匙圈）"
                             if core.state == .stopped { core.start() } else { core.restart() }
                         }
                     }
                     .disabled(!core.canRestart)
                     .keyboardShortcut("s", modifiers: .command)
-                    Button("從 .env 補齊空白欄位") {
-                        let n = settings.importFromEnv()
-                        message = "從 .env 補上 \(n) 個欄位"
+                    Spacer()
+                    Button(role: .destructive) { confirmRecapReset(core) } label: {
+                        Label("清空並重新總結", systemImage: "arrow.counterclockwise")
                     }
+                    .disabled(!(core.isRunning && core.status.recap_enabled))
+                    .help("刪掉 #總結 裡所有總結，等分析全部做完後依日期重新總結（會先跳確認視窗）")
                 }
                 if !message.isEmpty { Text(message).font(.caption).foregroundStyle(.secondary) }
             }
@@ -309,7 +449,12 @@ struct SettingsView: View {
             let value = Binding<Int>(
                 get: { Int(settings.values[f.key] ?? "").map { min(max($0, range.lowerBound), range.upperBound) } ?? def },
                 set: { settings.values[f.key] = String($0) })
-            Stepper("\(f.label)：\(value.wrappedValue) \(unit)", value: value, in: range)
+            LabeledContent(f.label) {
+                HStack(spacing: 6) {
+                    Text("\(value.wrappedValue) \(unit)").monospacedDigit()
+                    Stepper("", value: value, in: range).labelsHidden()
+                }
+            }
         }
     }
 

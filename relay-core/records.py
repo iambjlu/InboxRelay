@@ -5,6 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 PREFIX = "KW|v2"
+OCR_NL = " ⏎ "       # 舊版圖中文字的換行寫法（讀取時相容；新版寫成空白）
+OCR_PREFIX = "OCR|"     # 圖中文字訊息：OCR|tg_chat|tg_msg（一張圖一則）
+OCR_REF = "見 OCR 訊息"   # 主紀錄 ocr 欄位：文字在 OCR 訊息裡
+OCR_MARKERS = ("（無文字）", "（無法取得圖片）")
+OCR_ROOM = 1960          # 一則 OCR 訊息最多放多少字（2000 扣掉標記行）
 MAX_LEN = 2000
 
 
@@ -25,6 +30,8 @@ class KwRecord:
     gist: str | None = None
     excerpt: str | None = None
     enriched: bool = False
+    ocr: str | None = None       # 圖中文字（本機 ANE 辨識）；「（無文字）」等標記代表做過了
+    img: str | None = None       # 文字裡「連到圖片」的網址（以空白分隔）：也做圖中文字辨識
 
     @property
     def key(self) -> tuple[int, int]:
@@ -40,7 +47,14 @@ def make_excerpt(text: str, n: int = 200) -> str:
     return t if len(t) <= n else t[: n - 1] + "…"
 
 
-def format_kw(r: KwRecord) -> str:
+def flat_ocr(ocr: str | None) -> str:
+    """圖中文字寫進紀錄時攤平成一行（行與行之間用空白），搜尋不受影響。"""
+    if not ocr:
+        return ""
+    return " ".join(" ".join(x.split()) for x in ocr.replace(OCR_NL, "\n").splitlines() if x.strip())
+
+
+def _head_lines(r: KwRecord) -> list[str]:
     lines = [
         PREFIX,
         f"tg_chat: {r.tg_chat}",
@@ -50,11 +64,39 @@ def format_kw(r: KwRecord) -> str:
         f"type: {r.type}",
         f"mirror: {r.mirror}",
     ]
-    for k in ("src", "filename", "fid", "reply", "shot", "kw", "gist"):
+    for k in ("src", "filename", "fid", "reply", "shot", "img", "kw", "gist"):
         v = getattr(r, k)
         if v:
             lines.append(f"{k}: {one_line(v)}")
+    return lines
+
+
+def ocr_message(r: KwRecord) -> str | None:
+    """這張圖的 OCR 訊息（#關鍵字庫 裡一張圖一則）：第一行是標記，其餘塞滿圖中文字。沒有文字回傳 None。"""
+    text = flat_ocr(r.ocr)
+    if not text or text in OCR_MARKERS or text == OCR_REF:
+        return None
+    head = f"{OCR_PREFIX}{r.tg_chat}|{r.tg_msg}\n"
+    return head + text[: MAX_LEN - len(head)]
+
+
+def parse_ocr_message(content: str) -> tuple[tuple[int, int], str] | None:
+    if not content.startswith(OCR_PREFIX):
+        return None
+    head, _, text = content.partition("\n")
+    try:
+        chat, msg = head[len(OCR_PREFIX):].split("|")[:2]
+        return (int(chat), int(msg)), text
+    except ValueError:
+        return None
+
+
+def format_kw(r: KwRecord) -> str:
+    lines = _head_lines(r)
     end = f"enriched: {'yes' if r.enriched else 'no'}"
+    if r.ocr:
+        # 主紀錄只記「做過了」：真正的文字放在這張圖自己的 OCR 訊息（一則塞滿）
+        lines.append(f"ocr: {r.ocr if r.ocr in OCR_MARKERS else OCR_REF}")
     if r.excerpt:
         room = MAX_LEN - sum(len(x) + 1 for x in lines) - len(end) - len("excerpt: ") - 1
         ex = one_line(r.excerpt)
@@ -105,9 +147,11 @@ def from_dict(d: dict[str, str]) -> KwRecord:
         fid=d.get("fid") or None,
         reply=d.get("reply") or None,
         shot=d.get("shot") or None,
+        img=d.get("img") or None,
         kw=d.get("kw") or None,
         gist=d.get("gist") or None,
         excerpt=d.get("excerpt") or None,
+        ocr=(d.get("ocr") or "").replace(OCR_NL, " ") or None,
         enriched=d.get("enriched", "no") == "yes",
     )
 

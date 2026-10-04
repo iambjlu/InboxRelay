@@ -37,7 +37,7 @@ class TestRecords(unittest.TestCase):
 
 class TestMirrorContent(unittest.TestCase):
     def test_attachment_only_first_of_day(self):
-        self.assertEqual(f.build_mirror_content("2026-10-02", ""), "# 2026-10-02")
+        self.assertEqual(f.build_mirror_content("2026-10-02", ""), "# 2026-10-02-Friday")
 
     def test_attachment_only_not_first(self):
         self.assertEqual(f.build_mirror_content("2026-10-02", "", with_header=False), "")
@@ -76,3 +76,22 @@ class TestAlbum(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OcrRecordTest(unittest.TestCase):
+    def test_ocr_message_and_no_return_symbol(self):
+        import records as r
+        text = "\n".join(f"第{i}行 訂單編號 A{i:05d}" for i in range(300))
+        rec = r.KwRecord(-1, 5, "live", "2026-10-01 10:00", "image", "u", filename="a.jpg", excerpt="說明", ocr=text)
+        main = r.format_kw(rec)
+        self.assertIn("ocr: 見 OCR 訊息", main)                 # 主紀錄只記「做過了」
+        msg = r.ocr_message(rec)
+        self.assertTrue(msg.startswith("OCR|-1|5\n"))
+        self.assertLessEqual(len(msg), 2000)                      # 一張圖一則，塞滿為止
+        self.assertNotIn("⏎", msg)
+        self.assertEqual(r.parse_ocr_message(msg)[0], (-1, 5))
+        self.assertIsNone(r.ocr_message(r.KwRecord(-1, 6, "live", "d", "image", "u", ocr="（無文字）")))
+        self.assertIn("ocr: （無文字）", r.format_kw(r.KwRecord(-1, 6, "live", "d", "image", "u", ocr="（無文字）")))
+        old = r.parse_record("KW|v2\ntg_chat: -1\ntg_msg: 5\norigin: live\ndate: 2026-10-01 10:00\ntype: image\n"
+                             "mirror: u\nocr: 第一行 ⏎ 第二行\nenriched: no")
+        self.assertEqual(old.ocr, "第一行 第二行")

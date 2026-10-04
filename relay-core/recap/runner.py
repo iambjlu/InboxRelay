@@ -24,6 +24,8 @@ from zoneinfo import ZoneInfo
 import discord
 
 import activity
+import lanes
+from ocr import useful
 import formatting
 import prompts
 from recap import daily
@@ -31,8 +33,8 @@ from recap import daily
 log = logging.getLogger("recap")
 
 TYPE_LABEL = {"text": "文字", "image": "圖片", "album": "相簿", "file": "檔案", "link": "連結",
-              "voice": "語音", "video": "影片", "sticker": "貼圖"}
-_MARK_RE = re.compile(r"^(?:-# )?(DAILY|MONTHLY)\|(\S+?)(?: (\d+)/(\d+))?$")
+              "voice": "語音", "video": "影片", "sticker": "貼圖", "invoice": "消費紀錄"}
+_MARK_RE = re.compile(r"^(?:-# )?(DAILY|MONTHLY|YEARLY)\|(\S+?)(?: (\d+)/(\d+))?$")
 _LINK_RE = re.compile(r"\[↗\d+\]\(<[^>]+>\)")
 CHUNK_ROOM = 1950
 
@@ -54,6 +56,38 @@ def make_chunks(kind: str, key: str, title: str, body: str, footer: str) -> list
     return out
 
 
+PLACEHOLDER_MARK = "⏳ 內容正在總結"
+POST_ROOM = 1990
+DRAIN_POLL_SEC = 30          # 等分析佇列做完時多久檢查一次
+
+
+def make_post(kind: str, key: str, title: str, body: str, footer: str) -> str:
+    """整篇放進「一則」訊息（才能先佔位、之後原地編輯，#總結 永遠照日期排序）。
+    太長時先把後面的出處連結改成純文字編號，還是太長才截斷內文。"""
+    head = f"{kind}|{key}"
+
+    def build(b: str) -> str:
+        return f"{head}\n{title}\n{b}\n{footer}".rstrip()
+
+    text = build(body)
+    if len(text) <= POST_ROOM:
+        return text
+    links = list(_LINK_RE.finditer(body))
+    for m in reversed(links):
+        plain = re.sub(r"^\[(↗\d+)\].*$", r"\1", m.group(0))
+        body = body[:m.start()] + plain + body[m.end():]
+        text = build(body)
+        if len(text) <= POST_ROOM:
+            return text
+    room = POST_ROOM - len(build("")) - 12
+    return build(body[:max(room, 0)].rsplit("\n", 1)[0] + "\n…（內容過長已截斷）")
+
+
+def timeline_key(kind: str, key: str) -> str:
+    """#總結 的排列順序：日 → 該月月總結 → … → 12 月月總結 → 年總結 → 下一年。"""
+    return key if kind == "DAILY" else f"{key}-~"
+
+
 def strip_citations(text: str) -> str:
     return _LINK_RE.sub("", text)
 
@@ -65,16 +99,26 @@ class RecapChannel:
         self.channel = channel
         self.bot_id = bot_id
         self.posts: dict[tuple[str, str], dict[int, discord.Message]] = {}
+        self.pending: set[tuple[str, str]] = set()     # 只是佔位（⏳ 內容正在總結），還沒寫
 
     def has(self, kind: str, key: str) -> bool:
+        """真的寫好了（不含佔位）。"""
+        return (kind, key) in self.posts and (kind, key) not in self.pending
+
+    def exists(self, kind: str, key: str) -> bool:
+        """有貼文（含佔位）。"""
         return (kind, key) in self.posts
 
     def keys(self, kind: str) -> set[str]:
-        return {k for (t, k) in self.posts if t == kind}
+        return {k for (t, k) in self.posts if t == kind and (t, k) not in self.pending}
 
     def first(self, kind: str, key: str) -> discord.Message | None:
+        if (kind, key) in self.pending:
+            return None
         parts = self.posts.get((kind, key))
         return parts[min(parts)] if parts else None
+
+
 
     async def load(self) -> None:
         self.posts.clear()
@@ -84,9 +128,13 @@ class RecapChannel:
             mk = parse_marker(m.content)
             if mk:
                 self.posts.setdefault((mk[0], mk[1]), {})[mk[2]] = m
-        log.info("#總結 已有每日 %d 篇、月 %d 篇", len(self.keys("DAILY")), len(self.keys("MONTHLY")))
+                if mk[2] == 1 and PLACEHOLDER_MARK in m.content:
+                    self.pending.add((mk[0], mk[1]))
+        log.info("#總結 已有每日 %d 篇、月 %d 篇、年 %d 篇（另有 %d 則佔位）", len(self.keys("DAILY")),
+                 len(self.keys("MONTHLY")), len(self.keys("YEARLY")), len(self.pending))
 
     async def remove(self, kind: str, key: str) -> None:
+        self.pending.discard((kind, key))
         for m in self.posts.pop((kind, key), {}).values():
             try:
                 await m.delete()
@@ -101,6 +149,7 @@ class RecapChannel:
                     del parts[i]
                     if 1 not in parts:          # 第一則（含標記）沒了就整篇視為不存在
                         self.posts.pop(k, None)
+                        self.pending.discard(k)
                     return True
         return False
 
@@ -120,6 +169,7 @@ class RecapChannel:
                 except discord.NotFound:
                     pass
         self.posts[(kind, key)] = new
+        self.pending.discard((kind, key))
         return new[1]
 
 
@@ -139,6 +189,7 @@ class Recapper:
         self.notes = notes         # state.DbRecord("RECAP_NOTES")：日期／月份 → 使用者補充要求
         self.start_at = None               # datetime.time；每天幾點開始
         self._trigger: asyncio.Event | None = None
+        self._cycle = False                # 這一輪（總結→等分析→再總結）還在進行
 
     def set_schedule(self, start: str) -> None:
         from datetime import time as dtime
@@ -157,9 +208,10 @@ class Recapper:
     @property
     def phase(self) -> str:
         """running＝正在總結；queued＝已按「立即總結」、還沒開始；""＝閒置。"""
-        if self._lock.locked():
+        if self._lock.locked() or getattr(self, "_cycle", False):
             return "running"
-        if self._trigger is not None and self._trigger.is_set():
+        lane = lanes.get("llm")
+        if lane is not None and lane.queued:
             return "queued"
         return ""
 
@@ -167,10 +219,8 @@ class Recapper:
         """立即總結（終端機按 n／App 按鈕）。正在總結或已經排隊時不重複觸發，回傳 False。"""
         if self.phase:
             return False
-        if self._trigger is None:
-            self._trigger = asyncio.Event()
-        self._trigger.set()
-        return True
+        lane = lanes.get("llm")
+        return lane.run_now() if lane is not None else False
 
     def note_for(self, key: str) -> str:
         return (self.notes.data.get(key, "") if self.notes else "").strip()
@@ -217,6 +267,9 @@ class Recapper:
             bits.append(f"重點：{rec.gist}")
         if rec.kw:
             bits.append(f"關鍵字：{rec.kw}")
+        o = useful(getattr(rec, "ocr", None))
+        if o:
+            bits.append(f"圖中文字：{o[:200]}")
         return "｜".join(bits) or "（無文字）"
 
     # ------------------------------------------------------------ 產生
@@ -234,7 +287,7 @@ class Recapper:
         body = daily.link_citations(out, [it.url for it in items])
         un = sum(1 for e in entries if not e.rec.enriched)
         footer = f"-# 共 {len(entries)} 則訊息" + ("｜⚠️ 部分內容尚未分析，分析完成後會自動更新" if un else "")
-        await self.rc.publish("DAILY", day, make_chunks("DAILY", day, f"# 📰 {formatting.display_date(day)} 每日總結", body, footer))
+        await self.rc.publish("DAILY", day, [make_post("DAILY", day, f"# 📰 {formatting.display_date(day)} 每日總結", body, footer)])
         partial = self._partial()
         (partial.add if un else partial.discard)(day)
         await self._set_partial(partial)
@@ -257,14 +310,36 @@ class Recapper:
                                   daily.build_material(items), max_tokens=3000)
         body = daily.link_citations(out, [it.url for it in items])
         footer = f"-# 根據 {len(items)} 天的每日總結"
-        await self.rc.publish("MONTHLY", month, make_chunks("MONTHLY", month, f"# 🗓️ {month} 月總結", body, footer))
+        await self.rc.publish("MONTHLY", month, [make_post("MONTHLY", month, f"# 🗓️ {month} 月總結", body, footer)])
         done = self.rc.keys("MONTHLY")
         await self.state.merge(monthly_until=max(done) if done else "")
         log.info("月總結 %s 完成（%d 天）", month, len(items))
 
+    async def summarize_year(self, year: str) -> None:
+        months = sorted(m for m in self.rc.keys("MONTHLY") if m.startswith(year))
+        items = []
+        for mo in months:
+            m = self.rc.first("MONTHLY", mo)
+            if m is None:
+                continue
+            text = strip_citations(m.content.split("\n", 2)[-1])[:1200]
+            items.append(daily.Item(mo, "月總結", text, m.jump_url))
+        if not items:
+            return
+        out = await self.llm.chat(self._with_note(prompts.render("RECAP_YEARLY", year=year), year),
+                                  daily.build_material(items), max_tokens=4000)
+        body = daily.link_citations(out, [it.url for it in items])
+        footer = f"-# 根據 {len(items)} 個月的月總結"
+        await self.rc.publish("YEARLY", year, [make_post("YEARLY", year, f"# 🎆 {year} 年總結", body, footer)])
+        log.info("年總結 %s 完成（%d 個月）", year, len(items))
+
     # ------------------------------------------------------------ 排程
     async def tick(self) -> None:
         async with self._lock:
+            try:
+                await self.dirty.load()      # 匯入工具可能新增了「需要重新總結」的日期
+            except Exception:
+                log.warning("重讀 RECAP_DIRTY 失敗，沿用記憶體中的清單")
             await self._tick(self._now())
 
     def plan(self, now: datetime) -> list[tuple[str, str]]:
@@ -294,6 +369,18 @@ class Recapper:
             work.append(("daily", d))
         return work
 
+    async def reset_all(self) -> int:
+        """清空 #總結（bot 發的全部）並重設進度；之後等分析全部做完，再依日期一次重新總結。"""
+        from reset import purge_bot_messages
+        async with self._lock:
+            n = await purge_bot_messages(self.rc.channel, self.rc.bot_id)
+            self.rc.posts.clear()
+            self.rc.pending.clear()
+            await self.state.merge(summarized_until="", monthly_until="", partial_days="")
+            await self.dirty.clear_all()
+            log.info("🧹 已清空 #總結（%d 則）；等外部 LLM 把分析全部做完後，會依日期重新總結", n)
+        return n
+
     async def _tick(self, now: datetime) -> None:
         """依日期順序做：某個月最後一篇每日總結做完，緊接著就做那個月的月總結，再往下一個月。"""
         today = now.strftime("%Y-%m-%d")
@@ -309,19 +396,45 @@ class Recapper:
         touched = {d[:7] for _, d in work}
         months = sorted(m for m in ({d[:7] for d in days} - {this_month})
                         if m < this_month and (m in touched or not self.rc.has("MONTHLY", m)))
-        # 時間軸：每日總結用日期排序；月總結排在該月所有日期之後（"YYYY-MM-~" 比 "YYYY-MM-31" 大）
-        steps = sorted([(d, kind) for kind, d in work] + [(f"{m}-~", "month") for m in months])
+        # 年總結：今年以前、這次有動到的月份所在年份，或還沒有年總結的年份
+        this_year = today[:4]
+        touched_years = {m[:4] for m in months}
+        years = sorted(y for y in {d[:4] for d in days}
+                       if y < this_year and (y in touched_years or not self.rc.has("YEARLY", y)))
+        # 時間軸：每日總結用日期排序；月總結排在該月所有日期之後（"YYYY-MM-~" 比 "YYYY-MM-31" 大）；
+        # 年總結排在該年 12 月的月總結之後（"YYYY-~" 比 "YYYY-12-~" 大、比下一年小）
+        steps = sorted([(d, kind) for kind, d in work] + [(f"{m}-~", "month") for m in months]
+                       + [(f"{y}-~", "year") for y in years])
+        # 順序檢查：新貼文只能接在最後；比現有最後一篇還早的日期（例如事後補匯入）只能排在後面，記錄警告
+        latest = max((timeline_key(k, v) for (k, v) in self.rc.posts), default="")
+        kind_of = {"month": "MONTHLY", "year": "YEARLY"}
+        late = [k for k, kind in steps
+                if k < latest and not self.rc.exists(kind_of.get(kind, "DAILY"), k.rstrip("-~"))]
+        if late:
+            log.warning("有 %d 篇總結的日期比 #總結 最後一篇還早（例：%s），只能排在後面", len(late), "、".join(late[:3]))
+
+        def year_ready(y: str) -> bool:
+            ms = {d[:7] for d in self.data_days() if d.startswith(y)}
+            return bool(ms) and all(self.rc.has("MONTHLY", m) for m in ms)
 
         def month_ready(m: str) -> bool:
             ds = [d for d in self.data_days() if d.startswith(m)]
             return bool(ds) and all(self.rc.has("DAILY", d) for d in ds)
 
-        task = activity.start("每日／月總結", total=len(steps)) if steps else None
+        task = activity.start("每日／月／年總結", total=len(steps)) if steps else None
         activity.bind(task)
         try:
             for key, kind in steps:
                 await activity.gate()
-                if kind == "month":
+                if kind == "year":
+                    y = key[:4]
+                    if task:
+                        task.set(detail=f"年總結 {y}")
+                    if year_ready(y):
+                        await self.summarize_year(y)
+                    else:
+                        log.info("%s 年還有月份缺月總結，年總結下次再做", y)
+                elif kind == "month":
                     m = key[:7]
                     if task:
                         task.set(detail=f"月總結 {m}")
@@ -341,23 +454,24 @@ class Recapper:
             if task:
                 activity.finish(task)
 
-    async def loop(self) -> None:
-        """等到每天的開始時間（或按 n 立即總結），一次做完所有積欠的。"""
-        if self._trigger is None:
-            self._trigger = asyncio.Event()
-        while True:
-            wait = self.seconds_until_start()
-            log.info("下一次自動總結：%s（約 %.1f 小時後；終端機按 n 可立即總結）",
-                     (self._now() + timedelta(seconds=wait)).strftime("%m/%d %H:%M"), wait / 3600)
-            try:
-                await asyncio.wait_for(self._trigger.wait(), timeout=wait + 1)
-                log.info("收到「立即總結」")
-            except asyncio.TimeoutError:
-                pass
-            self._trigger.clear()
-            try:
-                await self.tick()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
+    async def cycle(self) -> None:
+        """外部 LLM 車道每次開始時做：等分析佇列全部做完 → 依日期順序一次發完囤積的日／月／年總結。
+        （邊分析邊發會讓 #總結 缺日子、日期跳來跳去，因為 Discord 沒辦法插回舊位置。）"""
+        self._cycle = True
+        try:
+            if self.enricher is not None:
+                while not self.enricher.drained:
+                    await asyncio.sleep(DRAIN_POLL_SEC)
+            await self.tick()
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:
+            from llm import is_offline_error
+            if is_offline_error(ex):                 # 外部 LLM 連不上：沒寫的總結留到下次（下次會自動補）
+                lane = lanes.get("llm")
+                if lane is not None:
+                    lane.go_offline(type(ex).__name__)
+            else:
                 log.exception("總結失敗")
+        finally:
+            self._cycle = False

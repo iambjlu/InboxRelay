@@ -109,12 +109,25 @@ class DirtyDays:
         self.dates = {x.strip() for x in d.get("dates", "").split(",") if x.strip()}
 
     async def mark(self, date: str) -> None:
+        await self.load()                    # 先重讀：匯入工具可能同時寫入
         if date in self.dates:
             return
         self.dates.add(date)
         await self.record.save({"dates": ", ".join(sorted(self.dates)), "updated": now_iso()})
 
+    async def mark_many(self, dates: list[str]) -> None:
+        await self.load()
+        new = set(dates) - self.dates
+        if new:
+            self.dates |= new
+            await self.record.save({"dates": ", ".join(sorted(self.dates)), "updated": now_iso()})
+
+    async def clear_all(self) -> None:
+        self.dates = set()
+        await self.record.save({"dates": "", "updated": now_iso()})
+
     async def clear(self, date: str) -> None:
+        await self.load()
         if date in self.dates:
             self.dates.discard(date)
             await self.record.save({"dates": ", ".join(sorted(self.dates)), "updated": now_iso()})

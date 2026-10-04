@@ -43,9 +43,33 @@ def unwrap_block(text: str) -> str:
     return t
 
 
+def fit_memory(text: str, limit: int) -> str:
+    """放不下時「依段落」修剪，不從中間硬切：每段至少保留段名，從最長的段落尾端一條一條刪。"""
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    sections: list[list[str]] = [[]]
+    for ln in text.split("\n"):
+        if re.match(r"^\s*【.+】\s*$", ln) and sections[-1]:
+            sections.append([])
+        sections[-1].append(ln)
+
+    def total() -> int:
+        return len("\n".join("\n".join(s) for s in sections))
+
+    while total() > limit:
+        longest = max(sections, key=lambda s: len("\n".join(s)))
+        if len(longest) <= 1:
+            break
+        longest.pop()                                # 刪掉該段最後一條
+    out = "\n".join("\n".join(s) for s in sections).strip()
+    return out if len(out) <= limit else out[:limit].rsplit("\n", 1)[0]
+
+
 MEM_TAG = "#記憶"
 PROMPT_TAG = "#提示詞"
-MAX_MEMORY_CHARS = 1800   # 要能放進一則 Discord 訊息
+MAX_MEMORY_CHARS = 1800   # 硬上限：要能放進一則 Discord 訊息
+TARGET_MEMORY_CHARS = 1200  # 超過這個長度就請 AI 再精簡一次
 UPGRADE_EVERY = 30          # 累積幾筆新分析就自動升級
 _VER_RE = re.compile(r"v(\d+)")
 
@@ -70,6 +94,14 @@ class MemoryStore:
     observations: list[Observation] = field(default_factory=list)
     corrections: list[str] = field(default_factory=list)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # 讓 AI 對話也能用同一套（各自獨立的記憶）
+    apply_to_llm: bool = True                 # True＝寫進 llm.memory（收件匣分析用的用語筆記）
+    upgrade_prompt: str = "MEMORY_UPGRADE"
+    compress_hint: str = ("保留【詞彙】【常見主題】【整理偏好】【待確認】四段與使用者的更正；"
+                          "詞彙只留縮寫、暱稱、自創詞等不解釋就看不懂的（最多 25 條），一般產品／App／歌曲名稱的清單刪掉或用一句話概括。")
+    where: str = "#資料庫"                    # 通知裡說「去哪裡發 #記憶 蓋掉」
+    label: str = "記憶"
+    obs_label: str = "最近的訊息與分析"
 
     # ------------------------------------------------------------ 讀取
     def _trusted(self, m: discord.Message) -> bool:
@@ -85,10 +117,11 @@ class MemoryStore:
                 continue
             ver = _VER_RE.search(m.content.split("\n", 1)[0])
             self.version = int(ver.group(1)) if ver else await self._max_version(scan) + 1
-            self.content = self._body(m)[:MAX_MEMORY_CHARS]
+            self.content = fit_memory(self._body(m), MAX_MEMORY_CHARS)
             break
-        self.llm.memory, self.llm.memory_version = self.content, f"v{self.version}"
-        log.info("記憶：%s（%d 字）", f"v{self.version}" if self.content else "（尚無）", len(self.content))
+        if self.apply_to_llm:
+            self.llm.memory, self.llm.memory_version = self.content, f"v{self.version}"
+        log.info("%s：%s（%d 字）", self.label, f"v{self.version}" if self.content else "（尚無）", len(self.content))
 
     async def _max_version(self, scan: int) -> int:
         best = 0
@@ -125,29 +158,38 @@ class MemoryStore:
         mem = mem.replace("=== 記憶 ===", "").strip()
         items = [ln.strip().lstrip("-•").strip() for ln in changes.strip().split("\n") if ln.strip()]
         items = [x for x in items if x and x != "無"]
-        return mem[:MAX_MEMORY_CHARS], items
+        return mem.strip(), items
 
     def _upgrade_data(self) -> str:
         obs = "\n".join(f"- {o.text}｜關鍵字：{'、'.join(o.kw)}｜重點：{o.gist}" for o in self.observations[-80:])
         cor = "\n".join(f"- {c}" for c in self.corrections) or "（無）"
         return (f"【目前記憶 v{self.version}】\n{self.content or '（空）'}\n\n"
-                f"【使用者更正】\n{cor}\n\n【最近的訊息與分析】\n{obs or '（無）'}")
+                f"【使用者更正】\n{cor}\n\n【{self.obs_label}】\n{obs or '（無）'}")
 
-    async def upgrade(self, reason: str) -> bool:
-        """請 AI 產生新版記憶；有變動才發布。回傳是否升級。"""
+    async def upgrade(self, reason: str, urgent: bool = False) -> bool:
+        """請 AI 產生新版記憶；有變動才發布。回傳是否升級。urgent＝不等外部 LLM 排程（對話中觸發的）。"""
         async with self._lock:
             if not self.observations and not self.corrections:
                 return False
-            if not self.corrections:
+            if not self.corrections and not urgent:
                 await activity.gate()          # 自動升級算背景工作；使用者更正不等
-            task = activity.start("記憶升級", total=1, background=not self.corrections)
+            task = activity.start(f"{self.label}升級", total=1, background=not self.corrections)
             activity.bind(task)
             try:
-                out = await self.llm.chat(prompts.get("MEMORY_UPGRADE"), self._upgrade_data(),
+                out = await self.llm.chat(prompts.get(self.upgrade_prompt), self._upgrade_data(),
                                           max_tokens=2500, use_memory=False)
+                mem, changes = self.parse_upgrade(out)
+                if len(mem) > TARGET_MEMORY_CHARS:          # 太長 → 請 AI 精簡一次
+                    log.info("記憶 %d 字，超過 %d，請 AI 精簡", len(mem), TARGET_MEMORY_CHARS)
+                    short = await self.llm.chat(
+                        f"下面的筆記有 {len(mem)} 字，請精簡到 {TARGET_MEMORY_CHARS} 字以內：{self.compress_hint}"
+                        "只輸出精簡後的筆記本身。", mem, max_tokens=2000, use_memory=False)
+                    short = short.replace("=== 記憶 ===", "").strip()
+                    if short and len(short) < len(mem):
+                        mem = short
             finally:
                 activity.finish(task)
-            mem, changes = self.parse_upgrade(out)
+            mem = fit_memory(mem, MAX_MEMORY_CHARS)
             if not mem or (not changes and not self.corrections):
                 log.info("記憶檢查：沒有需要升級的內容")
                 self.observations.clear()
@@ -157,24 +199,57 @@ class MemoryStore:
             self.corrections.clear()
             return True
 
+    async def refresh_once(self, flag: str, note: str) -> None:
+        """規則改版後自動用新規則重整一次舊記憶（每個 flag 只做一次；失敗下次啟動再試）。"""
+        from paths import data_dir
+        f = data_dir() / flag
+        if f.exists():
+            return
+        if self.content.strip():
+            self.add_correction(note)
+            while True:
+                try:
+                    ok = await self.upgrade("規則更新", urgent=True)
+                    break
+                except Exception as ex:
+                    from llm import is_offline_error
+                    if is_offline_error(ex):            # 外部 LLM 連不上 → 等下次開始時間再試
+                        import lanes
+                        lane = lanes.get("llm")
+                        if lane is not None:
+                            lane.go_offline(type(ex).__name__)
+                            await activity.gate()
+                            continue
+                    log.warning("%s依新規則重整失敗，下次啟動再試", self.label, exc_info=True)
+                    self.corrections = [c for c in self.corrections if c != note]
+                    return
+            if not ok:
+                log.info("%s依新規則檢查：不用改", self.label)
+        try:
+            f.write_text("done\n")
+        except OSError:
+            pass
+
     async def publish(self, mem: str, changes: list[str], source: str) -> None:
         ver = self.version + 1
         head = f"{MEM_TAG} v{ver}｜{self._now()}｜{source}"
-        mem = mem[: 2000 - len(head) - 9].strip()
+        mem = fit_memory(mem, 2000 - len(head) - 9)
         await self.db_channel.send(f"{head}\n{wrap_block(mem)}")
         self.version, self.content = ver, mem
-        self.llm.memory, self.llm.memory_version = mem, f"v{ver}"
-        log.info("記憶已升級為 v%d", ver)
+        if self.apply_to_llm:
+            self.llm.memory, self.llm.memory_version = mem, f"v{ver}"
+        log.info("%s已升級為 v%d", self.label, ver)
         if self.notify_channel is not None:
             pts = "\n".join(f"• {c}" for c in changes[:10])
             await self.notify_channel.send(
-                f"🧠 **記憶已升級 v{ver}**（{source}）\n{pts}\n"
-                f"-# 不喜歡可以在 #資料庫 發一則以「#記憶」開頭的新訊息蓋掉；舊版都還在頻道裡")
+                f"🧠 **{self.label}已升級 v{ver}**（{source}）\n{pts}\n"
+                f"-# 不喜歡可以在 {self.where} 發一則以「#記憶」開頭的新訊息蓋掉；舊版都還在頻道裡")
 
 
 PROMPT_GROUPS = [
-    ("基本與分析", ["GUARD", "MEMORY_WRAP", "LINK", "IMAGE", "DOC", "DOC_PART", "DOC_MERGE", "KEYWORDS"]),
-    ("總結與互動", ["RECAP_DAILY", "RECAP_MONTHLY", "FEEDBACK_ROUTE", "MEMORY_UPGRADE"]),
+    ("基本與分析", ["GUARD", "MEMORY_WRAP", "LINK", "LINK_FALLBACK", "IMAGE", "DOC", "DOC_PART", "DOC_MERGE", "KEYWORDS"]),
+    ("總結與互動", ["RECAP_DAILY", "RECAP_MONTHLY", "RECAP_YEARLY", "FEEDBACK_ROUTE", "MEMORY_UPGRADE",
+                    "CHAT_MEMORY_UPGRADE", "CHAT_COMPACT"]),
     ("搜尋", ["SEARCH_PARSE", "SEARCH_ANSWER", "SEARCH_FOLLOWUP", "GENERAL_ANSWER"]),
 ]
 CUSTOM_MARK = "（自訂）"

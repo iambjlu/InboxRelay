@@ -26,6 +26,7 @@ import discord
 
 import activity
 import config
+import lanes
 import state
 from dc_output import DiscordOut
 from llm import LLM
@@ -63,9 +64,10 @@ _LOCK_HANDLE = None
 
 
 def single_instance() -> bool:
-    """用 run.sh 本身做檔案鎖（只讀開啟、不寫入任何檔案），避免同時開兩個。"""
+    """檔案鎖（~/Library/Application Support/InboxRelay/instance.lock），避免同時開兩個（App 與終端機共用同一把鎖）。"""
     global _LOCK_HANDLE
-    _LOCK_HANDLE = open(Path(__file__).resolve().parent.parent / "run.sh", "rb")
+    from paths import data_dir
+    _LOCK_HANDLE = open(data_dir() / "instance.lock", "a+")
     try:
         fcntl.flock(_LOCK_HANDLE.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         return True
@@ -86,7 +88,7 @@ def setup_logging() -> None:
     logging.getLogger("telegram.ext.Updater").addFilter(_TelegramNoiseFilter())
 
 
-HELP_KEYS = "按鍵：n 立即總結｜p 暫停背景 AI｜r 繼續｜s 狀態｜h 說明｜Ctrl+C 結束"
+HELP_KEYS = "按鍵：n 立即執行（分析＋總結）｜p 暫停背景 AI｜r 繼續｜s 狀態｜h 說明｜Ctrl+C 結束"
 
 
 def install_console(act, relayer, get_recapper):
@@ -106,7 +108,7 @@ def install_console(act, relayer, get_recapper):
         rc = get_recapper()
         if ch == "n":
             if rc is None:
-                log.info("每日總結沒有啟用（需要本地 AI）")
+                log.info("每日總結沒有啟用（需要外部 LLM）")
             else:
                 if rc.trigger_now():
                     log.info("🧾 立即總結：開始處理所有積欠的每日／月總結%s",
@@ -124,7 +126,7 @@ def install_console(act, relayer, get_recapper):
             else:
                 log.info("沒有暫停，不用繼續")
         elif ch == "s":
-            lines = act.status_lines() or ["本地 AI 閒置中"]
+            lines = act.status_lines() or ["目前沒有背景工作"]
             for ln in lines:
                 log.info("📊 %s", ln)
             if relayer.enricher is not None:
@@ -151,6 +153,7 @@ async def run(check_only: bool) -> int:
     _shot.ALLOW_PRIVATE = cfg.private_urls
     _shot.IGNORE_CERT = cfg.ignore_cert
     act = activity.init()
+    lanes.setup(cfg)                       # 外部 LLM／本機 ANE 兩條車道的排程
     restore_console = None
     llm = LLM(cfg.ai_server, cfg.ai_model, cfg.ai_key, cfg.ai_image_support) \
         if cfg.ai_server and cfg.ai_model else None
@@ -182,7 +185,8 @@ async def run(check_only: bool) -> int:
         # 選用頻道（實驗、搜尋測試、連結預覽、通知）不存在或沒權限 → 只停用那個功能，不影響主流程
         import dataclasses
         for label, attr in (("AI 測試", "ch_ai_test"), ("搜尋測試", "ch_search_test"),
-                            ("連結預覽與進度", "ch_screenshot"), ("通知與互動", "ch_notify")):
+                            ("連結預覽與進度", "ch_screenshot"), ("通知與互動", "ch_notify"),
+                            ("AI 對話", "ch_chat"), ("AI 對話提示詞", "ch_chat_prompt")):
             cid = getattr(cfg, attr)
             if cid:
                 bad = await dc.check_channels({label: cid})
@@ -204,11 +208,14 @@ async def run(check_only: bool) -> int:
                 models = await asyncio.wait_for(llm.ping(), timeout=15)
                 ok = cfg.ai_model in models
                 ai_status = "✅ 已連線" if ok else "⚠️ 已連線但找不到模型"
-                log.info("本地 AI 已連線：%s（模型 %s %s）", cfg.ai_server, cfg.ai_model,
+                log.info("外部 LLM 已連線：%s（模型 %s %s）", cfg.ai_server, cfg.ai_model,
                          "✅" if ok else f"❌ 不在清單：{', '.join(models[:5])}")
             except Exception as e:
                 ai_status = "❌ 連不上"
-                log.warning("本地 AI 連不上（%s）：%s；AI 功能會失敗，搬移照常", cfg.ai_server, e)
+                log.warning("外部 LLM 連不上（%s）：%s；搬移照常，AI 工作留到下次開始時間再試", cfg.ai_server, e)
+                lane = lanes.get("llm")
+                if lane is not None:
+                    lane.go_offline(type(e).__name__)
         if llm:
             from memory import MemoryStore
             guild = dc.guild
@@ -225,6 +232,9 @@ async def run(check_only: bool) -> int:
             pstore = PromptStore(mem.db_channel, mem.notify_channel, mem.bot_id, editors, cfg.tz)
             await pstore.load(publish_defaults=not check_only)
             await mem.load()
+            if not check_only:
+                asyncio.create_task(mem.refresh_once(
+                    "memory-rules-v2", "待確認只留反覆出現、看不懂就會整理錯的縮寫或代號，最多 3 條，沒有就寫「無」；不要放專案或事件的後續、人際關係、一次性的生活事件、只是看看的東西、里程油耗電量金額等數字紀錄。"))
             if aitest:
                 aitest.memory = mem
                 aitest.prompts = pstore
@@ -306,11 +316,25 @@ async def run(check_only: bool) -> int:
                     log.info("#總結 有一篇被手動刪除，下次檢查會重新產生")
             dc.add_delete_handler(_recap_deleted)
             recapper.set_schedule(cfg.recap_time)
-            background.append(asyncio.create_task(recapper.loop()))
-            log.info("每日／每月總結已啟用：每天 %s 開始（已完成到 %s）", cfg.recap_time,
-                     st.data.get("summarized_until") or "尚無")
+            if st.data.get("recap_layout") != "2":
+                # 新版 #總結 版面（依日期佔位、原地更新）：第一次啟動時清掉舊的總結、重建目錄（只做一次）
+                async def _migrate_recap() -> None:
+                    try:
+                        await recapper.reset_all()
+                        await st.merge(recap_layout="2")
+                    except Exception:
+                        log.exception("重建 #總結 失敗（下次啟動會再試）")
+                background.append(asyncio.create_task(_migrate_recap()))
+            log.info("每日／月／年總結已啟用（已完成到 %s）", st.data.get("summarized_until") or "尚無")
         else:
             recapper, rc = None, None
+        llm_lane = lanes.get("llm")
+        enr = relayer.enricher
+        background.append(asyncio.create_task(lanes.run_lane(
+            llm_lane, drained=lambda: enr is None or enr.drained,
+            cycle=recapper.cycle if recapper is not None else None)))
+        log.info("🚦 外部 LLM 工作：%s；本機 ANE 文字辨識：%s（搜尋、實驗頻道等互動隨時可用）",
+                 llm_lane.describe(), lanes.get("ane").describe())
         if llm:
             guild = dc.guild
             editors = set(cfg.memory_editors) | ({guild.owner_id} if guild and guild.owner_id else set())
@@ -321,6 +345,15 @@ async def run(check_only: bool) -> int:
                 SearchChannel(cfg, dc, llm, relayer.index, rc, live_ids, test_ids, aitest)
                 log.info("搜尋已啟用：正式 #搜尋 %s；測試頻道 %s（搜 AI 測試頻道的內容）",
                          "開" if live_ids else "關（SEARCH_LIVE=false）", "開" if test_ids else "關")
+            if cfg.ch_chat and cfg.ch_chat_prompt:
+                from chat import ChatChannel
+                try:
+                    await ChatChannel(cfg, dc, llm, editors,
+                                      await dc.channel(cfg.ch_notify) if cfg.ch_notify else None).setup()
+                except Exception:
+                    log.exception("AI 對話啟用失敗（其他功能照常）")
+            elif cfg.ch_chat:
+                log.warning("AI 對話需要同時設定 DC_CH_CHAT 與 DC_CH_CHAT_PROMPT（提示詞與記憶頻道）")
             if cfg.ch_notify:
                 from feedback import FeedbackChannel
                 FeedbackChannel(cfg, dc, llm, recapper, mem, editors, cfg.ch_notify)
@@ -353,10 +386,34 @@ async def run(check_only: bool) -> int:
             managed_by_app=ipc.enabled(), stop_event=stop)
         act.mem = guard
         background.append(asyncio.create_task(guard.loop()))
+        ane_lane = lanes.get("ane")
         if ipc.enabled():
+            from ocr import OcrWorker
             server = ipc.IpcServer(act, relayer, lambda: recapper, tg, cfg, ai_status, stop)
+            relayer.ocr = OcrWorker(dc, relayer.index, ipc.emit)
+            server.ocr = relayer.ocr
+            if relayer.enricher is not None:
+                relayer.enricher.on_link_images = relayer.ocr.submit
+            if recapper is not None:
+                relayer.ocr.has_daily = lambda day: recapper.rc.has("DAILY", day)
+                relayer.ocr.mark_days = relayer.dirty.mark_many
+            ane_lane.available = False            # 等 App 回報支援文字辨識（hello）
+            relayer.ocr.scan_index()
+            background.append(asyncio.create_task(relayer.ocr.run()))
+            background.append(asyncio.create_task(lanes.run_lane(ane_lane, drained=lambda: relayer.ocr.drained)))
             background.append(asyncio.create_task(server.run()))
             log.info("由 InboxRelay.app 管理（IPC 已啟用）")
+        if relayer.enricher is not None:
+            async def _refresh_links() -> None:
+                from enrich.refresh import refresh_links
+                while not relayer.enricher.drained:          # 新訊息的分析先做完
+                    await asyncio.sleep(30)
+                await refresh_links(dc, llm, relayer.index, cfg,
+                                    relayer.ocr.submit if relayer.ocr is not None else None)
+            background.append(asyncio.create_task(_refresh_links()))
+        else:
+            ane_lane.available = False
+            log.info("圖片文字辨識需要從 InboxRelay.app 啟動（終端機模式不辨識，App 開著時會自動補做）")
         restore_console = install_console(act, relayer, lambda: recapper) if not ipc.enabled() else None
         from statusbar import StatusBar
         bar = StatusBar(lambda: status_bar_lines(cfg, act, relayer, recapper, tg))
@@ -423,7 +480,7 @@ def online_message(cfg, tg, relayer: Relayer, mem, recapper, ai_status: str) -> 
     lines = [
         f"🟢 **InboxRelay 已上線**（{now}｜{__import__('state').this_host()}）",
         f"• 投遞箱：{tg.chat_title}（{'超級群組' if tg.chat_type == 'supergroup' else '一般群組'}）",
-        f"• 本地 AI：{ai_status}" + (f"｜記憶 v{mem.version}" if mem and mem.version else ""),
+        f"• 外部 LLM：{ai_status}" + (f"｜記憶 v{mem.version}" if mem and mem.version else ""),
         f"• 刪除同步 {on if relayer.prober else off}　編輯同步 {on if cfg.edit_sync else off}"
         f"　AI 分析 {on if relayer.enricher else off}　每日總結 {on if recapper else off}",
         f"• 搜尋：#搜尋 {on if cfg.search_live else off}　測試頻道 {on if cfg.ch_search_test else off}"
@@ -445,12 +502,14 @@ def online_message(cfg, tg, relayer: Relayer, mem, recapper, ai_status: str) -> 
 def status_bar_lines(cfg, act, relayer: Relayer, recapper, tg) -> list[str]:
     """底部狀態列三行：分隔線／目前狀態與進度／按鍵說明。"""
     from statusbar import HR
-    head = "⏸ 背景 AI 已暫停" if act.paused else "🟢 運行中"
+    llm_lane = lanes.get("llm")
+    head = "⏸ 背景 AI 已暫停" if act.paused else (
+        f"🌙 外部 LLM 等待中（{llm_lane.describe()}）" if llm_lane and llm_lane.state == "waiting" else "🟢 運行中")
     tasks = sorted(act.tasks.values(), key=lambda t: t.id)
     if tasks:
         doing = "⏳ " + tasks[0].line() + (f"（另有 {len(tasks) - 1} 項）" if len(tasks) > 1 else "")
     else:
-        doing = "本地 AI 閒置"
+        doing = "目前沒有背景工作"
     extra = []
     if relayer.enricher is not None and relayer.enricher.backlog:
         extra.append(f"待分析 {relayer.enricher.backlog:,}")
@@ -508,6 +567,8 @@ async def poll_new_records(relayer: Relayer, every: float = 300) -> None:
             if relayer.enricher:
                 for mirror, keys in groups.items():
                     relayer.enricher.submit(keys, mirror)
+            if relayer.ocr is not None and new:
+                relayer.ocr.submit_entries(new)
             if groups:
                 log.info("發現 %d 則新的未分析鏡像，已排入佇列", len(groups))
         except asyncio.CancelledError:
@@ -548,7 +609,10 @@ async def run_recap(args: argparse.Namespace) -> int:
         dirty = state.DirtyDays(state.DbRecord(db, bot_id, "RECAP_DIRTY"))
         r = Recapper(cfg, llm, index, rc, st, dirty)
         day = args.date or (datetime.now(ZoneInfo(cfg.tz)) - timedelta(days=1)).strftime("%Y-%m-%d")
-        if args.month:
+        if args.year:
+            await r.summarize_year(args.year)
+            log.info("✅ 已產生 %s 年總結", args.year)
+        elif args.month:
             await r.summarize_month(args.month)
             log.info("✅ 已產生 %s 月總結", args.month)
         else:
@@ -569,6 +633,19 @@ async def run_reset_cmd(args: argparse.Namespace) -> int:
     try:
         await dc.start()
         return await run_reset(cfg, dc, args.yes, args.memory, args.chats, args.prompts, args.all)
+    finally:
+        await dc.close()
+
+
+async def run_import_extra(args: argparse.Namespace) -> int:
+    from importer.extra_job import run_extra
+    cfg = config.load()
+    if args.dry_run:                      # 試跑只解析檔案，不連 Discord
+        return await run_extra(cfg, None, args.path, args.date_from, args.date_to, True)
+    dc = DiscordOut(cfg.dc_token, cfg.dc_guild_id)
+    try:
+        await dc.start()
+        return await run_extra(cfg, dc, args.path, args.date_from, args.date_to, False)
     finally:
         await dc.close()
 
@@ -603,6 +680,11 @@ def main() -> None:
     imp.add_argument("--dry-run", action="store_true", help="只掃描與檢查，不發任何訊息")
     imp.add_argument("--append-out-of-order", action="store_true",
                      help="允許補匯入比頻道現有資料更舊的訊息（會加分隔標記）")
+    ex = sub.add_parser("import-extra", help="匯入補充資料（電子發票 CSV、通用 JSONL）到 #補充資料")
+    ex.add_argument("--path", required=True, help="檔案或資料夾（會掃描底下所有檔案）")
+    ex.add_argument("--from", dest="date_from", help="起始日期 YYYY-MM-DD（含）")
+    ex.add_argument("--to", dest="date_to", help="結束日期 YYYY-MM-DD（含）")
+    ex.add_argument("--dry-run", action="store_true", help="只解析並顯示統計與範例，不連 Discord、不發訊息")
     rs = sub.add_parser("reset", help="清除測試資料（鏡像、關鍵字庫、總結、截圖、狀態紀錄），準備重新匯入")
     rs.add_argument("--yes", action="store_true", help="不再詢問確認")
     rs.add_argument("--memory", action="store_true", help="連 #記憶 一起清掉（含你手動發的）")
@@ -612,15 +694,20 @@ def main() -> None:
     rc = sub.add_parser("recap", help="手動產生某一天的每日總結（或 --month 月總結）")
     rc.add_argument("--date", help="日期 YYYY-MM-DD（預設昨天；可以是今天，方便測試）")
     rc.add_argument("--month", help="改產生月總結 YYYY-MM")
+    rc.add_argument("--year", help="改產生年總結 YYYY（用該年各月的月總結）")
     args = parser.parse_args()
     setup_logging()
     if args.cmd == "recap":
         sys.exit(asyncio.run(run_recap(args)))
-    if not args.check and not single_instance():
+    # import-extra 不收 Telegram，可以和核心（App）同時跑：核心每 5 分鐘會讀到新紀錄、排進夜間 AI
+    if not args.check and args.cmd != "import-extra" and not single_instance():
         log.error("InboxRelay 已經在執行（選單列 App 或另一個 Terminal 分頁）。請先結束它（App 選單 →「結束 InboxRelay」），再重新執行。")
         sys.exit(4)
     if args.cmd == "reset":
         sys.exit(asyncio.run(run_reset_cmd(args)))
+    if args.cmd == "import-extra":
+        logging.getLogger().setLevel(logging.WARNING)
+        sys.exit(asyncio.run(run_import_extra(args)))
     if args.cmd == "import":
         # 匯入時只顯示警告以上，避免洗掉進度列
         logging.getLogger().setLevel(logging.WARNING)

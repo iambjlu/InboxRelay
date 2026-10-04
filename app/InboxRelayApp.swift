@@ -34,6 +34,15 @@ struct InboxRelayApp: App {
         Window("InboxRelay", id: "main") {
             MainWindow(core: core, settings: settings)
                 .frame(minWidth: 720, minHeight: 520)
+                // 選單列 App 平常是 accessory（沒有 Dock 圖示、沒有左上角選單）；
+                // 主視窗打開時暫時變成一般 App，關掉後再藏回去
+                .onAppear {
+                    NSApp.setActivationPolicy(.regular)
+                    NSApp.activate(ignoringOtherApps: true)
+                }
+                .onDisappear {
+                    NSApp.setActivationPolicy(.accessory)
+                }
         }
         .defaultSize(width: 860, height: 640)
     }

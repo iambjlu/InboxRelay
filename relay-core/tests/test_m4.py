@@ -148,7 +148,7 @@ class TestEditSync(unittest.TestCase):
         r = self._relayer(mirror, [rec(7, excerpt="舊內容")])
         piece = TgPiece(-1, 7, datetime.now(timezone.utc), "新內容", "text")
         asyncio.run(r.handle_edit(piece))
-        self.assertEqual(mirror.edits[-1]["content"], "# 2026-10-02\n新內容")
+        self.assertEqual(mirror.edits[-1]["content"], "# 2026-10-02-Friday\n新內容")
         self.assertEqual(r.index.updates[(-1, 7)]["enriched"], False)
         self.assertEqual(self.submitted[0], [(-1, 7)])
 

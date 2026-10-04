@@ -2,13 +2,19 @@
 """App（SwiftUI 選單列）與核心之間的溝通（第 5.3 節）。
 
 - 啟動時環境變數 INBOXRELAY_IPC=1 才啟用。
-- App → 核心：stdin 每行一個 JSON，例如 {"type": "recap_now"}、{"type": "pause"}、{"type": "resume"}、{"type": "stop"}。
-- 核心 → App：stdout 每行一個 JSON（狀態每 2 秒一次；有變化才送）。日誌一律走 stderr。
+- App → 核心：stdin 每行一個 JSON：
+  {"type": "lane", "lane": "llm|ane", "action": "run_now|pause|resume"}、{"type": "hello", "ocr": true}、
+  {"type": "ocr_result", "id": 1, "text": "…", "ms": 120}、{"type": "stop"}；
+  舊指令 recap_now／pause／resume 仍可用（＝外部 LLM 車道）。
+- 核心 → App：stdout 每行一個 JSON：狀態（type=status，每 2 秒、有變化才送）、
+  文字辨識請求 {"type": "ocr_request", "id": 1, "url": "…", "name": "a.jpg"}。日誌一律走 stderr。
 """
 from __future__ import annotations
 
 import asyncio
 import json
+
+import lanes
 import logging
 import os
 import sys
@@ -38,6 +44,7 @@ class IpcServer:
         self.ai_status = ai_status
         self.stop_event = stop_event
         self._last = ""
+        self.ocr = None            # ocr.OcrWorker
 
     def status(self) -> dict:
         rc = self.get_recapper()
@@ -54,12 +61,26 @@ class IpcServer:
             "summarized_until": (rc.state.data.get("summarized_until") if rc else "") or "",
             "next_recap_hours": round(rc.seconds_until_start() / 3600, 2) if rc else None,
             "recap_enabled": rc is not None,
+            "lanes": self.lanes_status(),
             "recap_phase": rc.phase if rc else "",          # running / queued / ""
             "recap_time": self.cfg.recap_time,
             "chat_title": self.tg.chat_title or "",
             "ai_status": self.ai_status,
             "rss_mb": round(getattr(getattr(self.act, "mem", None), "current", 0) or 0),
         }
+
+    def lanes_status(self) -> dict:
+        r = self.relayer
+        out = {}
+        for name, lane in lanes.LANES.items():
+            backlog = (r.enricher.backlog if r.enricher else 0) if name == "llm" else \
+                (self.ocr.backlog if self.ocr else 0)
+            out[name] = {
+                "label": lane.label, "mode": lane.mode, "state": lane.state, "describe": lane.describe(),
+                "queued": lane.queued, "backlog": backlog,
+                "next_start": lane.next_start.strftime("%m/%d %H:%M") if lane.next_start and lane.state in ("waiting", "offline") else "",
+            }
+        return out
 
     def handle(self, line: str) -> None:
         try:
@@ -73,6 +94,37 @@ class IpcServer:
                 log.info("🧾 App 要求立即總結%s", "（目前暫停中，按「繼續」才會開始）" if self.act.paused else "")
             else:
                 log.info("🧾 總結已經在進行／排隊中，忽略重複的「立即總結」")
+        elif t == "lane":
+            lane = lanes.get(str(cmd.get("lane")))
+            action = cmd.get("action")
+            if lane is None:
+                return
+            if action == "pause":
+                lane.pause()
+            elif action == "resume":
+                lane.resume()
+            elif action == "run_now":
+                if lane.name == "llm" and rc is not None:
+                    if not rc.trigger_now():
+                        log.info("🧾 外部 LLM 已經在執行／排隊中")
+                    else:
+                        log.info("🧾 App 要求外部 LLM 立即執行（分析＋總結）")
+                elif lane.run_now():
+                    log.info("🔤 App 要求%s立即執行", lane.label)
+        elif t == "recap_reset" and rc is not None:
+            log.info("🧹 App 要求清空並重新總結")
+            asyncio.get_running_loop().create_task(rc.reset_all())
+        elif t == "hello":
+            lane = lanes.get("ane")
+            if lane is not None and cmd.get("ocr"):
+                if not lane.available:
+                    log.info("🔤 App 支援本機文字辨識（%s）", cmd.get("device") or "Vision")
+                lane.available = True
+                lane.notify()
+        elif t == "ocr_result":
+            if self.ocr is not None:
+                self.ocr.on_result(cmd)
+            return
         elif t == "pause" and not self.act.paused:
             self.act.pause()
         elif t == "resume" and self.act.paused:

@@ -66,11 +66,16 @@ async def run_reset(cfg, dc, yes: bool, memory: bool, chats: bool = False,
         targets = [(n, c, True) for n, c, _ in targets]
     if cfg.ch_screenshot:
         targets.append(("連結預覽與進度", cfg.ch_screenshot, wipe_all))
+    if getattr(cfg, "ch_extra", None):
+        targets.append(("#補充資料", cfg.ch_extra, wipe_all))
     if chats:
         for name, cid in (("#搜尋", cfg.ch_search), ("搜尋測試", cfg.ch_search_test),
-                          ("AI 測試", cfg.ch_ai_test), ("通知與互動", cfg.ch_notify)):
+                          ("AI 測試", cfg.ch_ai_test), ("通知與互動", cfg.ch_notify),
+                          ("AI 對話", getattr(cfg, "ch_chat", None))):
             if cid and cid not in {t[1] for t in targets}:
                 targets.append((name, cid, True))
+    if wipe_all and getattr(cfg, "ch_chat_prompt", None):
+        targets.append(("AI 對話提示詞與記憶", cfg.ch_chat_prompt, True))
     print("\n⚠️  即將刪除：")
     for name, _, everyone in targets:
         print(f"   • {name}" + ("（所有訊息）" if everyone else "（bot 發的訊息）"))

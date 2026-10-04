@@ -15,6 +15,14 @@ log = logging.getLogger("llm")
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.S)
 
+
+def is_offline_error(e: BaseException) -> bool:
+    """外部 LLM 連不上／伺服器掛了／模型沒載入：這種錯誤不是內容問題，工作要留著下次再做。"""
+    import openai
+    import httpx
+    return isinstance(e, (openai.APIConnectionError, openai.InternalServerError, openai.NotFoundError,
+                          httpx.ConnectError, httpx.TimeoutException, ConnectionError))
+
 class LLM:
     def __init__(self, base_url: str, model: str, api_key: str, image_support: bool = True) -> None:
         self.model = model
@@ -25,6 +33,7 @@ class LLM:
         self.memory: str = ""          # 最新 #記憶 的內容，由 memory.MemoryStore 設定
         self.memory_version: str = ""
         self._avg_tokens: dict[int, float] = {}   # 每種 max_tokens 實際平均產生多少 token（估進度用）
+        self._interactive_waiting = 0             # 有 AI 對話在等 → 背景工作先讓
 
     def _system(self, use_memory: bool) -> str:
         if use_memory and self.memory.strip():
@@ -58,6 +67,9 @@ class LLM:
             # 短摘要與關鍵字關閉 thinking，速度快很多（第 3.4 節）
             extra_body={"chat_template_kwargs": {"enable_thinking": thinking}},
         )
+        if task is not None:                       # 背景工作：有人在對話就先讓
+            while self._interactive_waiting:
+                await asyncio.sleep(0.3)
         async with self._lock:
             if task is None:
                 resp = await self.client.chat.completions.create(**kwargs)
@@ -65,6 +77,50 @@ class LLM:
             else:
                 text = await self._stream(kwargs, task, max_tokens)
         return _THINK_RE.sub("", text).strip()
+
+    async def chat_messages(self, messages: list[dict], max_tokens: int = 4000, thinking: bool = False,
+                            temperature: float = 0.6, progress=None) -> tuple[str, dict]:
+        """多輪對話（AI 對話頻道用）：messages 是完整的 OpenAI 格式（含 system）。優先於背景工作。
+        回傳 (回覆, 用量 {prompt_tokens, completion_tokens, total_tokens})；端點沒給用量時是空的。"""
+        self._interactive_waiting += 1
+        acquired = False
+        try:
+            async with self._lock:
+                self._interactive_waiting -= 1
+                acquired = True
+                if progress is not None:             # 串流：邊收邊回報已產生的 token 數（壓縮進度條用）
+                    parts: list[str] = []
+                    n = 0
+                    stream = await self.client.chat.completions.create(
+                        model=self.model, messages=messages, max_tokens=max_tokens, temperature=temperature,
+                        stream=True, extra_body={"chat_template_kwargs": {"enable_thinking": thinking}})
+                    async for chunk in stream:
+                        if chunk.choices and chunk.choices[0].delta.content:
+                            parts.append(chunk.choices[0].delta.content)
+                            n += 1
+                            progress(n)
+                    text = _THINK_RE.sub("", "".join(parts))
+                    if "</think>" in text:
+                        text = text.split("</think>", 1)[1]
+                    return text.strip(), {}
+                resp = await self.client.chat.completions.create(
+                    model=self.model, messages=messages, max_tokens=max_tokens, temperature=temperature,
+                    extra_body={"chat_template_kwargs": {"enable_thinking": thinking}})
+        finally:
+            if not acquired:                       # 等鎖時被取消／出錯：把等待數還回去
+                self._interactive_waiting -= 1
+        text = resp.choices[0].message.content or ""
+        text = _THINK_RE.sub("", text)
+        if "</think>" in text:                     # 沒有開頭標籤的思考內容
+            text = text.split("</think>", 1)[1]
+        usage = {}
+        u = getattr(resp, "usage", None)
+        if u is not None:
+            for k in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                v = getattr(u, k, None)
+                if isinstance(v, int):
+                    usage[k] = v
+        return text.strip(), usage
 
     async def _stream(self, kwargs: dict, task, max_tokens: int) -> str:
         """串流接收，邊收邊回報進度（已產生的 token ÷ 這類呼叫平均長度）。"""

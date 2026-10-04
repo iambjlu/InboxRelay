@@ -11,6 +11,16 @@ struct CoreTask: Codable, Hashable {
     let progress: Double?     // 0～1，含目前項目的細部進度
 }
 
+struct LaneStatus: Codable, Hashable {
+    var label: String = ""
+    var mode: String = ""
+    var state: String = ""          // running / waiting / paused / offline / unavailable
+    var describe: String = ""
+    var queued: Bool = false
+    var backlog: Int = 0
+    var next_start: String = ""
+}
+
 struct CoreStatus: Codable {
     var paused: Bool = false
     var tasks: [CoreTask] = []
@@ -24,6 +34,7 @@ struct CoreStatus: Codable {
     var rss_mb: Int = 0
     var recap_enabled: Bool = false
     var recap_phase: String = ""      // running / queued / ""
+    var lanes: [String: LaneStatus]? = nil   // llm（外部 LLM）／ane（本機 Neural Engine）
 }
 
 @MainActor
@@ -44,6 +55,7 @@ final class CoreController: ObservableObject {
     private var wantRunning = false
     private var failures = 0
     let settings: SettingsStore
+    let ocr = OCRService()
 
     init(settings: SettingsStore) {
         self.settings = settings
@@ -69,9 +81,10 @@ final class CoreController: ObservableObject {
 
     var recapHelp: String {
         if !isRunning { return "核心沒在運行" }
-        if !status.recap_enabled { return "每日總結沒有啟用（需要本地 AI）" }
+        if !status.recap_enabled { return "每日總結沒有啟用（需要外部 LLM）" }
         if recapBusy { return "總結正在進行，完成前不能再按" }
-        return status.paused ? "背景 AI 暫停中：按了會先排隊，按「繼續」才開始" : "馬上處理所有積欠的每日／月總結"
+        return status.paused ? "背景 AI 暫停中：按了會先排隊，按「繼續」才開始"
+            : "馬上執行積欠的 AI 分析與每日／月總結（不用等每日時段）"
     }
 
     private func lock(_ action: String) {
@@ -121,6 +134,82 @@ final class CoreController: ObservableObject {
         try? pipe.fileHandleForWriting.write(contentsOf: data + Data([0x0A]))
     }
 
+    func sendAny(_ obj: [String: Any]) {
+        guard let pipe = stdinPipe,
+              let data = try? JSONSerialization.data(withJSONObject: obj) else { return }
+        try? pipe.fileHandleForWriting.write(contentsOf: data + Data([0x0A]))
+    }
+
+    // MARK: - 兩條車道（外部 LLM／本機 ANE）
+    func lane(_ name: String) -> LaneStatus? { status.lanes?[name] }
+
+    func canRun(_ name: String) -> Bool {
+        guard isRunning, pendingAction == nil, let l = lane(name), !l.queued else { return false }
+        if name == "llm" { return status.recap_enabled ? !recapBusy : l.state != "unavailable" }
+        // 本機 ANE：已經在執行、或沒有待辨識的圖片時，「立即執行」沒有意義 → 反灰
+        return (l.state == "waiting" || l.state == "paused") && l.backlog > 0
+    }
+
+    func canToggle(_ name: String) -> Bool {
+        guard isRunning, pendingAction == nil, let l = lane(name), l.state != "unavailable" else { return false }
+        // 待命（正在執行時段裡但沒有工作）時沒東西可暫停 → 反灰；已暫停的一定可以按「繼續」
+        if l.state == "running" && l.backlog == 0 && !(name == "llm" && recapBusy) { return false }
+        return true
+    }
+
+    func toggleHelp(_ name: String) -> String {
+        guard let l = lane(name) else { return "" }
+        if l.state == "paused" { return "繼續" }
+        if l.state == "running" && l.backlog == 0 && !(name == "llm" && recapBusy) { return "目前沒有工作可以暫停" }
+        return l.state == "waiting" ? "暫停（到了排程時間也不會開始）" : "暫停"
+    }
+
+    /// 「立即執行」按鈕的說明（滑鼠移上去顯示，也說明為什麼反灰）
+    func runHelp(_ name: String) -> String {
+        if name == "llm" { return recapHelp }
+        guard isRunning, let l = lane(name) else { return "核心沒在運行" }
+        switch l.state {
+        case "running": return l.backlog > 0 ? "正在辨識中" : "沒有待辨識的圖片"
+        case "unavailable": return "等待 App 與核心連線"
+        default: return l.backlog > 0 ? "馬上辨識 \(l.backlog) 則還沒處理的圖片（不用等排程）" : "沒有待辨識的圖片"
+        }
+    }
+
+    func runTitle(_ name: String) -> String {
+        if name == "llm" && status.recap_enabled { return recapButtonTitle }
+        if pendingAction == "run_\(name)" { return "送出中…" }
+        return lane(name)?.queued == true ? "已排隊…" : "立即執行"
+    }
+
+    func laneRun(_ name: String) {
+        guard canRun(name) else { return }
+        lock(name == "llm" ? "recap" : "run_\(name)")
+        sendAny(["type": "lane", "lane": name, "action": "run_now"])
+    }
+
+    func laneToggle(_ name: String) {
+        guard canToggle(name), let l = lane(name) else { return }
+        lock("toggle_\(name)")
+        sendAny(["type": "lane", "lane": name, "action": l.state == "paused" ? "resume" : "pause"])
+    }
+
+    private func handleOCR(_ obj: [String: Any]) {
+        guard let id = obj["id"] as? Int, let url = obj["url"] as? String else { return }
+        ocr.recognize(urlString: url) { [weak self] text, error, ms, retry, wait in
+            Task { @MainActor in
+                self?.sendAny(["type": "ocr_result", "id": id, "text": text ?? "", "error": error ?? "", "ms": ms,
+                               "retry": retry, "retry_after": wait] as [String: Any])
+            }
+        }
+    }
+
+    /// 清空 #總結 並依日期重建目錄（佔位），之後照外部 LLM 排程重新總結
+    func recapReset() {
+        guard isRunning, status.recap_enabled, pendingAction == nil else { return }
+        lock("recap_reset")
+        sendAny(["type": "recap_reset"] as [String: Any])
+    }
+
     func recapNow() {
         guard canRecapNow else { return }
         lock("recap")
@@ -141,16 +230,21 @@ final class CoreController: ObservableObject {
 
     private func launch() {
         guard process == nil else { return }
-        let runSh = (settings.projectPath as NSString).appendingPathComponent("run.sh")
-        guard FileManager.default.fileExists(atPath: runSh) else {
-            lastError = "找不到 \(runSh)，請到「設定」確認專案資料夾"
+        // 優先用 App 內建的核心（Contents/Resources/core）；沒有才退回專案資料夾（開發用）
+        let bundled = Bundle.main.resourceURL?.appendingPathComponent("core/run.sh").path ?? ""
+        let fm = FileManager.default
+        let runSh = fm.fileExists(atPath: bundled) ? bundled
+            : (settings.projectPath as NSString).appendingPathComponent("run.sh")
+        guard fm.fileExists(atPath: runSh) else {
+            lastError = "找不到核心程式（App 內建的 core 不見了），請重新安裝 InboxRelay"
             state = .stopped
             return
         }
+        let workDir = (runSh as NSString).deletingLastPathComponent
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/bash")
         p.arguments = [runSh]
-        p.currentDirectoryURL = URL(fileURLWithPath: settings.projectPath)
+        p.currentDirectoryURL = URL(fileURLWithPath: workDir)
         p.environment = settings.environment()
         let inPipe = Pipe(), outPipe = Pipe(), errPipe = Pipe()
         p.standardInput = inPipe
@@ -174,7 +268,9 @@ final class CoreController: ObservableObject {
             stdinPipe = inPipe
             state = .starting
             lastError = ""
-            appendLog("— 啟動核心（\(settings.projectPath)）—")
+            // 告訴核心：這個 App 會做本機文字辨識（核心讀到後「本機 ANE」車道才會開始）
+            sendAny(["type": "hello", "ocr": true, "device": "Vision／Apple Neural Engine"] as [String: Any])
+            appendLog("— 啟動核心（\(runSh == bundled ? "App 內建" : workDir)）—")
         } catch {
             lastError = "無法啟動：\(error.localizedDescription)"
             state = .stopped
@@ -227,6 +323,10 @@ final class CoreController: ObservableObject {
             buf.removeSubrange(buf.startIndex...nl)
             let line = String(decoding: lineData, as: UTF8.self)
             if !isErr, line.hasPrefix("{"), let d = line.data(using: .utf8),
+               let json = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+               (json["type"] as? String) == "ocr_request" {
+                handleOCR(json)
+            } else if !isErr, line.hasPrefix("{"), let d = line.data(using: .utf8),
                let obj = try? JSONDecoder().decode(CoreStatus.self, from: d) {
                 if pendingAction != "restart" { pendingAction = nil }   // 核心回報新狀態 → 解鎖
                 status = obj

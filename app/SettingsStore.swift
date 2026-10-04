@@ -42,23 +42,60 @@ enum SettingCatalog {
         SettingField(key: "DC_CH_AI_TEST", label: "AI 測試（實驗用）", kind: .text, section: "頻道"),
         SettingField(key: "DC_CH_SEARCH_TEST", label: "搜尋測試", kind: .text, section: "頻道"),
         SettingField(key: "DC_CH_SCREENSHOT", label: "連結預覽與進度", kind: .text, section: "頻道"),
-        SettingField(key: "LOCAL_AI_SERVER", label: "oMLX 網址", kind: .text, section: "模型"),
-        SettingField(key: "LOCAL_AI_MODEL", label: "模型名稱", kind: .text, section: "模型"),
-        SettingField(key: "LOCAL_AI_API_KEY", label: "API Key", kind: .secret, section: "模型"),
-        SettingField(key: "LOCAL_AI_IMAGE_SUPPORT", label: "模型支援圖片", kind: .toggle(true), section: "模型"),
-        SettingField(key: "RECAP_TIME", label: "每日總結時間", kind: .time("03:30"), section: "功能"),
+        SettingField(key: "DC_CH_EXTRA", label: "補充資料（發票、筆記…）", kind: .text, section: "頻道"),
+        SettingField(key: "DC_CH_CHAT", label: "AI 對話", kind: .text, section: "頻道"),
+        SettingField(key: "DC_CH_CHAT_PROMPT", label: "AI 對話提示詞與記憶", kind: .text, section: "頻道"),
+        SettingField(key: "LOCAL_AI_SERVER", label: "OpenAI 相容端點", kind: .text, section: "外部 LLM 設定"),
+        SettingField(key: "LOCAL_AI_MODEL", label: "模型名稱", kind: .text, section: "外部 LLM 設定"),
+        SettingField(key: "LOCAL_AI_API_KEY", label: "API Key", kind: .secret, section: "外部 LLM 設定"),
+        SettingField(key: "LOCAL_AI_IMAGE_SUPPORT", label: "模型支援圖片", kind: .toggle(true), section: "外部 LLM 設定"),
+        SettingField(key: "LLM_CONTEXT", label: "Context window", kind: .choice([
+            Choice(value: "8192", label: "8K（8,192）"), Choice(value: "16384", label: "16K（16,384）"),
+            Choice(value: "32768", label: "32K（32,768）"), Choice(value: "65536", label: "64K（65,536）"),
+            Choice(value: "131072", label: "128K（131,072）"), Choice(value: "262144", label: "256K（262,144）"),
+            Choice(value: "524288", label: "512K（524,288）"), Choice(value: "1048576", label: "1M（1,048,576）")],
+            "131072"), section: "外部 LLM 設定"),
+        SettingField(key: "CHAT_COMPACT_PCT", label: "AI 對話自動壓縮門檻", kind: .number(30...98, 90, "%"),
+                     section: "外部 LLM 設定"),
+        SettingField(key: "LLM_SCHEDULE", label: "外部 LLM 工作時間", kind: .choice([Choice(value: "always", label: "永遠立即執行"),
+                                                Choice(value: "daily", label: "每天自動開始到做完為止"),
+                                                Choice(value: "window", label: "每天自動開始與暫停"),
+                                                Choice(value: "manual", label: "手動執行")], "daily"), section: "排程"),
+        SettingField(key: "RECAP_TIME", label: "外部 LLM 開始時間", kind: .time("03:30"), section: "排程"),
+        SettingField(key: "LLM_END", label: "外部 LLM 暫停時間", kind: .time("08:00"), section: "排程"),
+        SettingField(key: "ANE_SCHEDULE", label: "本機 Apple Neural Engine 工作時間", kind: .choice([Choice(value: "always", label: "永遠立即執行"),
+                                                Choice(value: "daily", label: "每天自動開始到做完為止"),
+                                                Choice(value: "window", label: "每天自動開始與暫停"),
+                                                Choice(value: "manual", label: "手動執行")], "always"), section: "排程"),
+        SettingField(key: "ANE_START", label: "本機 ANE 開始時間", kind: .time("03:30"), section: "排程"),
+        SettingField(key: "ANE_END", label: "本機 ANE 暫停時間", kind: .time("08:00"), section: "排程"),
         SettingField(key: "LINK_SCREENSHOT", label: "連結截圖", kind: .toggle(false), section: "功能"),
         SettingField(key: "PRIVATE_URLS", label: "內網網址也截圖與摘要", kind: .toggle(true), section: "功能"),
         SettingField(key: "IGNORE_CERT_ERRORS", label: "憑證無效也強制開啟（截圖／摘要）", kind: .toggle(false), section: "功能"),
         SettingField(key: "REVERSE_SYNC", label: "Discord 鏡像頻道發文 → 同步到 Telegram", kind: .toggle(true), section: "功能"),
         SettingField(key: "EDIT_SYNC_HOURS", label: "編輯同步時限", kind: .number(1...168, 24, "小時"), section: "功能"),
-        SettingField(key: "SEARCH_LIVE", label: "正式 #搜尋", kind: .toggle(true), section: "功能"),
+        SettingField(key: "SEARCH_LIVE", label: "啟用 #搜尋 頻道", kind: .toggle(true), section: "功能"),
         SettingField(key: "SEARCH_THINKING", label: "搜尋時先思考（較準、較慢）", kind: .toggle(false), section: "功能"),
         SettingField(key: "HEADER_STYLE", label: "日期標頭樣式", kind: .choice([Choice(value: "large", label: "大標題"),
                                                                           Choice(value: "small", label: "小字")], "large"),
                      section: "功能"),
     ]
-    static let sections = ["連線", "頻道", "模型", "功能"]
+    static let sections = ["連線", "頻道", "外部 LLM 設定", "排程", "功能"]
+
+    /// 依排程模式顯示時間欄位：開始時間只在「每天自動開始…」兩種模式；結束時間只在「每天自動開始與暫停」
+    static func isVisible(_ f: SettingField, values: [String: String]) -> Bool {
+        func mode(_ key: String, _ def: String) -> String {
+            let v = values[key] ?? ""
+            return v.isEmpty ? def : v
+        }
+        switch f.key {
+        case "RECAP_TIME": return ["daily", "window"].contains(mode("LLM_SCHEDULE", "daily"))
+        case "LLM_END": return mode("LLM_SCHEDULE", "daily") == "window"
+        case "ANE_START": return ["daily", "window"].contains(mode("ANE_SCHEDULE", "always"))
+        case "ANE_END": return mode("ANE_SCHEDULE", "always") == "window"
+        default: return true
+        }
+    }
 }
 
 enum Keychain {
@@ -99,9 +136,17 @@ struct SettingsFile: Codable {
 
 final class SettingsStore: ObservableObject {
     enum Storage: String, CaseIterable, Identifiable {
-        case local = "本機"
-        case folder = "指定資料夾（可放 iCloud Drive 同步）"
+        case local
+        case folder
         var id: String { rawValue }
+        var label: String { self == .local ? "本機" : "指定資料夾" }
+
+        /// 也認得舊版存的中文值
+        static func from(_ raw: String?) -> Storage {
+            guard let r = raw else { return .local }
+            if r == "folder" || r.hasPrefix("指定資料夾") { return .folder }
+            return .local
+        }
     }
 
     @Published var values: [String: String] = [:]
@@ -118,7 +163,7 @@ final class SettingsStore: ObservableObject {
         projectPath = defaults.string(forKey: "projectPath")
             ?? embedded
             ?? (NSHomeDirectory() + "/Downloads/InboxRelay")
-        storage = Storage(rawValue: defaults.string(forKey: "storage") ?? "") ?? .local
+        storage = Storage.from(defaults.string(forKey: "storage"))
         folderPath = defaults.string(forKey: "folderPath") ?? ""      // 由使用者自己選，不預設
         // Token 預設也寫進設定資料夾（使用者指定）；可在設定頁關掉
         tokensInFolder = defaults.object(forKey: "tokensInFolder") as? Bool ?? true

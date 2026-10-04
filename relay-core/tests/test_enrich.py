@@ -248,3 +248,17 @@ class KeywordLeakTest(unittest.TestCase):
         kw, gist = filter_keywords(["數位系統導論", "ConnectError", "xhslink"], "意義不明：原文", m, ["數位系統導論課"])
         self.assertEqual(kw, ["xhslink"])
         self.assertEqual(gist, "意義不明")
+
+
+class FitMemoryTest(unittest.TestCase):
+    def test_trim_by_section(self):
+        from memory import fit_memory
+        vocab = "\n".join(f"- 詞{i}：說明說明說明" for i in range(200))
+        mem = f"【詞彙】\n{vocab}\n\n【常見主題】\n- 主題A\n\n【整理偏好】\n- 條列\n\n【待確認】\n- 無"
+        out = fit_memory(mem, 600)
+        self.assertLessEqual(len(out), 600)
+        for sec in ("【詞彙】", "【常見主題】", "【整理偏好】", "【待確認】", "- 主題A", "- 條列"):
+            self.assertIn(sec, out)              # 後面的段落不會被切掉
+        self.assertIn("- 詞0：", out)
+        self.assertEqual(fit_memory("短", 600), "短")
+

@@ -14,11 +14,13 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 import prompts
+from ocr import useful
 from recap import daily
 
 WEEKDAYS = "一二三四五六日"
 TYPE_ICON = {"analysis": "🤖 AI 分析", "text": "💬 文字", "image": "🖼️ 圖片", "album": "🖼️ 相簿", "file": "📄 檔案", "link": "🔗 連結",
-             "voice": "🎤 語音", "video": "🎬 影片", "sticker": "😀 貼圖", "daily": "📰 每日總結"}
+             "voice": "🎤 語音", "video": "🎬 影片", "sticker": "😀 貼圖", "daily": "📰 每日總結",
+             "invoice": "🧾 消費"}
 MAX_CANDIDATES = 120
 
 
@@ -58,6 +60,12 @@ def parse_query(out: str, fallback: str) -> Query:
 def _excerpt(rec, terms: list[str]) -> str:
     """節錄規則：圖片／連結用摘要；檔案用檔名＋摘要首句；文字取命中前後各 10 字或前 20 字。"""
     gist = (rec.gist or "").split("。")[0]
+    o = useful(getattr(rec, "ocr", None))
+    for t in terms:                          # 命中圖中文字：直接秀那一段
+        i = o.find(t) if (o and t) else -1
+        if i >= 0:
+            s, e = max(0, i - 10), min(len(o), i + len(t) + 10)
+            return "🔤" + ("…" if s else "") + o[s:e].replace("\n", " ") + ("…" if e < len(o) else "")
     if rec.type in ("image", "album", "link", "video") and gist:
         return gist
     if rec.type == "file":
@@ -69,6 +77,18 @@ def _excerpt(rec, terms: list[str]) -> str:
             s, e = max(0, i - 10), min(len(text), i + len(t) + 10)
             return ("…" if s else "") + text[s:e] + ("…" if e < len(text) else "")
     return text[:20] + ("…" if len(text) > 20 else "")
+
+
+def ocr_window(o: str, terms: list[str], n: int = 600) -> str:
+    """圖中文字很長時，取第一個命中詞附近的 n 字（沒命中就取開頭）。"""
+    if len(o) <= n:
+        return o
+    low = o.lower()
+    hits = [low.find(t.lower()) for t in terms if t and t.lower() in low]
+    if not hits:
+        return o[:n] + "…"
+    start = max(0, min(hits) - n // 3)
+    return ("…" if start else "") + o[start:start + n] + ("…" if start + n < len(o) else "")
 
 
 def score_text(text: str, terms: list[str]) -> float:
@@ -100,10 +120,14 @@ def collect(index_entries, recaps: dict[str, tuple[str, str]], q: Query) -> list
         r = e.rec
         if not r.date:
             continue
-        text = "｜".join(x for x in (r.excerpt, r.filename and f"檔案：{r.filename}",
-                                     r.gist and f"重點：{r.gist}", r.kw and f"關鍵字：{r.kw}") if x)
+        o = useful(r.ocr)
+        base = [r.excerpt, r.filename and f"檔案：{r.filename}", r.gist and f"重點：{r.gist}",
+                r.kw and f"關鍵字：{r.kw}"]
+        # 比對用完整的圖中文字（才找得到後段的字）；給模型看的只取命中附近 600 字
+        full = "｜".join(x for x in base + [o and f"圖中文字：{o}"] if x)
+        text = "｜".join(x for x in base + [o and f"圖中文字：{ocr_window(o, q.terms)}"] if x)
         cands.append(Candidate(r.date, r.type, text or "（無文字）", _excerpt(r, q.terms), r.mirror,
-                               score_text(text, q.terms)))
+                               score_text(full, q.terms)))
     for day, (body, url) in recaps.items():
         cands.append(Candidate(day, "daily", body[:600], "每日總結", url, score_text(body, q.terms) * 0.8))
     return select(cands, q)
