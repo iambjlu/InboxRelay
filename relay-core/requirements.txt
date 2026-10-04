@@ -13,3 +13,5 @@ charset-normalizer>=3.3
 pypdf>=4.0
 pypdfium2>=4.20
 psutil>=5.9
+Pillow>=10          # 圖片格式轉換（HEIC 等 → JPEG，只在記憶體）
+pillow-heif>=0.18

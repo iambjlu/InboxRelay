@@ -137,8 +137,13 @@ async def probe_link(url: str) -> tuple[str, str, bytes | None, str]:
         return "", "", None, type(e).__name__
 
 
+RENDERABLE = ("text/", "image/", "application/pdf", "application/json", "application/xml", "application/xhtml")
+BINARY_MAX = 100 * 1024 * 1024
+
+
 async def probe_kind(url: str) -> str:
-    """只看回應標頭就判斷種類（截圖車道用，不下載內文）：private／image／file／""（一般網頁或讀不到，交給截圖）。"""
+    """只看回應標頭判斷這個網址能不能截圖（截圖車道用，不下載內文）：
+    private（內網被擋）／binary（zip、影片、安裝檔等瀏覽器不能預覽的檔案，或大到 100MB 以上）／""（網頁、PDF、文字檔、圖片…，或讀不到，交給截圖）。"""
     from enrich import screenshot
     if not screenshot.ALLOW_PRIVATE and not await screenshot.is_public_url(url):
         return "private"
@@ -146,13 +151,16 @@ async def probe_kind(url: str) -> str:
         async with httpx.AsyncClient(follow_redirects=True, timeout=10, headers={"User-Agent": UA},
                                      verify=not screenshot.IGNORE_CERT) as c:
             async with c.stream("GET", url) as r:
-                ctype = r.headers.get("content-type", "")
+                ctype = r.headers.get("content-type", "").lower()
                 if r.status_code >= 400:
                     return ""
-                if ctype.startswith("image/") and "svg" not in ctype:
-                    return "image"
-                if "html" not in ctype and "xml" not in ctype:
-                    return "file"
+                length = r.headers.get("content-length")
+                if length and length.isdigit() and int(length) > BINARY_MAX:
+                    return "binary"
+                if "html" in ctype or "xml" in ctype or ctype.startswith(RENDERABLE):
+                    return ""
+                if ctype:
+                    return "binary"
     except Exception:
         pass
     return ""
@@ -190,8 +198,12 @@ async def summarize_probed(llm: LLM, url: str, probed: tuple[str, str, bytes | N
             return LinkResult(f"🖼️ {url}", text, image=data)
         if not llm.image_support:
             return LinkResult(f"🖼️ {url}", "（模型未開啟圖片支援）", image=data)
+        from enrich.image import prepare_image
+        prep = await asyncio.to_thread(prepare_image, data, url)
+        if prep is None:
+            return LinkResult(f"🖼️ {url}", "（圖片格式無法轉換，略過）", image=data)
         s = await llm.chat(prompts.get("IMAGE"), data=f"使用者附註：{caption}" if caption else None,
-                           image=data, image_mime=sniff_mime(data), max_tokens=400)
+                           image=prep[0], image_mime=prep[1], max_tokens=400)
         return LinkResult(f"🖼️ {url}", s, image=data)
     if kind == "file":
         return LinkResult(f"🔗 {url}", text)

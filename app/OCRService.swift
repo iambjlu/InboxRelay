@@ -45,9 +45,11 @@ final class OCRService: @unchecked Sendable {
         }.resume()
     }
 
+    /// 注意：一定要「立即完整解碼」（ShouldCacheImmediately）。Telegram 的照片是 progressive JPEG，延遲解碼的 CGImage 交給 Vision
+    /// 會一律丟 CRImageReaderError（連重繪成 sRGB 都救不了），曾造成兩千多張圖被標成「無法取得圖片」。
     private func run(_ data: Data) -> (String?, String?) {
         guard let src = CGImageSourceCreateWithData(data as CFData, nil),
-              let img = CGImageSourceCreateImageAtIndex(src, 0, [kCGImageSourceShouldCache: false] as CFDictionary)
+              let img = CGImageSourceCreateImageAtIndex(src, 0, [kCGImageSourceShouldCacheImmediately: true] as CFDictionary)
         else { return (nil, "無法讀取圖片") }
         var orientation = CGImagePropertyOrientation.up
         if let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],

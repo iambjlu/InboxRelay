@@ -26,11 +26,12 @@ log = logging.getLogger("shot")
 
 SHOT_WAIT_SEC = 240      # AI 分析最多等截圖多久
 SHOT_LINE = "📸 截圖："
-SKIP = "-"               # 這個網址不需要截圖（圖片／檔案／內網）；沒有網址的長訊息也記一個，避免每輪重讀鏡像
+SKIP = "-"               # 這個網址不能截圖（zip／影片等無法預覽的檔案、內網）；沒有網址的長訊息也記一個，避免每輪重讀鏡像
 RETRY_MAX = 3            # 失敗的網址最多試幾次（含第一次），之後記成最終失敗
 RETRY_AFTER_SEC = 6 * 3600   # 失敗後隔多久才再試（算從失敗通知發出的時間）
 RETRY_FLAG = "shot-retry-v1"
 ARROW_FLAG = "shot-arrows-v1"
+SKIP_FLAG = "shot-skip-v2"
 ARROW_PREFIX = "-# [↗ 截圖]("     # 鏡像裡「含連結的那行」下面的小字箭頭行，點了跳到截圖貼文
 
 
@@ -250,6 +251,22 @@ class ShotWorker:
             log.warning("鏡像加截圖箭頭失敗：%s", mirror_url, exc_info=True)
             return False
 
+    async def reset_skipped(self) -> None:
+        """一次性：以前連到 PDF／文字檔／圖片被記成「不截圖」的紀錄，清掉記號讓它重新判斷（現在這些都會截圖）。"""
+        from paths import data_dir
+        flag = data_dir() / SKIP_FLAG
+        if flag.exists():
+            return
+        n = 0
+        for e in sorted(self.index.entries.values(), key=lambda e: e.msg_id):
+            toks = (e.rec.shot or "").split()
+            if toks and all(t == SKIP for t in toks) and find_urls(e.rec.excerpt or ""):
+                await self.index.update(e.rec.key, shot=None)
+                n += 1
+        flag.write_text("done")
+        log.info("📸 連結截圖：%d 則紀錄的「不截圖」記號清掉，重新判斷", n)
+        self.scan_index()
+
     async def backfill_arrows(self) -> None:
         """一次性：舊的鏡像訊息也補上截圖箭頭（慢慢做，不搶其他工作）。"""
         from paths import data_dir
@@ -380,7 +397,7 @@ class ShotWorker:
                         if kind == "ok":
                             ok_links.append(covered[u])
                         continue
-                if (await probe_kind(u)) in ("image", "file", "private"):
+                if (await probe_kind(u)) in ("binary", "private"):
                     tokens.append(SKIP)
                     continue
                 try:

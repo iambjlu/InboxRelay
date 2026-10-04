@@ -68,7 +68,7 @@ def fake_post_one(dc):
 
 
 async def probe(u):
-    return "image" if u.endswith(".png") else ""
+    return "binary" if u.endswith(".png") else ""
 
 
 class ShotTest(unittest.TestCase):
@@ -104,7 +104,7 @@ class ShotTest(unittest.TestCase):
             tokens = idx.updates[r.key]["shot"].split()
             self.assertEqual(len(tokens), 4)                                   # 4 個網址各一個記號（不含 t.me 來源）
             self.assertTrue(tokens[0].startswith("?1") and tokens[1].startswith("?1"))   # 網域不存在 → 無法截圖通知（之後會再試）
-            self.assertEqual(tokens[2], SKIP)                                  # 圖片網址不截圖
+            self.assertEqual(tokens[2], SKIP)                                  # 無法預覽的檔案不截圖
             self.assertFalse(tokens[3].startswith(("!", "?")))                 # 成功
             self.assertEqual(len(dc.posts), 3)
             self.assertFalse(w.needs_shot(idx.entries[r.key]))                 # 全部處理過 → 不再排隊
