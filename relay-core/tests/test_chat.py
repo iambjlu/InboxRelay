@@ -171,3 +171,13 @@ class ChatMemoryTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TitleTest(unittest.TestCase):
+    def test_placeholder_and_clean(self):
+        n = chat.placeholder_name("2026-10-04")
+        self.assertTrue(chat.is_placeholder(n))
+        self.assertFalse(chat.is_placeholder("2026-10-04_排查網路問題"))
+        self.assertEqual(chat.clean_title("標題：「排查網路問題。」\n其他"), "排查網路問題")
+        self.assertEqual(chat.clean_title(""), "")
+        self.assertLessEqual(len(chat.clean_title("字" * 80)), 30)

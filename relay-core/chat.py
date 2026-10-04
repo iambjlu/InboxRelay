@@ -14,6 +14,8 @@
 - 記憶自動升級（不算則數）：模型回答時順便判斷「這輪有沒有值得長期記住的事」（使用者要求記住、介紹背景、
   長期偏好、糾正回答方式、進行中的專案、糾正錯誤認知），有的話在回覆最後加一行「〔記憶〕…」（bot 會拿掉、不顯示）。
   使用者明確說「記住／以後…」→ 馬上升級；其他的等對話安靜 IDLE_UPGRADE_SEC 秒後一次整理。沒有值得記的就不升級。
+- 「➕ 新對話」按鈕：頻道裡有一則釘選的按鈕訊息，一鍵開新對話串（名稱先用「日期_亂碼」）；第一輪對話後由 AI 依內容
+  把名稱改成「日期_標題」。從主頻道直接發訊息開的對話串，也會在第一輪後用 AI 重新命名（自己改過名字的不會被蓋掉）。
 - 互動功能：不受「外部 LLM」排程限制，而且優先於背景工作。
 - 每則回覆最下面用小字顯示用了多少 context（端點回報的實際 token 數）。
 - 歷史依 context window（設定 LLM_CONTEXT）分配，超過才省略中間較舊的；用到 CHAT_COMPACT_PCT% 時自動壓縮：
@@ -25,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import random
 import re
 from collections import OrderedDict
 from datetime import datetime
@@ -111,6 +114,40 @@ def _strip_footer(text: str) -> str:
                      if not ln.startswith(USAGE_TAG) and not ln.startswith("-# 🗜️")).rstrip()
 
 
+NEW_CHAT_ID = "inboxrelay:new_chat"
+BUTTON_MARK = "💬 **開新對話**"
+BUTTON_TEXT = f"{BUTTON_MARK}\n-# 按下面的按鈕開一個新的對話串（名稱第一輪聊完會自動換成「日期_標題」），或直接在這個頻道發訊息。"
+_PLACEHOLDER = re.compile(r"^\d{4}-\d{2}-\d{2}_[a-z0-9]{4}$")
+_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"
+TITLE_PROMPT = ("根據下面這段對話的開頭，取一個簡短的繁體中文標題（8～20 個字，不要標點符號結尾、不要引號、"
+                "不要加日期），只輸出標題本身。")
+
+
+def placeholder_name(day: str) -> str:
+    return f"{day}_{''.join(random.choice(_ALPHABET) for _ in range(4))}"
+
+
+def is_placeholder(name: str) -> bool:
+    return bool(_PLACEHOLDER.match(name or ""))
+
+
+def clean_title(raw: str) -> str:
+    t = (raw or "").strip().splitlines()[0] if (raw or "").strip() else ""
+    t = re.sub(r"^(標題|Title)\s*[:：]\s*", "", t.strip(), flags=re.I).strip(" \"'「」『』“”`*#")
+    t = re.sub(r"[\\/]", "", t).rstrip("。.!！?？,，;；:：")
+    return t[:30]
+
+
+class NewChatView(discord.ui.View):
+    def __init__(self, chat: "ChatChannel") -> None:
+        super().__init__(timeout=None)
+        self.chat = chat
+
+    @discord.ui.button(label="新對話", emoji="➕", style=discord.ButtonStyle.primary, custom_id=NEW_CHAT_ID)
+    async def new_chat(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.chat.open_thread(interaction)
+
+
 def thread_title(text: str, fallback: str = "新對話") -> str:
     t = " ".join(text.replace(THINK_PREFIX, "").split())
     return (t[:40] + "…") if len(t) > 40 else (t or fallback)
@@ -178,6 +215,8 @@ class ChatChannel:
         self._idle_task: asyncio.Task | None = None
         self._tpc = 1.0                                     # 每個字大約幾個 token（用端點回報的實際用量校正）
         self._sleeping = False
+        self._auto: set[int] = set()                         # 這次執行期間自動命名、還沒用 AI 改名的對話串
+        self._retitling: set[int] = set()
 
     @property
     def bot_id(self) -> int:
@@ -201,6 +240,7 @@ class ChatChannel:
             "不要放專案或事件的後續進度、一次性的事、單純的數字紀錄。"))
         await self.load_prompt(publish_default=True)
         self.dc.add_message_handler(self.on_message)
+        await self._ensure_button()
         log.info("AI 對話已啟用：頻道 %s（提示詞 v%d，記憶 %s）", self.channel_id, self.prompt_version,
                  f"v{self.memory.version}" if self.memory.content else "尚無")
 
@@ -238,6 +278,63 @@ class ChatChannel:
             parts.append("【先前對話摘要】這段對話較早的內容已經濃縮成下面的摘要，請根據它接著聊：\n" + summary)
         return "\n\n".join(parts)
 
+    # ------------------------------------------------------------ 新對話按鈕／自動命名
+    def _today(self) -> str:
+        return datetime.now(ZoneInfo(self.cfg.tz)).strftime("%Y-%m-%d")
+
+    async def _ensure_button(self) -> None:
+        """頻道裡放一則（釘選的）「新對話」按鈕訊息；已經有就沿用。"""
+        try:
+            self.dc.client.add_view(NewChatView(self))
+            ch = await self.dc.channel(self.channel_id)
+            async for m in ch.history(limit=100):
+                if m.author.id == self.bot_id and m.content.startswith(BUTTON_MARK):
+                    return
+            msg = await ch.send(BUTTON_TEXT, view=NewChatView(self))
+            try:
+                await msg.pin()
+            except discord.HTTPException:
+                pass
+        except Exception:
+            log.warning("建立「新對話」按鈕失敗（仍可直接發訊息開對話）", exc_info=True)
+
+    async def open_thread(self, interaction: discord.Interaction) -> None:
+        ch = interaction.channel
+        if getattr(ch, "id", None) != self.channel_id:
+            await interaction.response.send_message("這個按鈕只能在 AI 對話頻道使用。", ephemeral=True)
+            return
+        try:
+            thread = await ch.create_thread(name=placeholder_name(self._today()),
+                                            type=discord.ChannelType.public_thread, auto_archive_duration=10080)
+        except discord.HTTPException as e:
+            await interaction.response.send_message(f"⚠️ 開對話串失敗：{str(e)[:150]}", ephemeral=True)
+            return
+        self._auto.add(thread.id)
+        await interaction.response.send_message(f"✅ 已開新對話：{thread.mention}", ephemeral=True)
+        await thread.send(f"{NOTE_PREFIX} 💬 直接在這裡發訊息就能開始聊；第一輪聊完會自動把對話串名稱改成「日期_標題」。")
+
+    def _wants_title(self, thread: discord.Thread) -> bool:
+        return (thread.id in self._auto or is_placeholder(thread.name)) and thread.id not in self._retitling
+
+    async def _retitle(self, thread: discord.Thread, user_text: str, reply: str) -> None:
+        """第一輪對話後，請 AI 依內容取標題，改成「日期_標題」。失敗就保留原名，下一輪再試。"""
+        self._retitling.add(thread.id)
+        try:
+            raw = await self.llm.chat(TITLE_PROMPT, data=f"使用者：{user_text[:600]}\n\n回覆：{reply[:600]}",
+                                      max_tokens=60, use_memory=False)
+            title = clean_title(raw)
+            if not title:
+                return
+            day = thread.name[:10] if is_placeholder(thread.name) else (
+                thread.created_at.astimezone(ZoneInfo(self.cfg.tz)).strftime("%Y-%m-%d")
+                if thread.created_at else self._today())
+            await thread.edit(name=f"{day}_{title}"[:100])
+            self._auto.discard(thread.id)
+        except Exception:
+            log.warning("AI 重新命名對話串失敗：%s", thread.id, exc_info=True)
+        finally:
+            self._retitling.discard(thread.id)
+
     # ------------------------------------------------------------ 訊息
     def _in_chat(self, ch) -> bool:
         if getattr(ch, "id", None) == self.channel_id:
@@ -261,6 +358,7 @@ class ChatChannel:
                                                              m.attachments[0].filename if m.attachments else "新對話"),
                                            auto_archive_duration=10080)
             self._starters[thread.id] = m
+            self._auto.add(thread.id)
         lock = self._locks.setdefault(thread.id, asyncio.Lock())
         async with lock:
             if m.clean_content.strip() == COMPACT_CMD:          # 手動壓縮
@@ -287,6 +385,8 @@ class ChatChannel:
             chunks[-1] = f"{chunks[-1]}\n{footer}"
             for chunk in chunks:
                 await thread.send(chunk)
+            if reply and self._wants_title(thread):
+                asyncio.create_task(self._retitle(thread, user_text, reply))
             if used >= ctx * self.cfg.chat_compact_pct / 100:
                 try:
                     async with thread.typing():
