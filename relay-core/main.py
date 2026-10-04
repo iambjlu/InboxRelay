@@ -387,11 +387,26 @@ async def run(check_only: bool) -> int:
         act.mem = guard
         background.append(asyncio.create_task(guard.loop()))
         ane_lane = lanes.get("ane")
+        shot_worker = None
+        if cfg.link_screenshot and cfg.ch_screenshot and shot_ok():
+            from enrich.shotworker import ShotWorker
+            shot_worker = ShotWorker(cfg, dc, relayer.index, relayer.text_cache)
+            if relayer.enricher is not None:
+                relayer.enricher.on_shot = shot_worker.submit
+            shot_lane = lanes.get("shot")
+            shot_worker.scan_index()
+            background.append(asyncio.create_task(shot_worker.run()))
+            background.append(asyncio.create_task(lanes.run_lane(
+                shot_lane, drained=lambda: shot_worker.drained, cycle=shot_worker.cycle)))
+            log.info("📸 連結截圖：%s", shot_lane.describe())
+        else:
+            lanes.LANES.pop("shot", None)           # 沒開連結截圖：不顯示這條車道
         if ipc.enabled():
             from ocr import OcrWorker
             server = ipc.IpcServer(act, relayer, lambda: recapper, tg, cfg, ai_status, stop)
             relayer.ocr = OcrWorker(dc, relayer.index, ipc.emit)
             server.ocr = relayer.ocr
+            server.shot = shot_worker
             if relayer.enricher is not None:
                 relayer.enricher.on_link_images = relayer.ocr.submit
             if recapper is not None:

@@ -3,6 +3,7 @@
 
 - llm：外部 LLM（oMLX 上的 Qwen）— AI 分析、每日／月／年總結、記憶升級。
 - ane：本機 Apple Neural Engine（選單列 App 用 Vision 做圖片文字辨識）。
+- shot：連結截圖（本機 WebKit，獨立排程，不跟著 llm；連結摘要仍屬 llm）。
 
 每條車道各自有排程模式、開始／結束時間、立即執行、暫停／繼續：
 - always  永遠立即執行（有工作就做；llm 每 10 分鐘檢查一次有沒有可以寫的每日／月／年總結，不用設開始時間）
@@ -222,6 +223,7 @@ def setup(cfg) -> dict[str, Lane]:
     LANES.clear()
     LANES["llm"] = Lane("llm", "外部 LLM 工作", cfg.llm_schedule, cfg.recap_time, cfg.llm_end, cfg.tz)
     LANES["ane"] = Lane("ane", "本機 ANE 文字辨識", cfg.ane_schedule, cfg.ane_start, cfg.ane_end, cfg.tz)
+    LANES["shot"] = Lane("shot", "連結截圖", cfg.shot_schedule, cfg.shot_start, cfg.shot_end, cfg.tz)
     return LANES
 
 

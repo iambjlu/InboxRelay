@@ -56,12 +56,15 @@ class Enricher:
         self._posted: list = []                  # 這則工作已經發出去的訊息（連不上時收回，避免重做時重複）
         self._holding = False          # 手上有一則正在做（或在等夜間時段）
         self.on_link_images = None     # callable(mirror_url)：有連到圖片的網址時通知文字辨識
+        self.on_shot = None            # callable(mirror_url)：通知連結截圖車道（截圖有自己的排程）
 
     def submit(self, keys: list, mirror_url: str) -> None:
         if mirror_url in self._queued:
             return
         self._queued.add(mirror_url)
         self.queue.put_nowait(EnrichJob(list(keys), mirror_url))
+        if self.on_shot is not None:
+            self.on_shot(mirror_url)
 
     @property
     def backlog(self) -> int:
@@ -139,11 +142,10 @@ class Enricher:
             return
         texts = {k: self._text(k) for k in keys}
         parts: list[tuple[str, str]] = []
-        # 細部進度：連結摘要＋附件＋截圖＋每則關鍵字，各算一步
+        # 細部進度：連結摘要＋附件＋每則關鍵字，各算一步
         n_urls = len({u for t in texts.values() for u in find_urls(t)}) if cfg.link_summary else 0
         n_atts = sum(1 for a in mirror.attachments if a.size <= MAX_FILE)
-        n_shot = 1 if (cfg.link_screenshot and cfg.ch_screenshot and find_urls(" ".join(texts.values()))) else 0
-        activity.begin_item(min(n_urls, 3) + n_atts + n_shot + (len(keys) if cfg.keywords else 0))
+        activity.begin_item(min(n_urls, 3) + n_atts + (len(keys) if cfg.keywords else 0))
 
         all_urls: list[str] = []
         for t in texts.values():
@@ -154,31 +156,17 @@ class Enricher:
         if cfg.link_summary:
             for u in all_urls[:3]:
                 probed[u] = await probe_link(u)      # 先看是網頁、檔案還是圖片
-        web = [u for u in all_urls if probed.get(u, ("", "article"))[1] not in ("image", "file", "private")]
-
-        # 截圖先拍：網頁讀不到正文時要拿截圖來摘要（連到圖片／檔案的網址不截圖）
-        shot_urls: list[str] = []
-        shot_png: dict = {}
-        if cfg.link_screenshot and cfg.ch_screenshot and web:
-            from enrich.screenshot import post_screenshots
-            first = self.index.get(keys[0])
-            shot_urls = await post_screenshots(self.dc, cfg.ch_screenshot, web[:2],
-                                               first.rec.date if first else "", job.mirror_url, pngs=shot_png)
-            self._posted += shot_urls
-            activity.step()
-
         img_links: list[str] = []
         if cfg.link_summary:
             caption = " ".join(texts.values())[:300]
             for u in all_urls[:3]:
-                r = await summarize_probed(self.llm, u, probed[u], embed_preview(mirror, u), shot_png.get(u),
+                r = await summarize_probed(self.llm, u, probed[u], embed_preview(mirror, u), None,
                                            caption, describe_image=cfg.image_summary)
                 parts.append((r.title, r.summary))
                 if r.image is not None:
                     img_links.append(u)
                 activity.step()
         probed.clear()
-        shot_png.clear()
 
         for a in mirror.attachments:
             name = a.filename
@@ -205,8 +193,10 @@ class Enricher:
             for title, s in parts:
                 lines.append(f"**{title}**")
                 lines += [f"> {x}" for x in s.split("\n") if x.strip()]
+            shot_urls = [u for k in keys for u in (self.index.get(k).rec.shot or "").split()]   # 截圖車道先拍好的
             if shot_urls:
-                lines.append("📸 截圖：" + " ".join(f"[↗{i}](<{u}>)" for i, u in enumerate(shot_urls, 1)))
+                from enrich.shotworker import shot_line
+                lines.append(shot_line(list(dict.fromkeys(shot_urls))))
             chunks = daily.split_message("\n".join(lines))
             reply = await mirror.reply(chunks[0], mention_author=False, suppress_embeds=True)
             self._posted.append(reply)
@@ -232,7 +222,7 @@ class Enricher:
             if mine:
                 extra["img"] = " ".join(mine)
             await self.index.update(k, kw="、".join(kw) or None, gist=gist or None,
-                                    enriched=True, reply=reply_url, shot=" ".join(shot_urls) or None, **extra)
+                                    enriched=True, reply=reply_url, **extra)
         if img_links and self.on_link_images is not None:
             self.on_link_images(job.mirror_url)          # 連到圖片的網址 → 交給本機文字辨識
         log.info("已分析 %s（%d 則，回覆 %s，佇列剩 %d）", job.mirror_url.rsplit("/", 1)[-1],

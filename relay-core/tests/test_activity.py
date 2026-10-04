@@ -60,7 +60,7 @@ class TestActivity(unittest.TestCase):
         async def go():
             import lanes
             from types import SimpleNamespace as N
-            lanes.setup(N(llm_schedule="always", recap_time="03:30", llm_end="", ane_schedule="always",
+            lanes.setup(N(llm_schedule="always", recap_time="03:30", llm_end="", ane_schedule="always", shot_schedule="always", shot_start="03:30", shot_end="",
                           ane_start="03:30", ane_end="", tz="Asia/Taipei"))
             act = activity.Activity()
             act.pause()
@@ -99,7 +99,7 @@ class TestIpc(unittest.TestCase):
 
         async def go():
             import lanes
-            lanes.setup(N(llm_schedule="always", recap_time="03:30", llm_end="", ane_schedule="always",
+            lanes.setup(N(llm_schedule="always", recap_time="03:30", llm_end="", ane_schedule="always", shot_schedule="always", shot_start="03:30", shot_end="",
                           ane_start="03:30", ane_end="", tz="Asia/Taipei"))
             act = activity.Activity()
             t = act.start("每日總結", total=4)

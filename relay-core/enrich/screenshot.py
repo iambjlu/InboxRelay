@@ -131,8 +131,10 @@ async def capture_many(urls: list[str], label: str = "連結截圖",
 
 
 async def post_screenshots(dc, channel_id: int, urls: list[str], when: str, back_url: str,
-                           back_label: str = "鏡像", pngs: dict | None = None) -> list[str]:
-    """截圖並發到連結預覽頻道，每個網址一則；回傳貼文連結。pngs 給了就把圖留給呼叫端（網址 → 圖）。"""
+                           back_label: str = "鏡像", pngs: dict | None = None,
+                           links: dict | None = None) -> list[str]:
+    """截圖並發到連結預覽頻道，每個網址一則；回傳貼文連結。pngs 給了就把圖留給呼叫端（網址 → 圖）；
+    links 給了就記下 網址 → 貼文連結（只含成功的）。"""
     posted: list[str] = []
     warn: list[tuple[str, str]] = []
     for u, png in await capture_many(urls, failures=warn):
@@ -142,5 +144,7 @@ async def post_screenshots(dc, channel_id: int, urls: list[str], when: str, back
         text = f"📸 {when}｜{u}{note}\n[↗ 跳到{back_label}](<{back_url}>)"
         msg = await dc.send_file(channel_id, text, "preview.jpg", png)
         posted.append(msg.jump_url)
+        if links is not None:
+            links[u] = msg.jump_url
     return posted
 

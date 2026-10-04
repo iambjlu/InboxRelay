@@ -80,10 +80,10 @@ func confirmIfBusy(_ core: CoreController, _ what: String, then action: () -> Vo
 /// 一條背景工作（外部 LLM／本機 ANE）的卡片：圖示、狀態、待處理、立即執行、暫停／繼續
 struct LaneRow: View {
     @ObservedObject var core: CoreController
-    let name: String          // llm / ane
+    let name: String          // llm / ane / shot
     let title: String
 
-    private var icon: String { name == "llm" ? "brain" : "text.viewfinder" }
+    private var icon: String { name == "llm" ? "brain" : name == "shot" ? "camera.viewfinder" : "text.viewfinder" }
 
     var body: some View {
         let l = core.lane(name)
@@ -215,6 +215,7 @@ struct MenuContent: View {
                 Text("背景工作").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                 LaneRow(core: core, name: "llm", title: "外部 LLM")
                 LaneRow(core: core, name: "ane", title: "本機 ANE")
+                if core.lane("shot") != nil { LaneRow(core: core, name: "shot", title: "連結截圖") }
             }
 
             if !summaryLine.isEmpty {
@@ -303,6 +304,10 @@ struct DashboardView: View {
                         LaneRow(core: core, name: "llm", title: "外部 LLM（分析、總結、記憶）")
                         Divider()
                         LaneRow(core: core, name: "ane", title: "本機 ANE（圖片文字辨識）")
+                        if core.lane("shot") != nil {
+                            Divider()
+                            LaneRow(core: core, name: "shot", title: "連結截圖")
+                        }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }

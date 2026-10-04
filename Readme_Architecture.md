@@ -16,7 +16,7 @@ Telegram group ──(python-telegram-bot polling)──► relay-core (Python 3
 - Persistence: Discord only (records, state, memory, prompts, summaries). Local disk: venv, lock, one-time flags (see §5); no log files are written (the App keeps an in-memory 500-line log buffer).
 - Media (attachments, images, pages, screenshots) handled as in-memory bytes; never written to disk.
 - One core instance per machine (`data_dir/instance.lock`) and per guild (host heartbeat in `#資料庫 STATE`).
-- Two work lanes (`lanes.py`): `llm` (external LLM background work) and `ane` (local OCR via the App). Interactive features (search, chat, feedback, AI test) bypass lanes.
+- Two work lanes (`lanes.py`): `llm` (external LLM background work) `ane` (local OCR via the App) and `shot` (link screenshots, own schedule; exists only when LINK_SCREENSHOT + DC_CH_SCREENSHOT + tools/linkshot are available, otherwise removed from `LANES`). Interactive features (search, chat, feedback, AI test) bypass lanes.
 
 ## 1. Repository layout
 
@@ -72,6 +72,7 @@ Source of values: App settings (Keychain for secrets, UserDefaults or synced-fol
 | MEMORY_EDITORS | memory_editors | ∅ | user ids allowed to post #記憶 / feedback (guild owner always allowed) |
 | LINK_SUMMARY | link_summary | true | |
 | LINK_SCREENSHOT | link_screenshot | false | requires tools/linkshot |
+| SHOT_SCHEDULE / SHOT_START / SHOT_END | shot_schedule / shot_start / shot_end | always / 03:30 / 08:00 | `shot` lane schedule (link summary stays on the `llm` lane) |
 | PRIVATE_URLS | private_urls | true | allow LAN/localhost URLs |
 | IGNORE_CERT_ERRORS | ignore_cert | false | |
 | REVERSE_SYNC | reverse_sync | true | Discord mirror posts → Telegram |
@@ -175,13 +176,16 @@ Pure helpers for mirror message text: date headers (`header`, `parse_header_date
 `Enricher(cfg, dc, llm, index, text_cache, memory)`; one job = `EnrichJob(keys, mirror_url)`.
 Queue: `asyncio.Queue` + `_front` deque (jobs returned after LLM offline, processed first); `backlog`, `drained`; `submit()` dedupes by mirror url. `on_link_images: callable(mirror_url)` (set to `OcrWorker.submit`).
 `run()`: `activity.gate()` + `lanes.get("llm").gate()` → `process(job)`; on `is_offline_error` → `_undo_posted()` (delete reply/screenshot posts of this job), push job to `_front`, `lane.go_offline()`; other errors logged and job dropped (record stays enriched=no; re-queued at next startup).
-`process(job)`: collect URLs → `probe_link` (≤3) → screenshots for web URLs (`post_screenshots`, ≤2, PNGs kept in memory) → `summarize_probed` per URL (image URL → 🖼️ part; unreadable page → preview+screenshot fallback) → attachments (`summarize_image`, `summarize_document`, ≤ `MAX_FILE=20MB`) → one reply under the mirror (`daily.split_message`) → per key `extract_keywords` + `memory.observe` → `index.update(kw, gist, enriched=True, reply, shot, img)`.
+`process(job)`: collect URLs → `probe_link` (≤3) → `summarize_probed` per URL (no screenshot input; screenshots belong to the `shot` lane, so an unreadable page falls back to preview only) (image URL → 🖼️ part; unreadable page → preview+screenshot fallback) → attachments (`summarize_image`, `summarize_document`, ≤ `MAX_FILE=20MB`) → one reply under the mirror (`daily.split_message`, plus a `📸 截圖` line if the shot lane already stored `shot`) → per key `extract_keywords` + `memory.observe` → `index.update(kw, gist, enriched=True, reply, img)`.
 
 ### enrich/link.py
 `find_urls` (`URL_RE`, ASCII only). `fetch_link(url, want_image)` → (text, kind, bytes) with kind `article|og|file|image|""` (HTML ≤ `MAX_BYTES=3MB`, image ≤ `IMAGE_MAX=20MB`, non-HTML only headers read → `file_link_note`). `fetch_text(url)` → (text, kind) (used by chat.py). `probe_link(url)` → (text, kind, bytes, err) with kind `private` when blocked by PRIVATE_URLS. `embed_preview(message, url)` → Discord embed (site/author/title/description). `summarize_probed(llm, url, probed, preview, shot, caption, describe_image)` → `LinkResult(title, summary, image, failed)`; fallback uses prompt `LINK_FALLBACK` and appends `（根據網頁標籤、網頁預覽、截圖）`. `summarize_link(llm, url)` → str (aitest). `sniff_mime`, `human_size`, `UA`.
 
 ### enrich/screenshot.py
-Runs `tools/linkshot <url> --timeout --settle 5 --width 1280 --max-height 4000 [--insecure]`; image from stdout (JPEG/PNG ≤ `MAX_PNG=8MB`); non-persistent WebKit store. `capture`, `capture_with_reason`, `capture_many(urls, label, failures)`, `post_screenshots(dc, channel_id, urls, when, back_url, back_label, pngs=None)` → post urls (and fills `pngs[url]`). Failures are only logged to the core logger (no file). `ALLOW_PRIVATE`, `IGNORE_CERT`, `CERT_WARN`, `is_public_url`.
+Runs `tools/linkshot <url> --timeout --settle 5 --width 1280 --max-height 4000 [--insecure]`; image from stdout (JPEG/PNG ≤ `MAX_PNG=8MB`); non-persistent WebKit store. `capture`, `capture_with_reason`, `capture_many(urls, label, failures)`, `post_screenshots(dc, channel_id, urls, when, back_url, back_label, pngs=None)` → post urls (and fills `pngs[url]`). Failures are only logged to the core logger (no file). `post_screenshots(..., links=)` also records url → post link of successful shots. `ALLOW_PRIVATE`, `IGNORE_CERT`, `CERT_WARN`, `is_public_url`.
+
+### enrich/shotworker.py
+`ShotWorker(cfg, dc, index, text_cache)` runs the `shot` lane (`run_lane(shot, drained, cycle=shot.cycle)`). `needs_shot(entry)`: not origin extra, `shot` empty, URL in text (`text_cache` or excerpt), not in in-memory `_nonweb`. `scan_index()` (startup and every lane start = schedule/run-now; also resets `_fails`) queues every such mirror, so all backlog links without a screenshot are retried each round. `submit(mirror)` is called from `Enricher.submit` (`on_shot`), i.e. after the delete-sync probe. `process(mirror)`: fetch mirror (full URLs for truncated excerpt URLs) → `probe_link` kind image/file/private skipped (→ `_nonweb`) → `post_screenshots(..., links=)` (≤ `MAX_URLS=2`) → `index.update(shot=…)` → append `📸 截圖：[↗n](<url>)` (`shot_line`) to the existing AI reply when it fits in 2000 chars. Failure: `MAX_TRIES=2` per round (returns False → backoff 30 s doubling to 900 s), then left for the next round. Screenshots stay in memory.
 
 ### enrich/refresh.py
 One-time backfill (flag `link-refresh-v1`): for records with `reply` and a URL in the excerpt, fetch the reply message, find blocks `**🔗|🖼️ url**` + `> …` lines whose body `needs_refresh` (無法讀取 / 僅根據網頁標題與描述 / 檔案下載連結+image/), redo with `summarize_probed` (old screenshot from `rec.shot` or a fresh capture, not posted), edit the reply (`join_fit` ≤2000), set `img` and notify OCR. Offline → `go_offline`, wait lane, retry same item. Functions: needs_refresh, parse_segments, join_fit, refresh_one, refresh_links.
@@ -200,8 +204,8 @@ One-time backfill (flag `link-refresh-v1`): for records with `reply` and a URL i
 
 ### ipc.py
 Enabled when `INBOXRELAY_IPC=1`. JSON lines; logs go to stderr.
-- App → core (stdin): `{"type":"lane","lane":"llm|ane","action":"run_now|pause|resume"}`, `{"type":"hello","ocr":true}` (ane available), `{"type":"ocr_result","id":N,"text":"…","ms":N}` or with `"error","retry","retry_after"`, `{"type":"recap_reset"}`, `{"type":"stop"}`; legacy `recap_now|pause|resume`.
-- core → App (stdout): `{"type":"status", paused, tasks[{label,done,total,detail,line,progress}], backlog, probe_pending, summarized_until, recap_enabled, recap_phase, recap_time, next_recap_hours, ai_status, chat_title, rss_mb, running, lanes{llm|ane:{label,mode,state,describe,queued,backlog,next_start}}}` every 2 s on change; `{"type":"ocr_request","id":N,"url":"…","name":"…"}`.
+- App → core (stdin): `{"type":"lane","lane":"llm|ane|shot","action":"run_now|pause|resume"}`, `{"type":"hello","ocr":true}` (ane available), `{"type":"ocr_result","id":N,"text":"…","ms":N}` or with `"error","retry","retry_after"`, `{"type":"recap_reset"}`, `{"type":"stop"}`; legacy `recap_now|pause|resume`.
+- core → App (stdout): `{"type":"status", paused, tasks[{label,done,total,detail,line,progress}], backlog, probe_pending, summarized_until, recap_enabled, recap_phase, recap_time, next_recap_hours, ai_status, chat_title, rss_mb, running, lanes{llm|ane|shot:{label,mode,state,describe,queued,backlog,next_start}}}` every 2 s on change; `{"type":"ocr_request","id":N,"url":"…","name":"…"}`.
 `IpcServer(act, relayer, get_recapper, tg, cfg, ai_status, stop)`, `lanes_status()`, `emit()`.
 
 ### recap/runner.py / recap/daily.py
@@ -238,16 +242,16 @@ Prompt/memory in DC_CH_CHAT_PROMPT (latest `#提示詞` / `#記憶`, default pub
 - statusbar: terminal bottom bar via DECSTBM; disabled when not a TTY or `STATUS_BAR=false`.
 
 ### tests/
-unittest, run: `python -m unittest discover -s relay-core/tests`. Files: test_activity, test_chat, test_enrich, test_extra, test_formatting, test_importer, test_lanes (incl. offline), test_link_image, test_m4, test_ocr, test_ocr_message, test_recap, test_records_album, test_reset, test_reverse, test_search.
+unittest, run: `python -m unittest discover -s relay-core/tests`. Files: test_activity, test_chat, test_enrich, test_extra, test_formatting, test_importer, test_lanes (incl. offline), test_link_image, test_m4, test_ocr, test_ocr_message, test_recap, test_records_album, test_reset, test_reverse, test_search, test_shot.
 
 ## 4. App (app/*.swift, macOS 14+, built with swiftc, no Xcode project)
 
 | File | Role |
 |---|---|
 | InboxRelayApp.swift | `@main InboxRelayApp`: MenuBarExtra + main window; launch at login via `SMAppService.mainApp` |
-| CoreController.swift | Launches bundled core (`Contents/Resources/core/run.sh`) with env from settings + `INBOXRELAY_IPC=1`; restart with backoff; parses status JSON (`CoreStatus`, `CoreTask`, `LaneStatus{label,mode,state,describe,queued,backlog,next_start}`); lane actions; launch arg `--instant` → once status shows `llm` and a connected `ane` lane, sends `run_now` to both; `handleOCR` (calls OCRService, replies `ocr_result` with retry info); `recapReset`; in-memory `logs` |
+| CoreController.swift | Launches bundled core (`Contents/Resources/core/run.sh`) with env from settings + `INBOXRELAY_IPC=1`; restart with backoff; parses status JSON (`CoreStatus`, `CoreTask`, `LaneStatus{label,mode,state,describe,queued,backlog,next_start}`); lane actions (`llm|ane|shot`; `LaneRow` shows the `shot` row only when the core reports that lane); launch arg `--instant` → once status shows `llm` and a connected `ane` lane, sends `run_now` to `llm`, `ane` and `shot` (if present); `handleOCR` (calls OCRService, replies `ocr_result` with retry info); `recapReset`; in-memory `logs` |
 | OCRService.swift | `recognize(urlString:completion:)`: ephemeral URLSession (no cache/cookies), HTTP status check (non-2xx → retry with Retry-After), `VNRecognizeTextRequest` (accurate, zh-Hant + en-US, language correction), Neural Engine first, then CPU/GPU, then a re-render to standard sRGB 8-bit RGBA (long side ≤ 4096; works around `CRImageReaderError` on unusual formats); serial queue, image in memory only |
-| SettingsStore.swift | `SettingCatalog.fields` (key = env name, label, kind text/secret/toggle/time/choice/number, section 連線/頻道/外部 LLM 設定/排程/功能/…); secrets in Keychain; others in UserDefaults or synced folder `settings.json` (optional secrets there); first run imports `.env` |
+| SettingsStore.swift | `SettingCatalog.fields` (incl. `SHOT_SCHEDULE/START/END`; time fields visible per mode; key = env name, label, kind text/secret/toggle/time/choice/number, section 連線/頻道/外部 LLM 設定/排程/功能/…); secrets in Keychain; others in UserDefaults or synced folder `settings.json` (optional secrets there); first run imports `.env` |
 | Views.swift | Menu content (lane cards: colors running green/teal, waiting blue, offline red "LLM 離線", paused orange; run/pause buttons), dashboard, settings (reset button with confirmation, Cancel default), log view |
 | core_run.sh | Bundled launcher: venv in `data_dir/venv` (requirements hash stamp), `INBOXRELAY_ENV=data_dir/.env`, stdout reserved for JSON |
 

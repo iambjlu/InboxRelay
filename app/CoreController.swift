@@ -169,10 +169,11 @@ final class CoreController: ObservableObject {
     func runHelp(_ name: String) -> String {
         if name == "llm" { return recapHelp }
         guard isRunning, let l = lane(name) else { return "核心沒在運行" }
+        let (doing, what) = name == "shot" ? ("截圖", "連結") : ("辨識", "圖片")
         switch l.state {
-        case "running": return l.backlog > 0 ? "正在辨識中" : "沒有待辨識的圖片"
+        case "running": return l.backlog > 0 ? "正在\(doing)中" : "沒有待\(doing)的\(what)"
         case "unavailable": return "等待 App 與核心連線"
-        default: return l.backlog > 0 ? "馬上辨識 \(l.backlog) 則還沒處理的圖片（不用等排程）" : "沒有待辨識的圖片"
+        default: return l.backlog > 0 ? "馬上\(doing) \(l.backlog) 則還沒處理的\(what)（不用等排程）" : "沒有待\(doing)的\(what)"
         }
     }
 
@@ -334,7 +335,7 @@ final class CoreController: ObservableObject {
                 if instantPending, let lanes = obj.lanes, lanes["llm"] != nil,
                    let ane = lanes["ane"], ane.state != "unavailable" {
                     instantPending = false
-                    for name in ["llm", "ane"] {
+                    for name in ["llm", "ane", "shot"] where lanes[name] != nil {
                         sendAny(["type": "lane", "lane": name, "action": "run_now"])
                     }
                 }

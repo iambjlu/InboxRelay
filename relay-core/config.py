@@ -98,6 +98,9 @@ class Config:
     ane_schedule: str = "always"  # 本機 ANE（圖片文字辨識，在選單列 App 裡跑）
     ane_start: str = "03:30"
     ane_end: str = "08:00"
+    shot_schedule: str = "always"  # 連結截圖（獨立車道，預設永遠立即執行）
+    shot_start: str = "03:30"
+    shot_end: str = "08:00"
     recap_time: str = "03:30"    # 每天幾點開始跑總結（含補跑積欠的）；按 n 可立即總結、p 暫停
 
     def channel_map(self) -> dict[str, int]:
@@ -189,4 +192,7 @@ def load() -> Config:
         ane_schedule=(e.get("ANE_SCHEDULE") or "always").strip(),
         ane_start=(e.get("ANE_START") or "03:30").strip(),
         ane_end=(e.get("ANE_END") or "08:00").strip(),
+        shot_schedule=(e.get("SHOT_SCHEDULE") or "always").strip(),
+        shot_start=(e.get("SHOT_START") or "03:30").strip(),
+        shot_end=(e.get("SHOT_END") or "08:00").strip(),
     )

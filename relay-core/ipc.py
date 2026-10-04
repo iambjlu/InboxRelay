@@ -3,7 +3,7 @@
 
 - 啟動時環境變數 INBOXRELAY_IPC=1 才啟用。
 - App → 核心：stdin 每行一個 JSON：
-  {"type": "lane", "lane": "llm|ane", "action": "run_now|pause|resume"}、{"type": "hello", "ocr": true}、
+  {"type": "lane", "lane": "llm|ane|shot", "action": "run_now|pause|resume"}、{"type": "hello", "ocr": true}、
   {"type": "ocr_result", "id": 1, "text": "…", "ms": 120}、{"type": "stop"}；
   舊指令 recap_now／pause／resume 仍可用（＝外部 LLM 車道）。
 - 核心 → App：stdout 每行一個 JSON：狀態（type=status，每 2 秒、有變化才送）、
@@ -45,6 +45,7 @@ class IpcServer:
         self.stop_event = stop_event
         self._last = ""
         self.ocr = None            # ocr.OcrWorker
+        self.shot = None           # enrich.shotworker.ShotWorker
 
     def status(self) -> dict:
         rc = self.get_recapper()
@@ -73,8 +74,12 @@ class IpcServer:
         r = self.relayer
         out = {}
         for name, lane in lanes.LANES.items():
-            backlog = (r.enricher.backlog if r.enricher else 0) if name == "llm" else \
-                (self.ocr.backlog if self.ocr else 0)
+            if name == "llm":
+                backlog = r.enricher.backlog if r.enricher else 0
+            elif name == "shot":
+                backlog = self.shot.backlog if self.shot else 0
+            else:
+                backlog = self.ocr.backlog if self.ocr else 0
             out[name] = {
                 "label": lane.label, "mode": lane.mode, "state": lane.state, "describe": lane.describe(),
                 "queued": lane.queued, "backlog": backlog,

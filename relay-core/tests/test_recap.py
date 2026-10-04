@@ -210,7 +210,7 @@ class RecapPhaseTest(unittest.TestCase):
         async def go():
             import lanes
             from types import SimpleNamespace as N
-            lanes.setup(N(llm_schedule="daily", recap_time="03:30", llm_end="", ane_schedule="always",
+            lanes.setup(N(llm_schedule="daily", recap_time="03:30", llm_end="", ane_schedule="always", shot_schedule="always", shot_start="03:30", shot_end="",
                           ane_start="03:30", ane_end="", tz="Asia/Taipei"))
             r = Recapper.__new__(Recapper)
             r._lock, r._trigger = _a.Lock(), None
