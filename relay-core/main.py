@@ -694,6 +694,27 @@ async def run_import(args: argparse.Namespace) -> int:
         await dc.close()
 
 
+def _watch_orphan() -> None:
+    """由 App 啟動時：App 結束（父行程變成 launchd）就結束自己。啟動階段還沒開始讀 stdin、也還沒等結束訊號時，
+    只靠 IPC 的 stop／EOF 收不到通知，會變成殘留行程佔著單一實例鎖。"""
+    import os
+    import threading
+    import time
+    parent = os.getppid()
+
+    def watch() -> None:
+        while os.getppid() == parent:
+            time.sleep(2)
+        log.warning("App 已結束，核心跟著結束")
+        try:
+            os.kill(os.getpid(), signal.SIGTERM)          # 優雅關閉（已走到等待結束訊號時會發「已離線」通知）
+        except OSError:
+            pass
+        time.sleep(30)
+        os._exit(0)                                       # 優雅關閉沒完成（例如還在啟動階段）就強制結束
+    threading.Thread(target=watch, daemon=True, name="orphan-watch").start()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="InboxRelay core")
     parser.add_argument("--check", action="store_true", help="只檢查設定與權限")
@@ -722,6 +743,9 @@ def main() -> None:
     rc.add_argument("--year", help="改產生年總結 YYYY（用該年各月的月總結）")
     args = parser.parse_args()
     setup_logging()
+    import ipc
+    if ipc.enabled():
+        _watch_orphan()
     if args.cmd == "recap":
         sys.exit(asyncio.run(run_recap(args)))
     # import-extra 不收 Telegram，可以和核心（App）同時跑：核心每 5 分鐘會讀到新紀錄、排進夜間 AI

@@ -19,7 +19,7 @@ fi
 
 # App 結束後核心可能還在收尾（或卡住）：等它結束，逾時就強制結束，避免新核心因「已有一個在跑」而啟動失敗
 core_pids() { pgrep -f "/Applications/InboxRelay.app/Contents/Resources/core" 2>/dev/null || true; }
-for _ in $(seq 1 20); do
+for _ in $(seq 1 40); do
   [ -z "$(core_pids)" ] && break
   sleep 1
 done
