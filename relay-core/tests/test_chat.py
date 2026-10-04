@@ -308,6 +308,10 @@ class ControlsTest(unittest.TestCase):
                 def mention(self):
                     return f"<#{self.id}>"
 
+                @property
+                def jump_url(self):
+                    return f"https://discord.com/channels/1/{self.id}"
+
             threads = {}
 
             class Parent:
@@ -335,7 +339,9 @@ class ControlsTest(unittest.TestCase):
             content, view = sent[-1]
             self.assertEqual(content, "✅ 已開新對話\n<#500>")                 # 主頻道、換行、不是回覆
             self.assertIsInstance(view, chat.ThreadControlView)                 # 三顆按鈕在這則訊息下面
-            self.assertEqual({b.label for b in view.children}, {"新增聊天", "從這裡分支", "刪除此對話"})
+            self.assertEqual([b.label for b in view.children], ["開啟聊天", "新增聊天", "從這裡分支", "刪除此對話"])
+            self.assertEqual(view.children[0].url, "https://discord.com/channels/1/500")   # 最左邊是打開對話串的連結
+            self.assertTrue(chat.ThreadControlView(c).is_persistent())                    # 註冊用的版本仍可持久化
             t = await c._target_thread(N(channel=parent, message=N(content=content)))
             self.assertIs(t, threads[500])                                      # 按鈕找得到對應的對話串
         asyncio.run(go())

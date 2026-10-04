@@ -149,6 +149,13 @@ PERM_HINT = ("機器人缺少「管理討論串」權限。請到 伺服器設�
              "（或在這個頻道的權限設定裡，只對機器人開啟）。")
 
 
+def _thread_url(t) -> str | None:
+    try:
+        return t.jump_url
+    except Exception:
+        return None
+
+
 async def _safe_delete(m) -> None:
     if m is None:
         return
@@ -182,10 +189,16 @@ class _LoggedView(discord.ui.View):
 
 
 class ThreadControlView(_LoggedView):
-    """對話串裡的控制訊息：新增聊天／從這裡分支／刪除此對話（持久化，bot 重啟後仍有效）。"""
-    def __init__(self, chat: "ChatChannel") -> None:
+    """控制按鈕：開啟聊天（連結）／新增聊天／從這裡分支／刪除此對話（持久化，bot 重啟後仍有效）。"""
+    def __init__(self, chat: "ChatChannel", url: str | None = None) -> None:
         super().__init__(timeout=None)
         self.chat = chat
+        if url:                                      # 連結按鈕放最左邊：按下去直接打開這個對話串
+            items = list(self.children)
+            self.clear_items()
+            self.add_item(discord.ui.Button(label="開啟聊天", emoji="💬", style=discord.ButtonStyle.link, url=url))
+            for it in items:
+                self.add_item(it)
 
     @discord.ui.button(label="新增聊天", emoji="➕", style=discord.ButtonStyle.primary, custom_id="inboxrelay:t_new")
     async def t_new(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -453,14 +466,15 @@ class ChatChannel:
             await interaction.followup.send(f"⚠️ 開對話串失敗：{str(e)[:150]}", ephemeral=True)
             return
         self._auto.add(thread.id)
-        await self._announce(parent, f"✅ 已開新對話\n{thread.mention}", controls=True)
+        await self._announce(parent, f"✅ 已開新對話\n{thread.mention}", controls=thread)
 
-    async def _announce(self, ch, text: str, controls: bool = False) -> discord.Message | None:
-        """發一則普通訊息（不是回覆）。controls＝附上「新增聊天／從這裡分支／刪除此對話」按鈕（對應內文提到的對話串）。
+    async def _announce(self, ch, text: str, controls: discord.Thread | None = None) -> discord.Message | None:
+        """發一則普通訊息（不是回覆）。controls＝那個對話串：附上「開啟聊天（連結）／新增聊天／從這裡分支／刪除此對話」按鈕。
         在對話串裡發的要加 -#，才不會算進對話。"""
         try:
             return await ch.send(f"{NOTE_PREFIX} {text}" if isinstance(ch, discord.Thread) else text,
-                                 view=ThreadControlView(self) if controls else discord.utils.MISSING)
+                                 view=ThreadControlView(self, _thread_url(controls)) if controls is not None
+                                 else discord.utils.MISSING)
         except discord.HTTPException:
             log.warning("發送通知訊息失敗", exc_info=True)
             return None
@@ -537,7 +551,7 @@ class ChatChannel:
             await interaction.followup.send(f"⚠️ 分支到一半失敗：{type(e).__name__}：{str(e)[:150]}"
                                             f"（已搬 {copied} 則：{dst.mention}）", ephemeral=True)
             return
-        await self._announce(parent, f"🔀 已分支（{copied} 則）\n{dst.mention}", controls=True)
+        await self._announce(parent, f"🔀 已分支（{copied} 則）\n{dst.mention}", controls=dst)
 
     async def ask_delete(self, interaction: discord.Interaction) -> None:
         thread = await self._target_thread(interaction)
