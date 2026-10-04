@@ -402,7 +402,10 @@ async def run(check_only: bool) -> int:
             shot_lane = lanes.get("shot")
             shot_worker.scan_index()
             background.append(asyncio.create_task(shot_worker.run()))
-            background.append(asyncio.create_task(shot_worker.retry_old_failures()))
+            async def _shot_maintenance() -> None:                  # 一次性工作：舊失敗重試 → 舊鏡像補截圖箭頭
+                await shot_worker.retry_old_failures()
+                await shot_worker.backfill_arrows()
+            background.append(asyncio.create_task(_shot_maintenance()))
             background.append(asyncio.create_task(lanes.run_lane(
                 shot_lane, drained=lambda: shot_worker.drained, cycle=shot_worker.cycle)))
             if cfg.llm_wait_shot:

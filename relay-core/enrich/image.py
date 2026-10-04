@@ -15,6 +15,10 @@ def mime_of(filename: str) -> str:
 async def summarize_image(llm: LLM, data: bytes, filename: str, caption: str = "") -> str:
     if not llm.image_support:
         return "（模型未開啟圖片支援）"
+    import openai
     prompt = prompts.get("IMAGE")
-    return await llm.chat(prompt, data=f"使用者附註：{caption}" if caption else None,
-                          image=data, image_mime=mime_of(filename), max_tokens=400)
+    try:
+        return await llm.chat(prompt, data=f"使用者附註：{caption}" if caption else None,
+                              image=data, image_mime=mime_of(filename), max_tokens=400)
+    except openai.BadRequestError as e:            # 壞掉／格式不支援的圖：不要讓整則訊息的分析跟著失敗
+        return f"（圖片無法解析，略過：{str(getattr(e, 'message', e))[:60]}）"

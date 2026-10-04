@@ -24,7 +24,24 @@ log = logging.getLogger("kwindex")
 
 Key = tuple
 
-EDIT_GAP_SEC = 1.5      # 同一頻道的編輯至少間隔這麼久：OCR／截圖兩條車道同時改紀錄時不會撞到 Discord 的編輯頻率限制（429）
+
+class _Gap:
+    """編輯間隔會自動調整：discord.http 回報被限流（429）就拉長，之後順利時慢慢縮回去。"""
+    value = 1.5
+    bumped = False
+
+
+class _RateWatch(logging.Handler):
+    def emit(self, record: logging.LogRecord) -> None:
+        msg = record.getMessage()
+        if "rate limited" in msg and "PATCH" in msg:
+            _Gap.value = min(_Gap.value * 1.5 + 0.5, 10.0)
+            _Gap.bumped = True
+
+
+logging.getLogger("discord.http").addHandler(_RateWatch())
+
+EDIT_GAP_SEC = 1.5      # 同一頻道的編輯最短間隔（OCR／截圖兩條車道共用）；被限流（429）時 _Gap 會自動拉長到最多 10 秒，順利時慢慢縮回
 
 
 @dataclass
@@ -47,13 +64,16 @@ class KwIndex:
     async def _edit(self, message_id: int, content: str) -> None:
         """編輯訊息：所有編輯排隊、每次至少間隔 EDIT_GAP_SEC（速度由這裡統一控制）。"""
         async with self._edit_lock:
-            wait = self._last_edit + EDIT_GAP_SEC - time.monotonic()
+            wait = self._last_edit + max(EDIT_GAP_SEC, _Gap.value) - time.monotonic()
             if wait > 0:
                 await asyncio.sleep(wait)
+            _Gap.bumped = False
             try:
                 await self.channel.get_partial_message(message_id).edit(content=content)
             finally:
                 self._last_edit = time.monotonic()
+                if not _Gap.bumped:
+                    _Gap.value = max(EDIT_GAP_SEC, _Gap.value * 0.97)
 
     def __contains__(self, key: Key) -> bool:
         return key in self.entries

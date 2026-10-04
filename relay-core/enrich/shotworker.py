@@ -30,6 +30,30 @@ SKIP = "-"               # 這個網址不需要截圖（圖片／檔案／內�
 RETRY_MAX = 3            # 失敗的網址最多試幾次（含第一次），之後記成最終失敗
 RETRY_AFTER_SEC = 6 * 3600   # 失敗後隔多久才再試（算從失敗通知發出的時間）
 RETRY_FLAG = "shot-retry-v1"
+ARROW_FLAG = "shot-arrows-v1"
+ARROW_PREFIX = "-# [↗ 截圖]("     # 鏡像裡「含連結的那行」下面的小字箭頭行，點了跳到截圖貼文
+
+
+def add_arrows(content: str, url_links: dict[str, str]) -> str:
+    """在鏡像訊息每個有截圖的連結那一行下面加一行小字「↗ 截圖」（先清掉舊的箭頭行，重複執行結果一樣）。"""
+    out: list[str] = []
+    in_code = False
+    for ln in content.split("\n"):
+        if ln.startswith(ARROW_PREFIX):
+            continue
+        out.append(ln)
+        if ln.strip().startswith("```"):
+            in_code = not in_code
+        if in_code or ln.startswith(("#", "-#", "📎", "```")):
+            continue
+        links: list[str] = []
+        for u in find_urls(ln):
+            link = url_links.get(u)
+            if link and link not in links:
+                links.append(link)
+        if links:
+            out.append("-# " + " ".join(f"[↗ 截圖](<{l}>)" for l in links))
+    return "\n".join(out)
 
 
 def parse_token(t: str) -> tuple[str, int, str]:
@@ -80,6 +104,7 @@ class ShotWorker:
         self._wake = asyncio.Event()
         self._holding = False
         self._backoff = 30.0
+        self._link_url: dict[str, str] = {}         # 截圖貼文連結 → 網址（鏡像箭頭用，避免重複讀 Discord）
         self.on_drained = None                    # callable()：佇列清空時通知（外部 LLM 車道等截圖做完）
         self._waiters: dict[str, list] = {}       # 鏡像連結 → 等這則截圖做完的 Future（AI 分析要拿截圖當輔助）
 
@@ -200,6 +225,51 @@ class ShotWorker:
             finally:
                 self._holding = False
 
+    async def sync_arrows(self, mirror_url: str, msg=None) -> bool:
+        """把這則鏡像裡每個有截圖的連結，在它那行下面補上小字箭頭（只改 bot 自己發的鏡像）。回傳有沒有改。"""
+        try:
+            if msg is None:
+                msg = await self.dc.fetch_by_url(mirror_url)
+            me = self.dc.client.user
+            if msg is None or me is None or msg.author.id != me.id:
+                return False
+            url_links: dict[str, str] = {}
+            for e in self.index.by_mirror(mirror_url):
+                toks = [t for t in (e.rec.shot or "").split() if parse_token(t)[0] == "ok"]
+                for u, t in (await self._covered(toks)).items():
+                    url_links.setdefault(u, t)
+            if not url_links:
+                return False
+            new = add_arrows(msg.content or "", url_links)
+            if new == (msg.content or "") or len(new) > 2000:
+                return False
+            await msg.edit(content=new)
+            await asyncio.sleep(1.0)
+            return True
+        except Exception:
+            log.warning("鏡像加截圖箭頭失敗：%s", mirror_url, exc_info=True)
+            return False
+
+    async def backfill_arrows(self) -> None:
+        """一次性：舊的鏡像訊息也補上截圖箭頭（慢慢做，不搶其他工作）。"""
+        from paths import data_dir
+        flag = data_dir() / ARROW_FLAG
+        if flag.exists():
+            return
+        mirrors = []
+        for e in sorted(self.index.entries.values(), key=lambda e: e.msg_id):
+            if e.rec.mirror not in mirrors and any(parse_token(t)[0] == "ok" for t in (e.rec.shot or "").split()):
+                mirrors.append(e.rec.mirror)
+        n = 0
+        for i, m in enumerate(mirrors, 1):
+            await activity.gate("shot")
+            if await self.sync_arrows(m):
+                n += 1
+            if i % 200 == 0:
+                log.info("📸 補截圖箭頭：%d/%d", i, len(mirrors))
+        flag.write_text("done")
+        log.info("📸 舊鏡像補截圖箭頭完成：%d 則（共檢查 %d 則）", n, len(mirrors))
+
     async def _wait_network(self, task) -> None:
         """網路中斷：不發失敗通知，每 30 秒（逐次加到 5 分鐘）檢查 google.com，通了才繼續。"""
         from enrich.screenshot import network_ok
@@ -255,6 +325,9 @@ class ShotWorker:
             kind, _, link = parse_token(t)
             if kind == "skip":
                 continue
+            if kind == "ok" and link in self._link_url:
+                out.setdefault(self._link_url[link], t)
+                continue
             try:
                 m = await self.dc.fetch_by_url(link)
             except Exception:
@@ -263,6 +336,8 @@ class ShotWorker:
                 continue
             for u in find_urls(m.content.split("\n", 1)[0]):
                 out.setdefault(u, t)
+                if kind == "ok":
+                    self._link_url[link] = u
         return out
 
     async def process(self, mirror_url: str) -> bool:
@@ -331,6 +406,7 @@ class ShotWorker:
             log.info("📸 連結截圖：TG#%s 共 %d 個網址（成功 %d）", e.rec.tg_msg, len(urls), len(ok_links))
             if down:
                 raise NetworkDown()
+        await self.sync_arrows(mirror_url, msg)
         return True
 
     async def _update_reply(self, reply_url: str | None, links: list[str]) -> None:

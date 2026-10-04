@@ -141,6 +141,45 @@ class ShotTest(unittest.TestCase):
             self.assertTrue(idx.updates[(-1, 1)]["shot"].startswith("!"))        # 第 3 次還是失敗 → 最終失敗
         asyncio.run(go())
 
+    def test_add_arrows_idempotent(self):
+        content = "# 2025-07-16\n看這個 https://a.example/x 還有 https://b.example/y\n沒連結\nhttps://c.example/z\n-# [src](<https://t.me/c/1/2>)"
+        links = {"https://a.example/x": "https://discord.com/channels/1/5/11", "https://b.example/y": "https://discord.com/channels/1/5/12"}
+        out = shotworker.add_arrows(content, links)
+        lines = out.split("\n")
+        self.assertEqual(lines[2], "-# [↗ 截圖](<https://discord.com/channels/1/5/11>) [↗ 截圖](<https://discord.com/channels/1/5/12>)")
+        self.assertEqual(len(lines), len(content.split("\n")) + 1)             # 只多一行；沒截圖的連結不加
+        self.assertEqual(shotworker.add_arrows(out, links), out)               # 重複執行結果一樣
+        self.assertEqual(records.mirror_texts([rec(1, "看這個 https://a.example/x")], out)[(-1, 1)].split()[0], "看這個")   # 不影響切全文
+
+    def test_sync_arrows_edits_own_mirror(self):
+        async def go():
+            link = "https://discord.com/channels/1/5/" + str(now_id())
+            text = "看 https://a.example/x"
+            edits = []
+
+            class Mir:
+                content = text
+                author = N(id=7)
+
+                async def edit(self, content):
+                    edits.append(content)
+            dc = Posts(text)
+            dc.mirror = Mir()
+            dc.client = N(user=N(id=7))
+            dc.posts[link] = N(content="📸 2025-07-16 13:12｜https://a.example/x\n…")
+            idx = Index([rec(1, text, shot=link)])
+            w = ShotWorker(N(ch_screenshot=5), dc, idx, {})
+            real_sleep = asyncio.sleep
+
+            async def fast_sleep(_):
+                await real_sleep(0)
+            with mock.patch.object(shotworker.asyncio, "sleep", fast_sleep):
+                self.assertTrue(await w.sync_arrows(MIRROR))
+            self.assertEqual(edits, [f"{text}\n-# [↗ 截圖](<{link}>)"])
+            dc.mirror.author = N(id=8)                                           # 別人（使用者）發的不改
+            self.assertFalse(await w.sync_arrows(MIRROR))
+        asyncio.run(go())
+
     def test_parse_token(self):
         self.assertEqual(shotworker.parse_token("-"), ("skip", 0, ""))
         self.assertEqual(shotworker.parse_token("!https://x/1/2/3"), ("fail", shotworker.RETRY_MAX, "https://x/1/2/3"))
