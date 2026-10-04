@@ -126,6 +126,8 @@ _COLORS = ["red", "orange", "yellow", "green", "blue", "purple", "pink", "white"
 _THINGS = ["apple", "banana", "grape", "melon", "mango", "peach", "lemon", "cherry", "kiwi", "pear", "cat", "dog",
            "rabbit", "bear", "deer", "fox", "penguin", "dolphin", "squirrel", "otter", "owl", "koala"]
 _PLACEHOLDER = re.compile(r"^\d{4}-\d{2}-\d{2}_(?:[a-z]+-[a-z]+-\d{4}|[a-z0-9]{4}|[^_]*色-[^_]+-\d{4})$")
+TITLE_PROMPT = ("根據下面這段對話的開頭，取一個簡短的繁體中文標題（8～20 個字，不要標點符號結尾、不要引號、"
+                "不要加日期），只輸出標題本身。")
 
 
 def placeholder_name(day: str) -> str:
@@ -141,6 +143,19 @@ def clean_title(raw: str) -> str:
     t = re.sub(r"^(標題|Title)\s*[:：]\s*", "", t.strip(), flags=re.I).strip(" \"'「」『』“”`*#")
     t = re.sub(r"[\\/]", "", t).rstrip("。.!！?？,，;；:：")
     return t[:30]
+
+
+PERM_HINT = ("機器人缺少「管理討論串」權限。請到 伺服器設定 → 身分組 → 機器人的身分組 → 開啟「管理討論串」"
+             "（或在這個頻道的權限設定裡，只對機器人開啟）。")
+
+
+async def _safe_delete(m) -> None:
+    if m is None:
+        return
+    try:
+        await m.delete()
+    except discord.HTTPException:
+        pass
 
 
 USER_HEAD = "👤 **"            # 分支搬移時，使用者的發言由 bot 重貼；開頭標記讓 LLM 仍把它當成使用者說的話
@@ -187,9 +202,10 @@ class ThreadControlView(_LoggedView):
 
 
 class ConfirmDeleteView(_LoggedView):
-    def __init__(self, chat: "ChatChannel", thread: discord.Thread, requester: int) -> None:
+    def __init__(self, chat: "ChatChannel", thread: discord.Thread, requester: int,
+                 control: discord.Message | None = None) -> None:
         super().__init__(timeout=120)
-        self.chat, self.thread, self.requester = chat, thread, requester
+        self.chat, self.thread, self.requester, self.control = chat, thread, requester, control
         self.message: discord.Message | None = None
 
     async def _mine(self, interaction: discord.Interaction) -> bool:
@@ -202,7 +218,7 @@ class ConfirmDeleteView(_LoggedView):
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if await self._mine(interaction):
             self.stop()
-            await self.chat.delete_thread(interaction, self.thread)
+            await self.chat.delete_thread(interaction, self.thread, self.control)
 
     @discord.ui.button(label="取消", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -326,6 +342,13 @@ class ChatChannel:
         await self.load_prompt(publish_default=True)
         self.dc.add_message_handler(self.on_message)
         await self._ensure_button()
+        try:
+            ch = await self.dc.channel(self.channel_id)
+            me = ch.guild.me                                   # type: ignore[attr-defined]
+            if me is not None and not ch.permissions_for(me).manage_threads:   # type: ignore[attr-defined]
+                log.warning("AI 對話：%s", PERM_HINT + "沒有這個權限時「刪除此對話」會失敗。")
+        except Exception:
+            pass
         log.info("AI 對話已啟用：頻道 %s（提示詞 v%d，記憶 %s）", self.channel_id, self.prompt_version,
                  f"v{self.memory.version}" if self.memory.content else "尚無")
 
@@ -396,14 +419,24 @@ class ChatChannel:
     def _is_chat_thread(self, ch) -> bool:
         return isinstance(ch, discord.Thread) and ch.parent_id == self.channel_id
 
-    async def _send_controls(self, thread: discord.Thread, text: str) -> None:
-        for attempt in range(3):          # 剛建立的對話串偶爾還沒就緒 → 稍等重試
+    _MENTION = re.compile(r"<#(\d+)>")
+
+    async def _target_thread(self, interaction: discord.Interaction) -> discord.Thread | None:
+        """按鈕對應的對話串：在主頻道的控制訊息裡＝訊息內文提到的那個對話串；舊版放在對話串裡的＝那個對話串。"""
+        ch = interaction.channel
+        if self._is_chat_thread(ch):
+            return ch                                          # type: ignore[return-value]
+        m = self._MENTION.search(getattr(interaction.message, "content", "") or "")
+        if not m:
+            return None
+        tid = int(m.group(1))
+        t = self.dc.client.get_channel(tid)
+        if t is None:
             try:
-                await thread.send(f"{NOTE_PREFIX} {text}", view=ThreadControlView(self))
-                return
-            except discord.HTTPException as e:
-                log.warning("對話串控制按鈕送出失敗（第 %d 次）：%s", attempt + 1, e)
-                await asyncio.sleep(1.5)
+                t = await self.dc.client.fetch_channel(tid)
+            except discord.HTTPException:
+                return None
+        return t if self._is_chat_thread(t) else None             # type: ignore[return-value]
 
     async def open_thread(self, interaction: discord.Interaction) -> None:
         ch = interaction.channel
@@ -420,15 +453,17 @@ class ChatChannel:
             await interaction.followup.send(f"⚠️ 開對話串失敗：{str(e)[:150]}", ephemeral=True)
             return
         self._auto.add(thread.id)
-        await self._send_controls(thread, "💬")
-        await self._announce(ch, f"✅ 已開新對話\n{thread.mention}")
+        await self._announce(parent, f"✅ 已開新對話\n{thread.mention}", controls=True)
 
-    async def _announce(self, ch, text: str) -> None:
-        """在按下按鈕的地方發一則普通訊息（不是回覆）；在對話串裡發的要加 -#，才不會算進對話。"""
+    async def _announce(self, ch, text: str, controls: bool = False) -> discord.Message | None:
+        """發一則普通訊息（不是回覆）。controls＝附上「新增聊天／從這裡分支／刪除此對話」按鈕（對應內文提到的對話串）。
+        在對話串裡發的要加 -#，才不會算進對話。"""
         try:
-            await ch.send(f"{NOTE_PREFIX} {text}" if isinstance(ch, discord.Thread) else text)
+            return await ch.send(f"{NOTE_PREFIX} {text}" if isinstance(ch, discord.Thread) else text,
+                                 view=ThreadControlView(self) if controls else discord.utils.MISSING)
         except discord.HTTPException:
             log.warning("發送通知訊息失敗", exc_info=True)
+            return None
 
     # ------------------------------------------------------------ 分支／刪除
     async def _collect(self, thread: discord.Thread) -> list[discord.Message]:
@@ -477,13 +512,13 @@ class ChatChannel:
         return True
 
     async def branch_thread(self, interaction: discord.Interaction) -> None:
-        src = interaction.channel
-        if not self._is_chat_thread(src):
-            await interaction.response.send_message("這個按鈕只能在 AI 對話的對話串裡使用。", ephemeral=True)
+        src = await self._target_thread(interaction)
+        if src is None:
+            await interaction.response.send_message("找不到這個對話串（可能已經刪除）。", ephemeral=True)
             return
         await interaction.response.defer()
+        parent = await self.dc.channel(self.channel_id)
         try:
-            parent = await self.dc.channel(self.channel_id)
             dst = await parent.create_thread(name=f"🔀 {src.name}"[:100],  # type: ignore[attr-defined]
                                              type=discord.ChannelType.public_thread, auto_archive_duration=10080)
         except discord.HTTPException as e:
@@ -497,40 +532,52 @@ class ChatChannel:
                     for i, h in enumerate(msgs, 1):
                         if await self._copy_message(dst, h):
                             copied += 1
-                    await self._send_controls(dst, f"🔀 已從「{src.name}」分支（{copied} 則）")
         except Exception as e:
             log.exception("分支對話串失敗")
             await interaction.followup.send(f"⚠️ 分支到一半失敗：{type(e).__name__}：{str(e)[:150]}"
                                             f"（已搬 {copied} 則：{dst.mention}）", ephemeral=True)
             return
-        await self._announce(src, f"🔀 已分支\n{dst.mention}")
+        await self._announce(parent, f"🔀 已分支（{copied} 則）\n{dst.mention}", controls=True)
 
     async def ask_delete(self, interaction: discord.Interaction) -> None:
-        thread = interaction.channel
-        if not self._is_chat_thread(thread):
-            await interaction.response.send_message("這個按鈕只能在 AI 對話的對話串裡使用。", ephemeral=True)
+        thread = await self._target_thread(interaction)
+        if thread is None:
+            await interaction.response.send_message("找不到這個對話串（可能已經刪除）。", ephemeral=True)
             return
-        view = ConfirmDeleteView(self, thread, interaction.user.id)       # type: ignore[arg-type]
+        control = interaction.message if not self._is_chat_thread(interaction.channel) else None
+        view = ConfirmDeleteView(self, thread, interaction.user.id, control)
         await interaction.response.defer()
-        view.message = await thread.send(
-            f"{NOTE_PREFIX} ⚠️ 確定要刪除這個對話串（{thread.name}）嗎？刪除後無法復原。", view=view)
+        text = f"⚠️ 確定要刪除這個對話串嗎？刪除後無法復原。\n{thread.mention}"
+        ch = interaction.channel
+        view.message = await ch.send(f"{NOTE_PREFIX} {text}" if isinstance(ch, discord.Thread) else text,  # type: ignore[union-attr]
+                                     view=view)
 
-    async def delete_thread(self, interaction: discord.Interaction, thread: discord.Thread) -> None:
+    async def delete_thread(self, interaction: discord.Interaction, thread: discord.Thread,
+                            control: discord.Message | None = None) -> None:
+        """確認刪除：刪掉對話串，以及主頻道裡這個對話串的確認訊息、控制按鈕訊息、「已開啟討論串」系統訊息。"""
         await interaction.response.defer()
         try:
-            await thread.delete()                         # 對話串刪掉，確認訊息也一起消失
+            await thread.delete()
         except discord.Forbidden:
-            await interaction.followup.send("⚠️ 刪不掉：機器人缺少「管理貼文（Manage Threads）」權限。", ephemeral=True)
-            try:
-                await interaction.message.delete()        # type: ignore[union-attr]
-            except discord.HTTPException:
-                pass
+            await interaction.followup.send(f"⚠️ 刪不掉：{PERM_HINT}", ephemeral=True)
+            await _safe_delete(interaction.message)
             return
         except discord.NotFound:
             pass
         except discord.HTTPException as e:
             await interaction.followup.send(f"⚠️ 刪除失敗：{str(e)[:150]}", ephemeral=True)
             return
+        await _safe_delete(interaction.message)
+        await _safe_delete(control)
+        try:
+            parent = await self.dc.channel(self.channel_id)
+            async for m in parent.history(limit=200):          # type: ignore[attr-defined]
+                if (m.type == discord.MessageType.thread_created and m.reference is not None
+                        and m.reference.channel_id == thread.id):
+                    await _safe_delete(m)
+                    break
+        except discord.HTTPException:
+            pass
         for d in (self._locks, self._starters):
             d.pop(thread.id, None)
         self._auto.discard(thread.id)

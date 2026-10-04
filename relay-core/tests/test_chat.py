@@ -261,3 +261,81 @@ class BranchTest(unittest.TestCase):
             self.assertEqual([m["role"] for m in messages[1:]], ["user", "assistant", "user"])
             self.assertIn("你好", str(messages))
         asyncio.run(go())
+
+
+def _cfg():
+    return N(ch_chat=10, ch_chat_prompt=11, tz="Asia/Taipei", llm_context=131072, chat_compact_pct=90)
+
+
+class RetitleTest(unittest.TestCase):
+    def test_placeholder_thread_gets_ai_title(self):
+        async def go():
+            class LLM:
+                image_support = True
+
+                async def chat(self, prompt, data=None, max_tokens=800, use_memory=True, **k):
+                    self.prompt = prompt
+                    return "標題：早安問候與週日計畫。"
+            llm = LLM()
+            c = ChatChannel(_cfg(), N(client=N(user=N(id=BOT))), llm, {ME})
+            renamed = []
+
+            class Thread:
+                id = 300
+                name = "2026-10-04_orange-grape-6661"
+                created_at = None
+
+                async def edit(self, name):
+                    renamed.append(name)
+            t = Thread()
+            self.assertTrue(c._wants_title(t))
+            await c._retitle(t, "早安", "早安！")
+            self.assertIs(llm.prompt, chat.TITLE_PROMPT)
+            self.assertEqual(renamed, ["2026-10-04_早安問候與週日計畫"])
+        asyncio.run(go())
+
+
+class ControlsTest(unittest.TestCase):
+    def test_new_chat_posts_controls_in_main_channel_and_buttons_find_thread(self):
+        async def go():
+            sent = []
+
+            class Thread(discord.Thread):
+                def __init__(self, tid):
+                    self.id, self.parent_id, self.name = tid, 10, "t"
+
+                @property
+                def mention(self):
+                    return f"<#{self.id}>"
+
+            threads = {}
+
+            class Parent:
+                id = 10
+
+                async def create_thread(self, name, type=None, auto_archive_duration=None):
+                    t = Thread(500 + len(threads))
+                    threads[t.id] = t
+                    return t
+
+                async def send(self, content, view=None):
+                    sent.append((content, view))
+                    return N(content=content)
+            parent = Parent()
+
+            async def channel(i):
+                return parent
+            client = N(user=N(id=BOT), get_channel=lambda i: threads.get(i))
+            c = ChatChannel(_cfg(), N(client=client, channel=channel), None, {ME})
+
+            async def defer(*a, **k):
+                pass
+            inter = N(channel=parent, response=N(defer=defer), message=None)
+            await c.open_thread(inter)
+            content, view = sent[-1]
+            self.assertEqual(content, "✅ 已開新對話\n<#500>")                 # 主頻道、換行、不是回覆
+            self.assertIsInstance(view, chat.ThreadControlView)                 # 三顆按鈕在這則訊息下面
+            self.assertEqual({b.label for b in view.children}, {"新增聊天", "從這裡分支", "刪除此對話"})
+            t = await c._target_thread(N(channel=parent, message=N(content=content)))
+            self.assertIs(t, threads[500])                                      # 按鈕找得到對應的對話串
+        asyncio.run(go())
