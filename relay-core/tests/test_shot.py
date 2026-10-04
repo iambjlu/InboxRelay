@@ -180,6 +180,47 @@ class ShotTest(unittest.TestCase):
             self.assertFalse(await w.sync_arrows(MIRROR))
         asyncio.run(go())
 
+    def test_classify_content(self):
+        from enrich.link import classify_content as cc
+        for t in ("text/html; charset=utf-8", "application/json", "application/ld+json", "application/vnd.api+json",
+                  "application/xml", "text/xml", "application/rss+xml", "application/atom+xml", "image/svg+xml",
+                  "application/pdf", "text/plain", "text/csv", "application/javascript", "application/x-yaml",
+                  "image/heic", ""):
+            self.assertEqual(cc(t), "", t)
+        for t in ("application/zip", "video/mp4", "application/octet-stream", "audio/mpeg", "application/x-apple-diskimage"):
+            self.assertEqual(cc(t), "binary", t)
+        self.assertEqual(cc("application/pdf", 200 * 1024 * 1024), "binary")                 # 太大
+
+    def test_retry_unrenderable_failures(self):
+        async def go():
+            import tempfile
+            link = "https://discord.com/channels/1/5/" + str(now_id())
+            other = "https://discord.com/channels/1/5/" + str(now_id() + 1)
+            dc = Posts("x")
+            dc.posts[link] = N(content="📸 無法截圖｜t｜<https://a/x.json>\n-# 原因：不是可截圖的網頁（application/json，0 MB）\n…")
+            dc.posts[other] = N(content="📸 無法截圖｜t｜<https://b/y>\n-# 原因：逾時\n…")
+            idx = Index([rec(1, "https://a/x.json https://b/y", shot=f"!{link} !{other}")])
+            w = ShotWorker(N(ch_screenshot=5), dc, idx, {})
+            with tempfile.TemporaryDirectory() as d, mock.patch("paths.data_dir", lambda: Path(d)):
+                await w.retry_unrenderable_failures()
+            toks = idx.updates[(-1, 1)]["shot"].split()
+            self.assertEqual(toks, [f"?0{link}", f"!{other}"])                                # 只改 JSON 那個，逾時的不動
+            self.assertTrue(w.needs_shot(idx.entries[(-1, 1)]))                               # 排進積欠
+        asyncio.run(go())
+
+    def test_reset_skipped_keeps_other_tokens(self):
+        async def go():
+            import tempfile
+            ok = "https://discord.com/channels/1/5/" + str(now_id())
+            idx = Index([rec(1, "https://a/x.yaml https://b/y", shot=f"- {ok}"), rec(2, "沒連結的長文字"), rec(3, "https://c/z", shot="-")])
+            w = ShotWorker(N(ch_screenshot=5), Posts("x"), idx, {})
+            with tempfile.TemporaryDirectory() as d, mock.patch("paths.data_dir", lambda: Path(d)):
+                await w.reset_skipped()
+            self.assertEqual(idx.updates[(-1, 1)]["shot"], ok)                                # 只拿掉「不截圖」，成功的留著
+            self.assertIsNone(idx.updates[(-1, 3)]["shot"])
+            self.assertNotIn((-1, 2), idx.updates)
+        asyncio.run(go())
+
     def test_parse_token(self):
         self.assertEqual(shotworker.parse_token("-"), ("skip", 0, ""))
         self.assertEqual(shotworker.parse_token("!https://x/1/2/3"), ("fail", shotworker.RETRY_MAX, "https://x/1/2/3"))

@@ -254,6 +254,74 @@ class EditRegenTest(unittest.TestCase):
         asyncio.run(go())
 
 
+class ThreadDeleteAndTitleTest(EditRegenTest):
+    def test_deleting_thread_cancels_pending_llm_request(self):
+        async def go():
+            cfg = N(ch_chat=10, ch_chat_prompt=11, tz="Asia/Taipei", llm_context=131072, chat_compact_pct=90)
+            started, cancelled = asyncio.Event(), []
+
+            class HangLLM(FakeLLM):
+                async def chat_messages(self, messages, max_tokens=4000, thinking=False, progress=None):
+                    started.set()
+                    try:
+                        await asyncio.sleep(30)                                   # 模型還沒回來
+                    except asyncio.CancelledError:
+                        cancelled.append(True)
+                        raise
+            hist = [msg(1, ME, "問題")]
+            hist[0].type = discord.MessageType.default
+            th = self._make(hist)
+            hist[0].channel = th
+            c = ChatChannel(cfg, N(client=N(user=N(id=BOT))), HangLLM(), {ME})
+            c.memory = N(content="")
+            task = asyncio.create_task(c.on_message(hist[0]))
+            await asyncio.wait_for(started.wait(), 2)
+            await c.on_thread_delete(200, 99)                                      # 別的頻道的討論串：不動
+            self.assertFalse(task.done())
+            await c.on_thread_delete(200, 10)                                      # 對話串被刪
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 2)
+            self.assertEqual(cancelled, [True])                                    # LLM 請求被取消
+            self.assertEqual(th.sent, [])                                          # 也不會再往已刪除的對話串發東西
+            self.assertEqual(c._work, {})
+        asyncio.run(go())
+
+    def test_retitle_posts_notice_then_deletes_it(self):
+        async def go():
+            cfg = N(ch_chat=10, ch_chat_prompt=11, tz="Asia/Taipei", llm_context=131072, chat_compact_pct=90)
+            events = []
+
+            class TitleLLM(FakeLLM):
+                async def chat(self, *a, **k):
+                    events.append("llm")
+                    return "旅遊規劃"
+            hist = []
+            th = self._make(hist)
+
+            async def edit(name=None):
+                events.append("edit")
+                th.name = name
+            th.edit = edit
+            orig_send = th.send
+
+            async def send(content=None, **kw):
+                m = await orig_send(content, **kw)
+                events.append("notice")
+                async def d():
+                    events.append("deleted")
+                    hist.remove(m)
+                m.delete = d
+                return m
+            th.send = send
+            c = ChatChannel(cfg, N(client=N(user=N(id=BOT))), TitleLLM(), {ME})
+            await c._retitle(th, "幫我規劃旅遊", "好的")
+            self.assertEqual(events, ["notice", "llm", "edit", "deleted"])        # 先提示、改完名才刪提示
+            self.assertEqual(th.name, "旅遊規劃")
+            self.assertIn("正在重新命名", th.sent[0])
+            self.assertEqual(hist, [])
+        asyncio.run(go())
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -372,11 +440,15 @@ class RetitleTest(unittest.TestCase):
 
                 async def edit(self, name):
                     renamed.append(name)
+
+                async def send(self, content=None, **kw):              # 「正在重新命名…」提示
+                    renamed.append("notice")
+                    return N(delete=lambda: asyncio.sleep(0))
             t = Thread()
             self.assertTrue(c._wants_title(t))
             await c._retitle(t, "早安", "早安！")
             self.assertIs(llm.prompt, chat.TITLE_PROMPT)
-            self.assertEqual(renamed, ["早安問候與週日計畫"])
+            self.assertEqual(renamed, ["notice", "早安問候與週日計畫"])
         asyncio.run(go())
 
 

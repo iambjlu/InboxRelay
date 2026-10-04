@@ -31,7 +31,8 @@ RETRY_MAX = 3            # 失敗的網址最多試幾次（含第一次），�
 RETRY_AFTER_SEC = 6 * 3600   # 失敗後隔多久才再試（算從失敗通知發出的時間）
 RETRY_FLAG = "shot-retry-v1"
 ARROW_FLAG = "shot-arrows-v1"
-SKIP_FLAG = "shot-skip-v2"
+SKIP_FLAG = "shot-skip-v3"
+RETRY2_FLAG = "shot-retry-v2"
 ARROW_PREFIX = "-# [↗ 截圖]("     # 鏡像裡「含連結的那行」下面的小字箭頭行，點了跳到截圖貼文
 
 
@@ -251,8 +252,44 @@ class ShotWorker:
             log.warning("鏡像加截圖箭頭失敗：%s", mirror_url, exc_info=True)
             return False
 
+    async def retry_unrenderable_failures(self) -> None:
+        """一次性：以前因為「截圖工具不收 JSON／JavaScript／YAML…」失敗的通知（原因：不是可截圖的網頁（application/json…））改成馬上重試。"""
+        from paths import data_dir
+        from enrich.screenshot import RETRY_MARK
+        flag = data_dir() / RETRY2_FLAG
+        if flag.exists():
+            return
+        textual = ("json", "javascript", "ecmascript", "yaml", "toml", "x-sh", "sql", "x-ndjson")
+        n = 0
+        for e in sorted(self.index.entries.values(), key=lambda e: e.msg_id):
+            toks = (e.rec.shot or "").split()
+            if not any(parse_token(t)[0] in ("fail", "retry") for t in toks):
+                continue
+            out, changed = [], False
+            for t in toks:
+                kind, _, link = parse_token(t)
+                if kind in ("fail", "retry"):
+                    try:
+                        m = await self.dc.fetch_by_url(link)
+                    except Exception:
+                        out.append(t)
+                        continue
+                    body = getattr(m, "content", "") if m is not None else ""
+                    if "不是可截圖的網頁（" in body:
+                        mime = body.split("不是可截圖的網頁（", 1)[1].split("，", 1)[0].split("）", 1)[0].lower()
+                        if any(k in mime for k in textual):
+                            t, changed = f"{RETRY_MARK}0{link}", True
+                    await asyncio.sleep(0.2)
+                out.append(t)
+            if changed:
+                await self.index.update(e.rec.key, shot=" ".join(out))
+                n += 1
+        flag.write_text("done")
+        log.info("📸 連結截圖：%d 則紀錄因 JSON／JS／YAML 失敗的通知改成重試", n)
+        self.scan_index()
+
     async def reset_skipped(self) -> None:
-        """一次性：以前連到 PDF／文字檔／圖片被記成「不截圖」的紀錄，清掉記號讓它重新判斷（現在這些都會截圖）。"""
+        """一次性：以前被記成「不截圖」（PDF／文字檔／圖片／JSON／YAML…）的紀錄，拿掉「不截圖」記號讓它重新判斷（現在這些都會截圖）。"""
         from paths import data_dir
         flag = data_dir() / SKIP_FLAG
         if flag.exists():
@@ -260,8 +297,9 @@ class ShotWorker:
         n = 0
         for e in sorted(self.index.entries.values(), key=lambda e: e.msg_id):
             toks = (e.rec.shot or "").split()
-            if toks and all(t == SKIP for t in toks) and find_urls(e.rec.excerpt or ""):
-                await self.index.update(e.rec.key, shot=None)
+            if SKIP in toks and find_urls(e.rec.excerpt or ""):
+                keep = [t for t in toks if t != SKIP]          # 拿掉所有「不截圖」記號：沒有記號的網址下次車道會重新判斷（真的不能截的又會記回去）
+                await self.index.update(e.rec.key, shot=" ".join(keep) or None)
                 n += 1
         flag.write_text("done")
         log.info("📸 連結截圖：%d 則紀錄的「不截圖」記號清掉，重新判斷", n)

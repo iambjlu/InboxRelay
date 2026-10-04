@@ -137,8 +137,19 @@ async def probe_link(url: str) -> tuple[str, str, bytes | None, str]:
         return "", "", None, type(e).__name__
 
 
-RENDERABLE = ("text/", "image/", "application/pdf", "application/json", "application/xml", "application/xhtml")
+RENDERABLE = ("text/", "image/", "application/pdf")
+TEXTUAL = ("json", "javascript", "ecmascript", "yaml", "toml", "x-sh", "sql", "x-ndjson", "html", "xml")   # 子字串：含這些的類型都是文字
 BINARY_MAX = 100 * 1024 * 1024
+
+
+def classify_content(ctype: str, length: int | None = None) -> str:
+    """回應標頭 → 能不能截圖：binary（瀏覽器不能預覽的檔案，或 100MB 以上）／""（網頁、PDF、文字、JSON、XML、圖片…，未知也交給截圖）。"""
+    ctype = (ctype or "").lower()
+    if length is not None and length > BINARY_MAX:
+        return "binary"
+    if ctype.startswith(RENDERABLE) or any(k in ctype for k in TEXTUAL):
+        return ""
+    return "binary" if ctype else ""
 
 
 async def probe_kind(url: str) -> str:
@@ -151,16 +162,11 @@ async def probe_kind(url: str) -> str:
         async with httpx.AsyncClient(follow_redirects=True, timeout=10, headers={"User-Agent": UA},
                                      verify=not screenshot.IGNORE_CERT) as c:
             async with c.stream("GET", url) as r:
-                ctype = r.headers.get("content-type", "").lower()
                 if r.status_code >= 400:
                     return ""
                 length = r.headers.get("content-length")
-                if length and length.isdigit() and int(length) > BINARY_MAX:
-                    return "binary"
-                if "html" in ctype or "xml" in ctype or ctype.startswith(RENDERABLE):
-                    return ""
-                if ctype:
-                    return "binary"
+                return classify_content(r.headers.get("content-type", ""),
+                                        int(length) if length and length.isdigit() else None)
     except Exception:
         pass
     return ""

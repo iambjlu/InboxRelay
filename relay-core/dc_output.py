@@ -35,6 +35,7 @@ class DiscordOut:
         self._handlers: list = []
         self._delete_handlers: list = []
         self._edit_handlers: list = []
+        self._thread_delete_handlers: list = []
 
         @self.client.event
         async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent) -> None:
@@ -43,6 +44,14 @@ class DiscordOut:
                     await h(payload)
                 except Exception:
                     log.exception("處理編輯事件失敗")
+
+        @self.client.event
+        async def on_raw_thread_delete(payload: discord.RawThreadDeleteEvent) -> None:
+            for h in list(self._thread_delete_handlers):
+                try:
+                    await h(payload.thread_id, payload.parent_id)
+                except Exception:
+                    log.exception("處理討論串刪除事件失敗")
 
         @self.client.event
         async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent) -> None:
@@ -63,6 +72,10 @@ class DiscordOut:
     def add_delete_handler(self, handler) -> None:
         """註冊「訊息被刪除」處理函式：handler(channel_id, message_id, cached_message_or_None)。"""
         self._delete_handlers.append(handler)
+
+    def add_thread_delete_handler(self, handler) -> None:
+        """註冊「討論串被刪除」處理函式：handler(thread_id, parent_id)。"""
+        self._thread_delete_handlers.append(handler)
 
     def add_edit_handler(self, handler) -> None:
         """註冊「訊息被編輯」處理函式：handler(RawMessageUpdateEvent)。"""

@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import base64
 import io
 import logging
@@ -331,6 +332,7 @@ class ChatChannel:
         self._auto: set[int] = set()                         # 這次執行期間自動命名、還沒用 AI 改名的對話串
         self._retitling: set[int] = set()
         self._views_ready = False
+        self._work: dict[int, set] = {}                    # 對話串 ID → 正在處理它的 task（刪掉對話串時一起取消）
         self._edited: dict[int, str] = {}                  # 訊息 ID → 已處理過的編輯時間（同一次編輯不重複觸發）
 
     @property
@@ -356,6 +358,7 @@ class ChatChannel:
         await self.load_prompt(publish_default=True)
         self.dc.add_message_handler(self.on_message)
         self.dc.add_edit_handler(self.on_edit)
+        self.dc.add_thread_delete_handler(self.on_thread_delete)
         await self._ensure_button()
         try:
             ch = await self.dc.channel(self.channel_id)
@@ -572,6 +575,7 @@ class ChatChannel:
                             control: discord.Message | None = None) -> None:
         """確認刪除：刪掉對話串，以及主頻道裡這個對話串的確認訊息、控制按鈕訊息、「已開啟討論串」系統訊息。"""
         await interaction.response.defer()
+        self.cancel_thread_work(thread.id)                 # 先取消這個對話串還在跑的 LLM 請求
         try:
             await thread.delete()
         except discord.Forbidden:
@@ -602,16 +606,28 @@ class ChatChannel:
         return (thread.id in self._auto or is_placeholder(thread.name)) and thread.id not in self._retitling
 
     async def _retitle(self, thread: discord.Thread, user_text: str, reply: str) -> None:
-        """第一輪對話後，請 AI 依內容取標題，改成標題（不加日期）。失敗就保留原名，下一輪再試。"""
+        """第一輪對話後，請 AI 依內容取標題，改成標題（不加日期）。失敗就保留原名，下一輪再試。
+        進行中先發一則小字提示（做完刪掉），不然使用者會以為沒有反應。"""
         self._retitling.add(thread.id)
+        notice = None
         try:
-            raw = await self.llm.chat(TITLE_PROMPT, data=f"使用者：{user_text[:600]}\n\n回覆：{reply[:600]}",
-                                      max_tokens=60, use_memory=False)
-            title = clean_title(raw)
-            if not title:
-                return
-            await thread.edit(name=title[:100])
-            self._auto.discard(thread.id)
+            with self._working(thread.id):
+                try:
+                    notice = await thread.send(f"{NOTE_PREFIX} 🏷️ 正在重新命名對話標題…")
+                except discord.HTTPException:
+                    notice = None
+                try:
+                    raw = await self.llm.chat(TITLE_PROMPT, data=f"使用者：{user_text[:600]}\n\n回覆：{reply[:600]}",
+                                              max_tokens=60, use_memory=False)
+                    title = clean_title(raw)
+                    if not title:
+                        return
+                    await thread.edit(name=title[:100])
+                    self._auto.discard(thread.id)
+                finally:
+                    await _safe_delete(notice)
+        except asyncio.CancelledError:
+            raise
         except Exception:
             log.warning("AI 重新命名對話串失敗：%s", thread.id, exc_info=True)
         finally:
@@ -642,18 +658,53 @@ class ChatChannel:
             self._starters[thread.id] = m
             self._auto.add(thread.id)
         lock = self._locks.setdefault(thread.id, asyncio.Lock())
-        async with lock:
-            if m.clean_content.strip() == COMPACT_CMD:          # 手動壓縮
-                try:
-                    async with thread.typing():
-                        await self.compact(thread, reason="手動")
-                except Exception as e:
-                    log.exception("壓縮失敗")
-                    await thread.send(f"{NOTE_PREFIX} ⚠️ 壓縮失敗：{type(e).__name__}：{str(e)[:200]}")
-                return
-            res = await self._respond(thread, m)
-        if res is not None:
-            await self._remember(*res)
+        with self._working(thread.id):
+            async with lock:
+                if m.clean_content.strip() == COMPACT_CMD:          # 手動壓縮
+                    try:
+                        async with thread.typing():
+                            await self.compact(thread, reason="手動")
+                    except Exception as e:
+                        log.exception("壓縮失敗")
+                        await thread.send(f"{NOTE_PREFIX} ⚠️ 壓縮失敗：{type(e).__name__}：{str(e)[:200]}")
+                    return
+                res = await self._respond(thread, m)
+            if res is not None:
+                await self._remember(*res)
+
+    @contextlib.contextmanager
+    def _working(self, thread_id: int):
+        """標記「現在這個 task 正在處理這個對話串」：對話串被刪掉時可以把它取消（連同還沒回來的 LLM 請求）。"""
+        t = asyncio.current_task()
+        tasks = self._work.setdefault(thread_id, set())
+        if t is not None:
+            tasks.add(t)
+        try:
+            yield
+        finally:
+            tasks.discard(t)
+            if not tasks:
+                self._work.pop(thread_id, None)
+
+    def cancel_thread_work(self, thread_id: int) -> int:
+        """取消這個對話串所有進行中的工作（等鎖的、等 LLM 回覆的、壓縮、重新命名標題）。回傳取消幾個。"""
+        me = asyncio.current_task()
+        n = 0
+        for t in list(self._work.get(thread_id, ())):
+            if t is not me and not t.done():
+                t.cancel()
+                n += 1
+        if n:
+            log.info("💬 對話串 %s 被刪除：取消 %d 個進行中的工作（含未完成的 LLM 請求）", thread_id, n)
+        return n
+
+    async def on_thread_delete(self, thread_id: int, parent_id: int | None) -> None:
+        if parent_id != self.channel_id:
+            return
+        self.cancel_thread_work(thread_id)
+        for d in (self._locks, self._starters):
+            d.pop(thread_id, None)
+        self._auto.discard(thread_id)
 
     async def on_edit(self, payload: discord.RawMessageUpdateEvent) -> None:
         """使用者編輯了對話串裡「自己發的最後一則」→ 刪掉 bot 在它後面的回覆，用編輯後的內容重新生成。
@@ -686,25 +737,26 @@ class ChatChannel:
         if payload.channel_id == self.channel_id:
             self._starters[thread.id] = m                              # 歷史裡的開頭那則要用編輯後的內容
         lock = self._locks.setdefault(thread.id, asyncio.Lock())
-        async with lock:
-            msgs = await self._collect(thread)
-            users = [h for h in msgs if not self._is_bot_turn(h)]
-            if not users or users[-1].id != m.id:
-                log.info("💬 編輯的不是最後一則使用者訊息，不重新生成（對話串 %s）", thread.id)
-                return
-            mine: list[discord.Message] = []
-            async for h in thread.history(limit=None, after=discord.Object(id=m.id), oldest_first=True):
-                if h.author.id == self.bot_id and not is_copied_user(h.content):
-                    mine.append(h)
-            if any(h.content.startswith(SUMMARY_HEAD) for h in mine):
-                await thread.send(f"{NOTE_PREFIX} ⚠️ 這則之後已經壓縮過對話，不能用編輯來重新生成。")
-                return
-            for h in mine:
-                await _safe_delete(h)
-            log.info("💬 編輯最後一則訊息：刪掉 %d 則舊回覆，重新生成（對話串 %s）", len(mine), thread.id)
-            res = await self._respond(thread, m)
-        if res is not None:
-            await self._remember(*res)
+        with self._working(thread.id):
+            async with lock:
+                msgs = await self._collect(thread)
+                users = [h for h in msgs if not self._is_bot_turn(h)]
+                if not users or users[-1].id != m.id:
+                    log.info("💬 編輯的不是最後一則使用者訊息，不重新生成（對話串 %s）", thread.id)
+                    return
+                mine: list[discord.Message] = []
+                async for h in thread.history(limit=None, after=discord.Object(id=m.id), oldest_first=True):
+                    if h.author.id == self.bot_id and not is_copied_user(h.content):
+                        mine.append(h)
+                if any(h.content.startswith(SUMMARY_HEAD) for h in mine):
+                    await thread.send(f"{NOTE_PREFIX} ⚠️ 這則之後已經壓縮過對話，不能用編輯來重新生成。")
+                    return
+                for h in mine:
+                    await _safe_delete(h)
+                log.info("💬 編輯最後一則訊息：刪掉 %d 則舊回覆，重新生成（對話串 %s）", len(mine), thread.id)
+                res = await self._respond(thread, m)
+            if res is not None:
+                await self._remember(*res)
 
     async def _respond(self, thread: discord.Thread, m: discord.Message) -> tuple[str, list[str]] | None:
         """對 m 這則使用者訊息產生回覆並發出（呼叫端要已經拿著這個對話串的鎖）。失敗發一則錯誤提示並回傳 None；

@@ -106,10 +106,13 @@ final class Shooter: NSObject, WKNavigationDelegate {
         let resp = navigationResponse.response
         let mime = (resp.mimeType ?? "").lowercased()
         let size = resp.expectedContentLength          // 不知道時是 -1
-        let displayable = mime.hasPrefix("text/") || mime.hasPrefix("image/") || mime.contains("html")
+        // 文字類（JSON、JavaScript、YAML、Markdown、CSV、SQL…）一律當文字顯示，就算 WebKit 說它「不能顯示」
+        let textual = mime.hasPrefix("text/") || ["json", "javascript", "ecmascript", "yaml", "toml", "x-sh", "sql", "x-ndjson"]
+            .contains(where: { mime.contains($0) })
+        let displayable = textual || mime.hasPrefix("image/") || mime.contains("html")
             || mime.contains("xml") || mime == "application/pdf"
         if navigationResponse.isForMainFrame
-            && (!navigationResponse.canShowMIMEType || !displayable || size > 30_000_000) {
+            && ((!navigationResponse.canShowMIMEType && !textual) || !displayable || size > 30_000_000) {
             decisionHandler(.cancel)
             fail("不是可截圖的網頁（\(mime.isEmpty ? "未知類型" : mime)，\(size > 0 ? "\(size / 1_000_000) MB" : "大小不明")）", code: 4)
         }
