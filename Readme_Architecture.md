@@ -121,7 +121,7 @@ Progress tracking for background work. `Task` (label, done, total, detail, item 
 - `chat(prompt, data=None, image=None, image_mime, max_tokens, thinking, use_memory)` → str. System = `GUARD` + `MEMORY_WRAP(memory)`. Background calls (bound activity task) stream for progress and yield to interactive callers (`_interactive_waiting`). `<think>` stripped.
 - `chat_messages(messages, max_tokens, thinking, temperature, progress=None)` → (text, usage) for multi-turn chat; `progress(n_tokens)` enables streaming.
 - `ping()` → model ids. `memory`, `memory_version` set by MemoryStore.
-- `test_connection(base_url, model, api_key)` → `{ok, message, ms}`: standalone client (timeout 20 s, no retry) for the settings-page test; lists models (model missing → not ok), then asks for a tiny reply; maps 401/connection/status errors to readable messages. Does not touch the running `LLM`.
+- `test_connection(base_url, model, api_key)` → `{ok, message, ms}`: standalone client (timeout 20 s, no retry) for the settings-page test; only calls `GET /models` (HTTP 200 = endpoint and key OK; model name missing from the list → not ok); never generates text; maps 401/connection/status errors to readable messages. Does not touch the running `LLM`.
 - `is_offline_error(e)`: openai.APIConnectionError / InternalServerError / NotFoundError, httpx.ConnectError / TimeoutException, ConnectionError → treat as "LLM offline" (keep work).
 
 ### prompts.py
