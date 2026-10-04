@@ -169,6 +169,91 @@ class ChatMemoryTest(unittest.TestCase):
         asyncio.run(go())
 
 
+class EditRegenTest(unittest.TestCase):
+    """使用者編輯對話串裡自己發的最後一則 → 刪掉後面的回覆、用新內容重新生成。"""
+
+    def _make(self, hist, parent=10):
+        class FakeThread(discord.Thread):
+            def __init__(self):
+                self.id, self.parent_id, self.name = 200, parent, "手動命名"
+                self.sent, self.deleted = [], []
+
+            async def history(self, limit=None, after=None, oldest_first=True):
+                for h in hist:
+                    if after is None or h.id > after.id:
+                        yield h
+
+            async def fetch_message(self, mid):
+                return next(h for h in hist if h.id == mid)
+
+            async def send(self, content=None, **kw):
+                m = msg(900 + len(self.sent), BOT, content)
+                self.sent.append(content)
+                hist.append(m)
+                return m
+
+            def typing(self):
+                class T:
+                    async def __aenter__(self_): return None
+                    async def __aexit__(self_, *a): return False
+                return T()
+        return FakeThread()
+
+    def test_edit_last_user_message_regenerates(self):
+        async def go():
+            cfg = N(ch_chat=10, ch_chat_prompt=11, tz="Asia/Taipei", llm_context=131072, chat_compact_pct=90)
+            llm = FakeLLM()
+            hist = [msg(1, ME, "第一題"), msg(2, BOT, "第一答\n-# 🧮 x"), msg(3, ME, "第二題（舊）"),
+                    msg(4, BOT, "舊回答\n-# 🧮 x"), msg(5, BOT, "-# ⚠️ 舊的錯誤提示")]
+            deleted = []
+            for h in hist:
+                async def d(h=h):
+                    deleted.append(h.id)
+                    hist.remove(h)
+                h.delete = d
+                h.type = discord.MessageType.default
+            th = self._make(hist)
+            thread_obj = th
+            client = N(user=N(id=BOT), get_channel=lambda cid: thread_obj)
+            c = ChatChannel(cfg, N(client=client), llm, {ME})
+            c.memory = N(content="")
+            c._remember = lambda *a: asyncio.sleep(0)
+            hist[2].clean_content = "第二題（改過）"
+            payload = N(channel_id=200, message_id=3, data={"edited_timestamp": "2026-10-05T10:00:00+00:00"})
+            await c.on_edit(payload)
+            self.assertEqual(deleted, [4, 5])                                   # 舊回覆與舊提示都刪
+            self.assertEqual(len(th.sent), 1)                                   # 重新發了一則回覆
+            self.assertIn("好的", th.sent[0])
+            sent_msgs = str(llm.got[0])
+            self.assertIn("第二題（改過）", sent_msgs)
+            self.assertNotIn("舊回答", sent_msgs)
+            await c.on_edit(payload)                                            # 同一次編輯不重複觸發
+            self.assertEqual(len(th.sent), 1)
+        asyncio.run(go())
+
+    def test_edit_not_last_or_not_real_edit_is_ignored(self):
+        async def go():
+            cfg = N(ch_chat=10, ch_chat_prompt=11, tz="Asia/Taipei", llm_context=131072, chat_compact_pct=90)
+            llm = FakeLLM()
+            hist = [msg(1, ME, "第一題"), msg(2, BOT, "第一答"), msg(3, ME, "第二題"), msg(4, BOT, "第二答")]
+            for h in hist:
+                h.type = discord.MessageType.default
+                h.delete = lambda: asyncio.sleep(0)
+            th = self._make(hist)
+            client = N(user=N(id=BOT), get_channel=lambda cid: th)
+            c = ChatChannel(cfg, N(client=client), llm, {ME})
+            c.memory = N(content="")
+            await c.on_edit(N(channel_id=200, message_id=1, data={"edited_timestamp": "t"}))   # 不是最後一則
+            await c.on_edit(N(channel_id=200, message_id=3, data={}))                          # 只是連結預覽更新
+            self.assertEqual(th.sent, [])
+            self.assertIsNone(llm.got)
+            hist.insert(3, msg(40, BOT, "🗜️ **對話摘要（手動）**\n- x"))                    # 後面已壓縮
+            await c.on_edit(N(channel_id=200, message_id=3, data={"edited_timestamp": "t2"}))
+            self.assertTrue(th.sent and "壓縮" in th.sent[0])
+            self.assertIsNone(llm.got)
+        asyncio.run(go())
+
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -331,6 +331,7 @@ class ChatChannel:
         self._auto: set[int] = set()                         # 這次執行期間自動命名、還沒用 AI 改名的對話串
         self._retitling: set[int] = set()
         self._views_ready = False
+        self._edited: dict[int, str] = {}                  # 訊息 ID → 已處理過的編輯時間（同一次編輯不重複觸發）
 
     @property
     def bot_id(self) -> int:
@@ -354,6 +355,7 @@ class ChatChannel:
             "不要放專案或事件的後續進度、一次性的事、單純的數字紀錄。"))
         await self.load_prompt(publish_default=True)
         self.dc.add_message_handler(self.on_message)
+        self.dc.add_edit_handler(self.on_edit)
         await self._ensure_button()
         try:
             ch = await self.dc.channel(self.channel_id)
@@ -649,32 +651,90 @@ class ChatChannel:
                     log.exception("壓縮失敗")
                     await thread.send(f"{NOTE_PREFIX} ⚠️ 壓縮失敗：{type(e).__name__}：{str(e)[:200]}")
                 return
+            res = await self._respond(thread, m)
+        if res is not None:
+            await self._remember(*res)
+
+    async def on_edit(self, payload: discord.RawMessageUpdateEvent) -> None:
+        """使用者編輯了對話串裡「自己發的最後一則」→ 刪掉 bot 在它後面的回覆，用編輯後的內容重新生成。
+        只認真的內容編輯（payload 帶 edited_timestamp；連結預覽載入等不算）；不是最後一則、或後面已經壓縮過就不動。"""
+        data = payload.data or {}
+        stamp = data.get("edited_timestamp")
+        if not stamp or self._edited.get(payload.message_id) == stamp:
+            return
+        client = self.dc.client
+        if payload.channel_id == self.channel_id:                      # 編輯的是主頻道裡開頭那則 → 對話串 ID 同訊息 ID
+            thread = client.get_channel(payload.message_id)
+            parent = await self.dc.channel(self.channel_id)
+            fetch = parent.fetch_message
+        else:
+            thread = client.get_channel(payload.channel_id)
+            fetch = getattr(thread, "fetch_message", None)
+        if not isinstance(thread, discord.Thread) or thread.parent_id != self.channel_id or fetch is None:
+            return
+        try:
+            m = await fetch(payload.message_id)
+        except discord.HTTPException:
+            return
+        if m.author.bot or m.type not in (discord.MessageType.default, discord.MessageType.reply):
+            return
+        if m.clean_content.strip() == COMPACT_CMD:
+            return
+        self._edited[payload.message_id] = stamp
+        if len(self._edited) > 200:
+            self._edited.pop(next(iter(self._edited)))
+        if payload.channel_id == self.channel_id:
+            self._starters[thread.id] = m                              # 歷史裡的開頭那則要用編輯後的內容
+        lock = self._locks.setdefault(thread.id, asyncio.Lock())
+        async with lock:
+            msgs = await self._collect(thread)
+            users = [h for h in msgs if not self._is_bot_turn(h)]
+            if not users or users[-1].id != m.id:
+                log.info("💬 編輯的不是最後一則使用者訊息，不重新生成（對話串 %s）", thread.id)
+                return
+            mine: list[discord.Message] = []
+            async for h in thread.history(limit=None, after=discord.Object(id=m.id), oldest_first=True):
+                if h.author.id == self.bot_id and not is_copied_user(h.content):
+                    mine.append(h)
+            if any(h.content.startswith(SUMMARY_HEAD) for h in mine):
+                await thread.send(f"{NOTE_PREFIX} ⚠️ 這則之後已經壓縮過對話，不能用編輯來重新生成。")
+                return
+            for h in mine:
+                await _safe_delete(h)
+            log.info("💬 編輯最後一則訊息：刪掉 %d 則舊回覆，重新生成（對話串 %s）", len(mine), thread.id)
+            res = await self._respond(thread, m)
+        if res is not None:
+            await self._remember(*res)
+
+    async def _respond(self, thread: discord.Thread, m: discord.Message) -> tuple[str, list[str]] | None:
+        """對 m 這則使用者訊息產生回覆並發出（呼叫端要已經拿著這個對話串的鎖）。失敗發一則錯誤提示並回傳 None；
+        成功回傳 (使用者這次說的話, 模型標記的記憶)，讓呼叫端在鎖外面做記憶整理。"""
+        try:
+            async with thread.typing():
+                reply, user_text, usage, messages = await self.answer(thread, m)
+            reply, memos = split_memos(reply)
+        except Exception as e:
+            log.exception("AI 對話回覆失敗")
+            await thread.send(f"{NOTE_PREFIX} ⚠️ 回覆失敗：{type(e).__name__}：{str(e)[:200]}")
+            return None
+        used = self._used(usage, messages, reply)
+        ctx = self.cfg.llm_context
+        footer = (f"{USAGE_TAG} 上下文 {'約 ' if not usage else ''}{used:,}／{ctx:,} tokens"
+                  f"（{100 * used / ctx:.0f}%）")
+        chunks = daily.split_message(reply or "（模型沒有回覆內容）", limit=1990 - len(footer) - 1)
+        chunks[-1] = f"{chunks[-1]}\n{footer}"
+        for chunk in chunks:
+            await thread.send(chunk)
+        if reply and self._wants_title(thread):
+            asyncio.create_task(self._retitle(thread, user_text, reply))
+        if used >= ctx * self.cfg.chat_compact_pct / 100:
             try:
                 async with thread.typing():
-                    reply, user_text, usage, messages = await self.answer(thread, m)
-                reply, memos = split_memos(reply)
-            except Exception as e:
-                log.exception("AI 對話回覆失敗")
-                await thread.send(f"{NOTE_PREFIX} ⚠️ 回覆失敗：{type(e).__name__}：{str(e)[:200]}")
-                return
-            used = self._used(usage, messages, reply)
-            ctx = self.cfg.llm_context
-            footer = (f"{USAGE_TAG} 上下文 {'約 ' if not usage else ''}{used:,}／{ctx:,} tokens"
-                      f"（{100 * used / ctx:.0f}%）")
-            chunks = daily.split_message(reply or "（模型沒有回覆內容）", limit=1990 - len(footer) - 1)
-            chunks[-1] = f"{chunks[-1]}\n{footer}"
-            for chunk in chunks:
-                await thread.send(chunk)
-            if reply and self._wants_title(thread):
-                asyncio.create_task(self._retitle(thread, user_text, reply))
-            if used >= ctx * self.cfg.chat_compact_pct / 100:
-                try:
-                    async with thread.typing():
-                        await self.compact(thread, reason=f"自動：用到 {100 * used / ctx:.0f}%",
-                                           base=messages + [{"role": "assistant", "content": reply}], before=used)
-                except Exception:
-                    log.exception("自動壓縮失敗")
-        await self._remember(user_text, memos)
+                    await self.compact(thread, reason=f"自動：用到 {100 * used / ctx:.0f}%",
+                                       base=messages + [{"role": "assistant", "content": reply}], before=used)
+            except Exception:
+                log.exception("自動壓縮失敗")
+        return user_text, memos
 
     def _used(self, usage: dict, messages: list[dict], reply: str) -> int:
         """這輪之後的 context 用量：有端點回報就用實際值（並校正估算比例），沒有就估。"""
