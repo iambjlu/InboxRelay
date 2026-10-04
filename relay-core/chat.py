@@ -15,7 +15,7 @@
   長期偏好、糾正回答方式、進行中的專案、糾正錯誤認知），有的話在回覆最後加一行「〔記憶〕…」（bot 會拿掉、不顯示）。
   使用者明確說「記住／以後…」→ 馬上升級；其他的等對話安靜 IDLE_UPGRADE_SEC 秒後一次整理。沒有值得記的就不升級。
 - 「➕ 新對話」按鈕：頻道裡有一則釘選的按鈕訊息，一鍵開新對話串（名稱先用「日期_顏色-水果或動物-四位數字（英文，如 2026-10-04_black-dog-8818）」）；第一輪對話後由 AI 依內容
-  把名稱改成「日期_標題」。從主頻道直接發訊息開的對話串，也會在第一輪後用 AI 重新命名（自己改過名字的不會被蓋掉）。
+  把名稱改成標題（不含日期）。從主頻道直接發訊息開的對話串，也會在第一輪後用 AI 重新命名（自己改過名字的不會被蓋掉）。
 - 按「新對話」開出來的對話串（以及分支出來的）最上面有一則控制訊息，三顆按鈕：➕ 新增聊天、🔀 從這裡分支、🗑️ 刪除此對話。
   分支＝開新對話串並把目前的對話搬過去（使用者看到完整內容；曾經壓縮過的話，LLM 仍只讀最後一次摘要之後的部分）；
   刪除會先發一則確認／取消訊息：確認＝刪掉整個對話串，取消＝只刪掉那則確認訊息。
@@ -600,7 +600,7 @@ class ChatChannel:
         return (thread.id in self._auto or is_placeholder(thread.name)) and thread.id not in self._retitling
 
     async def _retitle(self, thread: discord.Thread, user_text: str, reply: str) -> None:
-        """第一輪對話後，請 AI 依內容取標題，改成「日期_標題」。失敗就保留原名，下一輪再試。"""
+        """第一輪對話後，請 AI 依內容取標題，改成標題（不加日期）。失敗就保留原名，下一輪再試。"""
         self._retitling.add(thread.id)
         try:
             raw = await self.llm.chat(TITLE_PROMPT, data=f"使用者：{user_text[:600]}\n\n回覆：{reply[:600]}",
@@ -608,10 +608,7 @@ class ChatChannel:
             title = clean_title(raw)
             if not title:
                 return
-            day = thread.name[:10] if is_placeholder(thread.name) else (
-                thread.created_at.astimezone(ZoneInfo(self.cfg.tz)).strftime("%Y-%m-%d")
-                if thread.created_at else self._today())
-            await thread.edit(name=f"{day}_{title}"[:100])
+            await thread.edit(name=title[:100])
             self._auto.discard(thread.id)
         except Exception:
             log.warning("AI 重新命名對話串失敗：%s", thread.id, exc_info=True)

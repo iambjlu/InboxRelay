@@ -291,7 +291,7 @@ class RetitleTest(unittest.TestCase):
             self.assertTrue(c._wants_title(t))
             await c._retitle(t, "早安", "早安！")
             self.assertIs(llm.prompt, chat.TITLE_PROMPT)
-            self.assertEqual(renamed, ["2026-10-04_早安問候與週日計畫"])
+            self.assertEqual(renamed, ["早安問候與週日計畫"])
         asyncio.run(go())
 
 
