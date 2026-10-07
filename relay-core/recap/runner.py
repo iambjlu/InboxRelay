@@ -56,6 +56,24 @@ def make_chunks(kind: str, key: str, title: str, body: str, footer: str) -> list
     return out
 
 
+def make_chunks_fit(kind: str, key: str, title: str, body: str, footer: str,
+                    max_chunks: int | None = None) -> list[str]:
+    """把整篇總結切成一到多則訊息（來源連結都保留）。max_chunks 有值＝不能多發訊息（這篇不在頻道最下面，
+    多出來的續篇會排到別篇後面）：超過就從最後面開始把來源連結改成純文字編號，還是太長才截斷。"""
+    chunks = make_chunks(kind, key, title, body, footer)
+    if max_chunks is None or len(chunks) <= max_chunks:
+        return chunks
+    for m in reversed(list(_LINK_RE.finditer(body))):
+        plain = re.sub(r"^\[(↗\d+)\].*$", r"\1", m.group(0))
+        body = body[:m.start()] + plain + body[m.end():]
+        chunks = make_chunks(kind, key, title, body, footer)
+        if len(chunks) <= max_chunks:
+            return chunks
+    chunks = chunks[:max_chunks]
+    chunks[-1] = chunks[-1][:POST_ROOM - 20].rsplit("\n", 1)[0] + "\n…（內容過長已截斷）"
+    return chunks
+
+
 PLACEHOLDER_MARK = "⏳ 內容正在總結"
 POST_ROOM = 1990
 DRAIN_POLL_SEC = 30          # 等分析佇列做完時多久檢查一次
@@ -119,6 +137,31 @@ class RecapChannel:
         return parts[min(parts)] if parts else None
 
 
+
+    def body(self, kind: str, key: str) -> str:
+        """這篇總結的內文（去掉標記與標題行；多則訊息接起來）。"""
+        parts = self.posts.get((kind, key))
+        if not parts or (kind, key) in self.pending:
+            return ""
+        out = []
+        for i in sorted(parts):
+            c = parts[i].content
+            out.append(c.split("\n", 2)[-1] if i == min(parts) else c.split("\n", 1)[-1])
+        return "\n".join(out)
+
+    def is_tail(self, kind: str, key: str) -> bool:
+        """這篇是不是頻道裡最後面的總結（續篇只能接在最後面才不會亂掉順序）。"""
+        parts = self.posts.get((kind, key))
+        if not parts:
+            return True
+        mine = max(m.id for m in parts.values())
+        return all(m.id <= mine for ps in self.posts.values() for m in ps.values())
+
+    async def publish_post(self, kind: str, key: str, title: str, body: str, footer: str) -> discord.Message:
+        """發佈整篇總結：新的或在最後面的可以拆成多則（來源連結全保留）；中間的舊篇只能維持原本的則數。"""
+        existing = len(self.posts.get((kind, key), {}))
+        limit = None if (existing == 0 or self.is_tail(kind, key)) else existing
+        return await self.publish(kind, key, make_chunks_fit(kind, key, title, body, footer, limit))
 
     async def load(self) -> None:
         self.posts.clear()
@@ -287,7 +330,7 @@ class Recapper:
         body = daily.link_citations(out, [it.url for it in items])
         un = sum(1 for e in entries if not e.rec.enriched)
         footer = f"-# 共 {len(entries)} 則訊息" + ("｜⚠️ 部分內容尚未分析，分析完成後會自動更新" if un else "")
-        await self.rc.publish("DAILY", day, [make_post("DAILY", day, f"# 📰 {formatting.display_date(day)} 每日總結", body, footer)])
+        await self.rc.publish_post("DAILY", day, f"# 📰 {formatting.display_date(day)} 每日總結", body, footer)
         partial = self._partial()
         (partial.add if un else partial.discard)(day)
         await self._set_partial(partial)
@@ -310,7 +353,7 @@ class Recapper:
                                   daily.build_material(items), max_tokens=3000)
         body = daily.link_citations(out, [it.url for it in items])
         footer = f"-# 根據 {len(items)} 天的每日總結"
-        await self.rc.publish("MONTHLY", month, [make_post("MONTHLY", month, f"# 🗓️ {month} 月總結", body, footer)])
+        await self.rc.publish_post("MONTHLY", month, f"# 🗓️ {month} 月總結", body, footer)
         done = self.rc.keys("MONTHLY")
         await self.state.merge(monthly_until=max(done) if done else "")
         log.info("月總結 %s 完成（%d 天）", month, len(items))
@@ -330,7 +373,7 @@ class Recapper:
                                   daily.build_material(items), max_tokens=4000)
         body = daily.link_citations(out, [it.url for it in items])
         footer = f"-# 根據 {len(items)} 個月的月總結"
-        await self.rc.publish("YEARLY", year, [make_post("YEARLY", year, f"# 🎆 {year} 年總結", body, footer)])
+        await self.rc.publish_post("YEARLY", year, f"# 🎆 {year} 年總結", body, footer)
         log.info("年總結 %s 完成（%d 個月）", year, len(items))
 
     # ------------------------------------------------------------ 排程

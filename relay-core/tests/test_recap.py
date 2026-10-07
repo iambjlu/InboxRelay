@@ -53,6 +53,10 @@ class FakeRC:
         self.posts[(k, key)] = chunks
         self.pending.discard((k, key))
 
+    async def publish_post(self, k, key, title, body, footer):
+        from recap.runner import make_chunks_fit
+        await self.publish(k, key, make_chunks_fit(k, key, title, body, footer))
+
 
 class FakeState:
     def __init__(self):
@@ -183,6 +187,78 @@ class TestRecapper(unittest.TestCase):
         asyncio.run(r._tick(NOW))
         self.assertNotEqual(r.rc.posts[("DAILY", "2026-10-01")][0], "DAILY|2026-10-01\n舊")
         self.assertEqual(r.dirty.dates, set())
+
+
+class SplitTest(unittest.TestCase):
+    URL = "https://discord.com/channels/519696701917757440/1555324160195166300/"
+
+    def _body(self, n=30):
+        return "\n".join(f"- 第 {i} 個重點，說明一些內容 " + "".join(f"[↗{j}](<{self.URL}{1000 + j}>)" for j in (i, i + 1, i + 2))
+                         for i in range(1, n + 1))
+
+    def test_long_recap_split_keeps_every_link(self):
+        from recap.runner import make_chunks_fit
+        body = self._body()
+        chunks = make_chunks_fit("DAILY", "2022-03-03", "# 📰 標題", body, "-# 共 30 則訊息")
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(len(c) <= 2000 for c in chunks))
+        self.assertEqual(sum(c.count("[↗") for c in chunks), body.count("[↗"))      # 連結一個都沒少
+        self.assertEqual([parse_marker(c) for c in chunks][0], ("DAILY", "2022-03-03", 1))
+        self.assertEqual([parse_marker(c)[2] for c in chunks], list(range(1, len(chunks) + 1)))
+        self.assertTrue(chunks[1].startswith("-# DAILY|2022-03-03 2/"))
+
+    def test_fixed_chunk_count_falls_back_to_plain_numbers(self):
+        from recap.runner import make_chunks_fit
+        body = self._body()
+        chunks = make_chunks_fit("DAILY", "2022-03-03", "# 📰 標題", body, "-# 共 30 則訊息", max_chunks=1)
+        self.assertEqual(len(chunks), 1)
+        self.assertLessEqual(len(chunks[0]), 2000)
+        self.assertIn("↗", chunks[0])                                                  # 後面變成純文字編號
+        self.assertLess(chunks[0].count("[↗"), body.count("[↗"))
+
+    def test_channel_tail_body_and_publish_post(self):
+        import asyncio
+        from types import SimpleNamespace as N
+        from recap.runner import RecapChannel
+        sent, edited = [], []
+
+        class Msg:
+            def __init__(self, i, content):
+                self.id, self.content = i, content
+                self.jump_url = f"https://discord.com/channels/1/9/{i}"
+
+            async def edit(self, content, suppress=True):
+                self.content = content
+                edited.append(self.id)
+                return self
+
+            async def delete(self):
+                pass
+
+        class Ch:
+            async def send(self, content, suppress_embeds=True):
+                m = Msg(100 + len(sent), content)
+                sent.append(m)
+                return m
+
+        async def go():
+            rc = RecapChannel(Ch(), 1)
+            rc.posts[("DAILY", "A")] = {1: Msg(10, "DAILY|A\n# 標題\n- a")}
+            rc.posts[("DAILY", "B")] = {1: Msg(20, "DAILY|B\n# 標題\n- b")}
+            self.assertFalse(rc.is_tail("DAILY", "A"))
+            self.assertTrue(rc.is_tail("DAILY", "B"))
+            body = self._body()
+            await rc.publish_post("DAILY", "A", "# 標題", body, "-# f")                 # 中間那篇：維持 1 則（連結縮成編號）
+            self.assertEqual(len(rc.posts[("DAILY", "A")]), 1)
+            self.assertEqual(sent, [])
+            await rc.publish_post("DAILY", "B", "# 標題", body, "-# f")                 # 最後一篇：拆成多則、接在後面
+            self.assertGreater(len(rc.posts[("DAILY", "B")]), 1)
+            self.assertEqual(len(sent), len(rc.posts[("DAILY", "B")]) - 1)
+            text = rc.body("DAILY", "B")
+            self.assertEqual(text.count("[↗"), body.count("[↗"))                        # 內文接起來，連結都在
+            await rc.publish_post("DAILY", "C", "# 標題", body, "-# f")                 # 新的一篇：直接拆
+            self.assertTrue(rc.is_tail("DAILY", "C"))
+        asyncio.run(go())
 
 
 if __name__ == "__main__":

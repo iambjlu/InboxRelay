@@ -71,8 +71,7 @@ class SearchChannel:
             return out
         for (kind, key), parts in self.rc.posts.items():
             if kind == "DAILY" and parts and self.rc.has(kind, key):      # 跳過佔位
-                first = parts[min(parts)]
-                out[key] = (first.content.split("\n", 2)[-1], first.jump_url)
+                out[key] = (self.rc.body(kind, key), parts[min(parts)].jump_url)
         return out
 
     async def _live_source(self, q: Query) -> list[Candidate]:
