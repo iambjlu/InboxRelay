@@ -241,7 +241,7 @@ Prompt/memory in DC_CH_CHAT_PROMPT (latest `#提示詞` / `#記憶`, default pub
 - extra.py / extra_job.py: `import-extra` → `DayDoc(day, kind, icon, name, body, …)` from 財政部 invoice CSV (`is_invoice_csv`, `invoice_docs`) or JSONL (`parse_jsonl`: day, kind, icon, name, body, title?, excerpt?); one post per day+kind in DC_CH_EXTRA; KW record origin=`extra`, tg_chat=0 (`EXTRA_CHAT`), type `invoice`/kind; changed days → RECAP_DIRTY. Personal-format converters must not be added to the repo.
 
 ### reset.py
-`run_reset(...)`: deletes mirror messages, bot posts in keywords/recap/screenshot/extra, `STATE_TAGS=("STATE","IMPORT","LIVE","RECAP_DIRTY","RECAP_NOTES")`; flags `--memory --chats --prompts --all`. Telegram untouched. (App `recap_reset` IPC is different: it calls `Recapper.reset_all()` — clears #總結 and re-summarizes.)
+`run_reset(...)`: deletes mirror messages, bot posts in keywords/recap/screenshot/extra, `STATE_TAGS=("STATE","IMPORT","LIVE","RECAP_DIRTY","RECAP_NOTES")`; flags `--memory --chats --prompts --all`. Telegram untouched. (App `recap_reset` IPC is different: it calls `Recapper.reset_all()` — clears #總結 and re-summarizes.) CLI `main.py reset-recap [--yes]` (needs the App/core to be closed because of the instance lock) does the same as `reset_all` without the App: purges the bot's messages in #總結, empties `summarized_until/monthly_until/partial_days` in STATE and clears RECAP_DIRTY; other data and RECAP_NOTES are kept.
 
 ### memguard.py / statusbar.py
 - memguard: RSS every minute; > soft → clear caches; 3× > hard → exit (App restarts) or warn.

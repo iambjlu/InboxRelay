@@ -683,6 +683,32 @@ async def run_recap(args: argparse.Namespace) -> int:
         await dc.close()
 
 
+async def run_reset_recap_cmd(args: argparse.Namespace) -> int:
+    """只清空 #總結 並重設總結進度（和 App 的「清空並重新總結」一樣）；之後核心會依日期重新總結。要先結束 App。"""
+    from reset import purge_bot_messages
+    cfg = config.load()
+    dc = DiscordOut(cfg.dc_token, cfg.dc_guild_id)
+    try:
+        await dc.start()
+        bot_id = dc.client.user.id  # type: ignore[union-attr]
+        if not args.yes:
+            if not sys.stdin.isatty() or input("會刪掉 #總結 裡所有每日／月／年總結（其他資料不動）。確定嗎？請輸入 RESET：").strip() != "RESET":
+                print("已取消（需要確認：加上 --yes）")
+                return 1
+        n = await purge_bot_messages(await dc.channel(cfg.ch_recap), bot_id)
+        db = await dc.channel(cfg.ch_db)
+        st = state.DbRecord(db, bot_id, "STATE")
+        await st.load()
+        await st.merge(summarized_until="", monthly_until="", partial_days="")
+        dirty = state.DirtyDays(state.DbRecord(db, bot_id, "RECAP_DIRTY"))
+        await dirty.load()
+        await dirty.clear_all()
+        print(f"✅ 已清空 #總結（{n} 則）並重設進度；開啟 App 後會等分析做完，再依日期重新總結。")
+        return 0
+    finally:
+        await dc.close()
+
+
 async def run_reset_cmd(args: argparse.Namespace) -> int:
     from reset import run_reset
     cfg = config.load()
@@ -769,6 +795,8 @@ def main() -> None:
     rs.add_argument("--chats", action="store_true", help="連 #搜尋、搜尋測試、AI 測試、通知與互動 的對話一起清掉")
     rs.add_argument("--prompts", action="store_true", help="連 #提示詞 一起清掉（下次啟動重新發預設版）")
     rs.add_argument("--all", action="store_true", help="全部清空：所有相關頻道裡任何人發的所有訊息")
+    rr = sub.add_parser("reset-recap", help="只清空 #總結 並重設總結進度（之後依日期重新總結）；要先結束 App")
+    rr.add_argument("--yes", action="store_true", help="不再詢問確認")
     rc = sub.add_parser("recap", help="手動產生某一天的每日總結（或 --month 月總結）")
     rc.add_argument("--date", help="日期 YYYY-MM-DD（預設昨天；可以是今天，方便測試）")
     rc.add_argument("--month", help="改產生月總結 YYYY-MM")
@@ -786,6 +814,8 @@ def main() -> None:
         sys.exit(4)
     if args.cmd == "reset":
         sys.exit(asyncio.run(run_reset_cmd(args)))
+    if args.cmd == "reset-recap":
+        sys.exit(asyncio.run(run_reset_recap_cmd(args)))
     if args.cmd == "import-extra":
         logging.getLogger().setLevel(logging.WARNING)
         sys.exit(asyncio.run(run_import_extra(args)))
