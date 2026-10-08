@@ -76,7 +76,8 @@ def make_chunks_fit(kind: str, key: str, title: str, body: str, footer: str,
 
 PLACEHOLDER_MARK = "⏳ 內容正在總結"
 POST_ROOM = 1990
-DRAIN_POLL_SEC = 30          # 等分析佇列做完時多久檢查一次
+DRAIN_POLL_SEC = 30          # 等分析、圖片辨識佇列做完時多久檢查一次
+SETTLE_SEC = 5               # 都清空後再等這麼久確認一次（辨識完成到分析入列之間的交接空檔）
 
 
 def make_post(kind: str, key: str, title: str, body: str, footer: str) -> str:
@@ -230,6 +231,7 @@ class Recapper:
         self.tz = ZoneInfo(cfg.tz)
         self._lock = asyncio.Lock()
         self.notes = notes         # state.DbRecord("RECAP_NOTES")：日期／月份 → 使用者補充要求
+        self.waits: list = []              # 其他要先做完才能開始總結的佇列：callable() → True＝已做完（例如圖片辨識 OcrWorker.drained）
         self.start_at = None               # datetime.time；每天幾點開始
         self._trigger: asyncio.Event | None = None
         self._cycle = False                # 這一輪（總結→等分析→再總結）還在進行
@@ -497,14 +499,26 @@ class Recapper:
             if task:
                 activity.finish(task)
 
+    def ready(self) -> bool:
+        """分析佇列和其他要先做完的佇列（圖片辨識…）都清空了。"""
+        return (self.enricher is None or self.enricher.drained) and all(w() for w in self.waits)
+
+    async def wait_ready(self) -> None:
+        """總結要等「圖片辨識」和「AI 分析」都做完：辨識出文字會觸發重新分析，所以要連續兩次確認都清空才算（避免剛好卡在交接空檔）。"""
+        while True:
+            if self.ready():
+                await asyncio.sleep(SETTLE_SEC)
+                if self.ready():
+                    return
+            else:
+                await asyncio.sleep(DRAIN_POLL_SEC)
+
     async def cycle(self) -> None:
         """外部 LLM 車道每次開始時做：等分析佇列全部做完 → 依日期順序一次發完囤積的日／月／年總結。
         （邊分析邊發會讓 #總結 缺日子、日期跳來跳去，因為 Discord 沒辦法插回舊位置。）"""
         self._cycle = True
         try:
-            if self.enricher is not None:
-                while not self.enricher.drained:
-                    await asyncio.sleep(DRAIN_POLL_SEC)
+            await self.wait_ready()
             await self.tick()
         except asyncio.CancelledError:
             raise

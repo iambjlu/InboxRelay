@@ -432,6 +432,8 @@ async def run(check_only: bool) -> int:
             if recapper is not None:
                 relayer.ocr.has_daily = lambda day: recapper.rc.has("DAILY", day)
                 relayer.ocr.mark_days = relayer.dirty.mark_many
+            if recapper is not None:
+                recapper.waits.append(lambda: relayer.ocr.drained)    # 總結要等圖片辨識做完（再加上分析佇列）才開始
             ane_lane.available = False            # 等 App 回報支援文字辨識（hello）
             relayer.ocr.scan_index()
             background.append(asyncio.create_task(relayer.ocr.run()))

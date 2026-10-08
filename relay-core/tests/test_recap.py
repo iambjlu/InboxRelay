@@ -92,7 +92,7 @@ def entry(day, msg, enriched=True, mirror="https://discord.com/channels/1/2/3"):
 def make(entries, dirty=(), backlog=0):
     idx = SimpleNamespace(entries={e.rec.key: e for e in entries})
     cfg = SimpleNamespace(tz="Asia/Taipei")
-    enr = SimpleNamespace(backlog=backlog)
+    enr = SimpleNamespace(backlog=backlog, drained=backlog == 0)
     return Recapper(cfg, FakeLLM(), idx, FakeRC(), FakeState(), FakeDirty(dirty), enr, 12)
 
 
@@ -148,7 +148,7 @@ class TestRecapper(unittest.TestCase):
         r.enricher.drained = False
 
         import recap.runner as rr
-        rr.DRAIN_POLL_SEC = 0.01
+        rr.DRAIN_POLL_SEC = rr.SETTLE_SEC = 0.01
 
         async def go():
             t = asyncio.create_task(r.cycle())
@@ -161,6 +161,33 @@ class TestRecapper(unittest.TestCase):
         asyncio.run(go())
         self.assertEqual(order, ["DAILY:2025-12-30", "MONTHLY:2025-12", "YEARLY:2025",
                                  "DAILY:2026-01-02", "DAILY:2026-01-03", "MONTHLY:2026-01"])
+
+    def test_cycle_waits_for_ocr_and_reanalysis_before_summarizing(self):
+        r = make([entry("2025-12-30", 1), entry("2026-01-02", 2)], backlog=0)
+        order = []
+        orig = r.rc.publish
+
+        async def pub(k, key, chunks):
+            order.append(f"{k}:{key}")
+            await orig(k, key, chunks)
+        r.rc.publish = pub
+        ocr_state = {"drained": False}
+        r.waits.append(lambda: ocr_state["drained"])           # 圖片辨識還沒做完（分析佇列此刻是空的）
+        import recap.runner as rr
+        rr.DRAIN_POLL_SEC = rr.SETTLE_SEC = 0.01
+
+        async def go():
+            t = asyncio.create_task(r.cycle())
+            await asyncio.sleep(0.1)
+            self.assertEqual(order, [])                         # 分析佇列空了也不能開始：OCR 還在跑
+            ocr_state["drained"] = True
+            r.enricher.drained = False                          # OCR 一做完就觸發重新分析入列
+            await asyncio.sleep(0.1)
+            self.assertEqual(order, [])                         # 重新分析還沒做完：還是不開始
+            r.enricher.drained = True
+            await asyncio.wait_for(t, 5)
+        asyncio.run(go())
+        self.assertIn("DAILY:2025-12-30", order)
 
     def test_make_post_fits_one_message(self):
         from recap.runner import make_post
