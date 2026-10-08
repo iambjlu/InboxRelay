@@ -31,6 +31,7 @@ RETRY_MAX = 3            # 失敗的網址最多試幾次（含第一次），�
 RETRY_AFTER_SEC = 6 * 3600   # 失敗後隔多久才再試（算從失敗通知發出的時間）
 RETRY_FLAG = "shot-retry-v1"
 ARROW_FLAG = "shot-arrows-v1"
+BUTTON_FLAG = "shot-buttons-v1"
 SKIP_FLAG = "shot-skip-v3"
 RETRY2_FLAG = "shot-retry-v2"
 ARROW_PREFIX = "-# [↗ 截圖]("     # 鏡像裡「含連結的那行」下面的小字箭頭行，點了跳到截圖貼文
@@ -106,6 +107,7 @@ class ShotWorker:
         self._wake = asyncio.Event()
         self._holding = False
         self._backoff = 30.0
+        self._lock = asyncio.Lock()                 # 車道處理一則鏡像、或使用者按「重試截圖」時獨占（兩邊會改同一筆紀錄）
         self._link_url: dict[str, str] = {}         # 截圖貼文連結 → 網址（鏡像箭頭用，避免重複讀 Discord）
         self.on_drained = None                    # callable()：佇列清空時通知（外部 LLM 車道等截圖做完）
         self._waiters: dict[str, list] = {}       # 鏡像連結 → 等這則截圖做完的 Future（AI 分析要拿截圖當輔助）
@@ -206,7 +208,9 @@ class ShotWorker:
                 if task is None:
                     task = activity.start("連結截圖")
                 task.set(done=done, total=done + 1 + len(self.queue))
-                if not await self.process(mirror):
+                async with self._lock:
+                    done_ok = await self.process(mirror)
+                if not done_ok:
                     self.queue.appendleft(mirror)
                     self._queued.add(mirror)
                     log.info("連結截圖暫停 %.0f 秒後重試", self._backoff)
@@ -304,6 +308,75 @@ class ShotWorker:
         flag.write_text("done")
         log.info("📸 連結截圖：%d 則紀錄的「不截圖」記號清掉，重新判斷", n)
         self.scan_index()
+
+    async def retry_notice(self, msg) -> str:
+        """使用者按了「📸 無法截圖」通知上的「重試截圖」：重拍；成功就貼出截圖、換掉紀錄裡的失敗記號、刪掉通知、補鏡像箭頭；
+        失敗就把通知上的原因更新成最新的。回傳要顯示給使用者看的一行結果。"""
+        import re
+        from enrich.screenshot import CERT_WARN, NetworkDown, try_capture
+        from enrich.shotbutton import parse_notice
+        info = parse_notice(getattr(msg, "content", ""))
+        if info is None:
+            return "這不是截圖失敗通知，沒辦法重試"
+        when, url, back = info
+        async with self._lock:
+            try:
+                png, why = await try_capture(url)
+            except NetworkDown:
+                return "🔌 網路好像中斷了（連不上 google.com），等網路恢復再試"
+            if not png:
+                new = re.sub(r"-# 原因：.*", f"-# 原因：{why or '未知'}", msg.content, count=1)
+                if new != msg.content:
+                    await msg.edit(content=new)
+                return f"❌ 還是失敗：{why or '未知'}"
+            note = f"\n{CERT_WARN}" if why == CERT_WARN else ""
+            posted = await self.dc.send_file(self.cfg.ch_screenshot,
+                                             f"📸 {when}｜{url}{note}\n[↗ 跳到鏡像](<{back}>)", "preview.jpg", png)
+            png = None
+            old_link, new_link = msg.jump_url, posted.jump_url
+            replies = set()
+            for e in self.index.by_mirror(back):
+                toks = (e.rec.shot or "").split()
+                new = [new_link if parse_token(t)[2] == old_link else t for t in toks]
+                if new != toks:
+                    await self.index.update(e.rec.key, shot=" ".join(new))
+                if e.rec.reply:
+                    replies.add((e.rec.reply, tuple(success_links(" ".join(new)))))
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+            for reply_url, links in replies:
+                if links:
+                    await self._update_reply(reply_url, list(links))
+            await self.sync_arrows(back)
+        return "✅ 截圖成功，已更新"
+
+    async def add_retry_buttons(self) -> None:
+        """一次性：以前發的「無法截圖」通知也加上「重試截圖」按鈕。"""
+        from paths import data_dir
+        from enrich.shotbutton import RetryView
+        flag = data_dir() / BUTTON_FLAG
+        if flag.exists():
+            return
+        n = 0
+        seen: set[str] = set()
+        for e in sorted(self.index.entries.values(), key=lambda e: e.msg_id):
+            for t in (e.rec.shot or "").split():
+                kind, _, link = parse_token(t)
+                if kind not in ("fail", "retry") or link in seen:
+                    continue
+                seen.add(link)
+                try:
+                    m = await self.dc.fetch_by_url(link)
+                    if m is not None and not m.components:
+                        await m.edit(view=RetryView())
+                        n += 1
+                except Exception:
+                    log.warning("加「重試截圖」按鈕失敗：%s", link, exc_info=True)
+                await asyncio.sleep(1.0)
+        flag.write_text("done")
+        log.info("📸 已為 %d 則舊的「無法截圖」通知加上「重試截圖」按鈕", n)
 
     async def backfill_arrows(self) -> None:
         """一次性：舊的鏡像訊息也補上截圖箭頭（慢慢做，不搶其他工作）。"""

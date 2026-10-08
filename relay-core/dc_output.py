@@ -146,8 +146,9 @@ class DiscordOut:
         return problems
 
     async def send(self, channel_id: int, content: str | None,
-                   files: list[tuple[str, bytes]] | None = None, retries: int = 3) -> discord.Message:
-        """發一則訊息；附件以 (檔名, bytes) 傳入，每次重試都重新包成 discord.File。"""
+                   files: list[tuple[str, bytes]] | None = None, retries: int = 3,
+                   view: discord.ui.View | None = None) -> discord.Message:
+        """發一則訊息；附件以 (檔名, bytes) 傳入，每次重試都重新包成 discord.File。view＝要附的按鈕。"""
         ch = await self.channel(channel_id)
         delay = 2.0
         for attempt in range(1, retries + 1):
@@ -158,6 +159,8 @@ class DiscordOut:
                     kwargs["content"] = content
                 if dfiles:
                     kwargs["files"] = dfiles
+                if view is not None:
+                    kwargs["view"] = view
                 return await ch.send(**kwargs)
             except discord.Forbidden:
                 raise  # 權限問題重試也沒用，避免累積無效請求

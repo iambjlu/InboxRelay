@@ -400,6 +400,8 @@ async def run(check_only: bool) -> int:
             shot_worker = ShotWorker(cfg, dc, relayer.index, relayer.text_cache)
             if relayer.enricher is not None:
                 relayer.enricher.shot_worker = shot_worker
+            from enrich.shotbutton import RetryView
+            dc.client.add_view(RetryView(shot_worker.retry_notice))      # 「重試截圖」按鈕（持久；App 重開後仍有效）
             shot_lane = lanes.get("shot")
             shot_worker.scan_index()
             background.append(asyncio.create_task(shot_worker.run()))
@@ -408,6 +410,7 @@ async def run(check_only: bool) -> int:
                 await shot_worker.retry_unrenderable_failures()
                 await shot_worker.retry_old_failures()
                 await shot_worker.backfill_arrows()
+                await shot_worker.add_retry_buttons()
             background.append(asyncio.create_task(_shot_maintenance()))
             background.append(asyncio.create_task(lanes.run_lane(
                 shot_lane, drained=lambda: shot_worker.drained, cycle=shot_worker.cycle)))

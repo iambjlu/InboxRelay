@@ -221,6 +221,82 @@ class ShotTest(unittest.TestCase):
             self.assertNotIn((-1, 2), idx.updates)
         asyncio.run(go())
 
+    def test_parse_notice_and_view(self):
+        from enrich import shotbutton
+        txt = "📸 無法截圖｜2026-08-22 12:29｜<https://a.example/x?cid=1>\n-# 原因：網域不存在（DNS 查不到）\n[↗ 跳到鏡像](<https://discord.com/channels/1/2/3>)"
+        self.assertEqual(shotbutton.parse_notice(txt), ("2026-08-22 12:29", "https://a.example/x?cid=1", "https://discord.com/channels/1/2/3"))
+        self.assertIsNone(shotbutton.parse_notice("📸 2026-08-22 12:29｜https://a.example/x\n[↗ 跳到鏡像](<https://discord.com/channels/1/2/3>)"))
+
+        async def go():
+            v = shotbutton.RetryView()
+            self.assertEqual([c.custom_id for c in v.children], [shotbutton.CUSTOM_ID])
+        asyncio.run(go())
+
+    def test_retry_notice_success_replaces_token_and_deletes_notice(self):
+        async def go():
+            old = "https://discord.com/channels/1/5/" + str(now_id())
+            notice = N(jump_url=old, deleted=False,
+                       content=f"📸 無法截圖｜2025-07-16 13:12｜<https://a.example/x>\n-# 原因：逾時\n[↗ 跳到鏡像](<{MIRROR}>)")
+
+            async def delete():
+                notice.deleted = True
+            notice.delete = delete
+            dc = Posts("x")
+            sent = []
+
+            async def send_file(ch, content, name, data):
+                sent.append((ch, content))
+                return N(jump_url="https://discord.com/channels/1/5/" + str(now_id() + 7))
+            dc.send_file = send_file
+            idx = Index([rec(1, "https://a.example/x", shot=f"!{old}", reply=None)])
+            w = ShotWorker(N(ch_screenshot=5), dc, idx, {})
+            arrows = []
+
+            async def fake_arrows(m, msg=None):
+                arrows.append(m)
+                return True
+            w.sync_arrows = fake_arrows
+
+            async def ok(url, tries=1):
+                return b"jpg", ""
+            with mock.patch.object(screenshot, "try_capture", ok):
+                text = await w.retry_notice(notice)
+            self.assertTrue(text.startswith("✅"))
+            new_tok = idx.updates[(-1, 1)]["shot"]
+            self.assertFalse(new_tok.startswith(("!", "?")))                           # 失敗記號換成成功的截圖連結
+            self.assertNotEqual(new_tok, old)
+            self.assertTrue(notice.deleted)                                            # 舊通知刪掉
+            self.assertEqual(arrows, [MIRROR])                                         # 鏡像補小箭頭
+            self.assertIn("https://a.example/x", sent[0][1])
+        asyncio.run(go())
+
+    def test_retry_notice_failure_updates_reason_and_network_down_is_reported(self):
+        async def go():
+            edits = []
+            notice = N(jump_url="https://discord.com/channels/1/5/9",
+                       content=f"📸 無法截圖｜t｜<https://a.example/x>\n-# 原因：逾時\n[↗ 跳到鏡像](<{MIRROR}>)")
+
+            async def edit(content):
+                edits.append(content)
+            notice.edit = edit
+            idx = Index([rec(1, "https://a.example/x", shot="!https://discord.com/channels/1/5/9")])
+            w = ShotWorker(N(ch_screenshot=5), Posts("x"), idx, {})
+
+            async def fail(url, tries=1):
+                return None, "網域不存在（DNS 查不到）"
+            with mock.patch.object(screenshot, "try_capture", fail):
+                text = await w.retry_notice(notice)
+            self.assertTrue(text.startswith("❌") and "網域不存在" in text)
+            self.assertIn("-# 原因：網域不存在（DNS 查不到）", edits[0])
+            self.assertEqual(idx.updates, {})                                          # 失敗：紀錄不動
+
+            async def down(url, tries=1):
+                raise screenshot.NetworkDown("x")
+            with mock.patch.object(screenshot, "try_capture", down):
+                self.assertIn("網路", await w.retry_notice(notice))
+            self.assertEqual(await w.retry_notice(N(content="隨便")), "這不是截圖失敗通知，沒辦法重試")
+        asyncio.run(go())
+
     def test_parse_token(self):
         self.assertEqual(shotworker.parse_token("-"), ("skip", 0, ""))
         self.assertEqual(shotworker.parse_token("!https://x/1/2/3"), ("fail", shotworker.RETRY_MAX, "https://x/1/2/3"))

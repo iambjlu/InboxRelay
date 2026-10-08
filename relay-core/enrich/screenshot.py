@@ -164,11 +164,8 @@ async def network_ok(host: str = "www.google.com", timeout: float = 6) -> bool:
         return False
 
 
-async def post_one(dc, channel_id: int, url: str, when: str, back_url: str,
-                   back_label: str = "鏡像", tries: int = 1) -> tuple[str, bool, str]:
-    """截一個網址並發到連結預覽頻道；拍不到就改發一則「📸 無法截圖」通知（含原因）。
-    回傳 (貼文連結, 是否成功, 失敗原因)。失敗不在這裡反覆重試（交給車道之後排程重試）；
-    失敗時若 google.com 也連不上 → 是網路中斷，丟 NetworkDown（不發通知）。圖只在記憶體裡。"""
+async def try_capture(url: str, tries: int = 1) -> tuple[bytes | None, str]:
+    """（DNS 檢查 →）截圖，回傳 (圖, 原因)。失敗且不是永久原因時，連 google.com 都連不上 → 丟 NetworkDown（網路中斷）。"""
     png, why = None, ""
     if not await _host_resolves(url):
         why = "網域不存在（DNS 查不到）"
@@ -181,11 +178,21 @@ async def post_one(dc, channel_id: int, url: str, when: str, back_url: str,
                 await asyncio.sleep(3)
     if not png and not is_permanent(why) and not await network_ok():
         raise NetworkDown(why or "網路中斷")
+    return png, why
+
+
+async def post_one(dc, channel_id: int, url: str, when: str, back_url: str,
+                   back_label: str = "鏡像", tries: int = 1) -> tuple[str, bool, str]:
+    """截一個網址並發到連結預覽頻道；拍不到就改發一則「📸 無法截圖」通知（含原因、「重試截圖」按鈕）。
+    回傳 (貼文連結, 是否成功, 失敗原因)。失敗不在這裡反覆重試（交給車道之後排程重試）；
+    失敗時若 google.com 也連不上 → 是網路中斷，丟 NetworkDown（不發通知）。圖只在記憶體裡。"""
+    from enrich.shotbutton import RetryView
+    png, why = await try_capture(url, tries)
     back = f"[↗ 跳到{back_label}](<{back_url}>)"
     if png:
         note = f"\n{CERT_WARN}" if why == CERT_WARN else ""
         msg = await dc.send_file(channel_id, f"📸 {when}｜{url}{note}\n{back}", "preview.jpg", png)
         png = None
         return msg.jump_url, True, ""
-    msg = await dc.send(channel_id, f"📸 無法截圖｜{when}｜<{url}>\n-# 原因：{why or '未知'}\n{back}")
+    msg = await dc.send(channel_id, f"📸 無法截圖｜{when}｜<{url}>\n-# 原因：{why or '未知'}\n{back}", view=RetryView())
     return msg.jump_url, False, why or "未知"
