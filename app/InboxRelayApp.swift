@@ -27,7 +27,7 @@ struct InboxRelayApp: App {
         MenuBarExtra {
             MenuContent(core: core)
         } label: {
-            Image(systemName: menuIcon)
+            MenuIcon(name: menuIcon)
         }
         .menuBarExtraStyle(.window)
 
@@ -56,6 +56,31 @@ struct InboxRelayApp: App {
             return core.status.tasks.isEmpty ? "tray.full" : "tray.and.arrow.down"
         }
     }
+}
+
+/// 選單列圖示。App 一啟動它就會被建立，所以順便在這裡依「App 開啟時顯示主視窗」設定（預設開）打開主視窗，只做一次。
+struct MenuIcon: View {
+    let name: String
+    @Environment(\.openWindow) private var openWindow
+    @AppStorage(AppPrefs.showMainWindowKey) private var showMainWindow = true
+    @State private var handled = false
+
+    var body: some View {
+        Image(systemName: name)
+            .task {
+                guard !handled else { return }
+                handled = true
+                if showMainWindow {
+                    openWindow(id: "main")
+                    NSApp.activate(ignoringOtherApps: true)
+                }
+            }
+    }
+}
+
+/// 每台電腦各自的 App 介面偏好（存在 UserDefaults，不隨設定資料夾同步）。
+enum AppPrefs {
+    static let showMainWindowKey = "showMainWindowOnLaunch"
 }
 
 enum LoginItem {

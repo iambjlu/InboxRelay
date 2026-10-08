@@ -342,6 +342,7 @@ struct SettingsView: View {
     @ObservedObject var core: CoreController
     @ObservedObject var settings: SettingsStore
     @State private var loginItem = LoginItem.enabled
+    @AppStorage(AppPrefs.showMainWindowKey) private var showMainWindow = true
     @State private var message = ""
     @State private var revealed: Set<String> = []     // 目前顯示明碼的欄位（關掉視窗就恢復隱藏）
 
@@ -373,6 +374,8 @@ struct SettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section("一般") {
+                Toggle("App 開啟時顯示主視窗", isOn: $showMainWindow)
+                    .help("關閉的話，App 開啟後只會出現在選單列，要從選單列的「主視窗」才打開")
                 Toggle("登入時自動啟動 InboxRelay", isOn: $loginItem)
                     .onChange(of: loginItem) { _, on in
                         if let err = LoginItem.set(on) {
