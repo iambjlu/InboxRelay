@@ -18,17 +18,17 @@ class Item:
     url: str           # 出處（鏡像訊息連結）
 
 
-def build_material(items: list[Item], per_item: int | None = None) -> str:
+def build_material(items: list[Item], per_item: int | None = None, max_chars: int = MAX_MATERIAL_CHARS) -> str:
     """per_item=None 時自動分配：則數少就每則給多一點字（最多 2000），則數多就壓到 400。"""
     if per_item is None:
-        per_item = max(MAX_ITEM_CHARS, min(2000, MAX_MATERIAL_CHARS // max(len(items), 1)))
+        per_item = max(MAX_ITEM_CHARS, min(2000, max_chars // max(len(items), 1)))
     lines, total = [], 0
     for i, it in enumerate(items, 1):
         t = " ".join(it.text.split())
         if len(t) > per_item:
             t = t[:per_item] + "…"
         line = f"[{i}] {it.time}｜{it.kind}｜{t}"
-        if total + len(line) > MAX_MATERIAL_CHARS:
+        if total + len(line) > max_chars:
             lines.append(f"（其餘 {len(items) - i + 1} 則因長度省略）")
             break
         lines.append(line)

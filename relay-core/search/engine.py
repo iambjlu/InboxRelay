@@ -21,7 +21,16 @@ WEEKDAYS = "一二三四五六日"
 TYPE_ICON = {"analysis": "🤖 AI 分析", "text": "💬 文字", "image": "🖼️ 圖片", "album": "🖼️ 相簿", "file": "📄 檔案", "link": "🔗 連結",
              "voice": "🎤 語音", "video": "🎬 影片", "sticker": "😀 貼圖", "daily": "📰 每日總結",
              "invoice": "🧾 消費"}
-MAX_CANDIDATES = 120
+MAX_CANDIDATES = 150
+MAX_MATERIAL = 50_000          # 給模型的候選材料字數上限（context 131k tokens 放得下）
+# 問「一類東西」時，程式自己補上這一類常見的說法（光靠模型給的幾個詞，只寫店名或餐點的紀錄會漏掉）
+CATEGORY_TERMS = [
+    (("吃", "餐", "食", "飯", "麵", "菜單", "美食", "飲料", "喝", "咖啡", "便當", "外送", "外帶", "宵夜", "小吃"),
+     ["吃", "餐", "飯", "麵", "便當", "菜單", "餐廳", "小吃", "火鍋", "咖啡", "飲料", "早餐", "午餐", "晚餐", "宵夜",
+      "外送", "外帶", "美食", "鍋", "燒肉", "拉麵", "丼", "漢堡", "披薩", "壽司", "牛排", "甜點", "手搖", "茶", "雞", "豬", "牛"]),
+]
+_TIME_HINT = re.compile(r"\d{1,4}\s*[/\-年月日號週周天]|今天|昨天|前天|明天|上週|上周|本週|這週|這周|上個月|這個月|本月|去年|今年|前年|最近|剛剛|早上|昨晚|今晚|"
+                        r"上次|週[一二三四五六日]|星期|禮拜|[一二三四五六七八九十]月|春天|夏天|秋天|冬天|寒假|暑假")
 
 
 @dataclass
@@ -47,7 +56,7 @@ def parse_query(out: str, fallback: str) -> Query:
     if m:
         try:
             d = json.loads(m.group(0))
-            terms = [str(t).strip() for t in d.get("terms", []) if str(t).strip()][:12]
+            terms = [str(t).strip() for t in d.get("terms", []) if str(t).strip()][:20]
             f, t = str(d.get("from") or ""), str(d.get("to") or "")
             ok = re.compile(r"^\d{4}-\d{2}-\d{2}$")
             return Query(f if ok.match(f) else "", t if ok.match(t) else "", terms or [fallback],
@@ -55,6 +64,20 @@ def parse_query(out: str, fallback: str) -> Query:
         except (json.JSONDecodeError, AttributeError):
             pass
     return Query(terms=[fallback])
+
+
+def has_time_hint(question: str) -> bool:
+    return bool(_TIME_HINT.search(question or ""))
+
+
+def expand_terms(question: str, terms: list[str]) -> list[str]:
+    """問題或搜尋詞屬於某一類（例如吃的）→ 補上這一類的常見詞（不重複，最多 45 個）。"""
+    out = list(terms)
+    blob = question + " " + " ".join(terms)
+    for triggers, extra in CATEGORY_TERMS:
+        if any(t in blob for t in triggers):
+            out += [t for t in extra if t not in out]
+    return out[:45]
 
 
 def _excerpt(rec, terms: list[str]) -> str:
@@ -172,14 +195,22 @@ async def search(llm, question: str, source, tz_now: datetime,
     out = await llm.chat(prompts.render("SEARCH_PARSE", today=today, weekday=weekday), question,
                          max_tokens=300)
     q = parse_query(out, question)
+    if not has_time_hint(question):                 # 使用者沒提時間：模型自己編的日期範圍一律不用（會把更早的紀錄擋掉）
+        q.date_from = q.date_to = ""
+    q.terms = expand_terms(question, q.terms)
     cands = await source(q)
     if not cands:
         rng = f"（{q.date_from}～{q.date_to}）" if q.date_from or q.date_to else ""
         return f"找不到相關的訊息 🤔{rng}", q, 0
     items = [daily.Item(c.date[5:], TYPE_ICON.get(c.type, c.type), c.text, c.url) for c in cands]
-    material = daily.build_material(items)
-    ans = await llm.chat(prompts.render("SEARCH_ANSWER", question=question), material,
-                         max_tokens=4000 if thinking else 800, thinking=thinking)
+    material = daily.build_material(items, per_item=max(250, min(2000, MAX_MATERIAL // len(items))),
+                                    max_chars=MAX_MATERIAL)
+    prompt = prompts.render("SEARCH_ANSWER", question=question)
+    ans = await llm.chat(prompt, material, max_tokens=8000 if thinking else 1500, thinking=thinking)
+    if not ans.strip() and thinking:                # 思考到被截斷、沒有答案：關掉思考再問一次
+        ans = await llm.chat(prompt, material, max_tokens=1500, thinking=False)
+    if not ans.strip():
+        return "模型這次沒有完整回答（可能是思考太久被截斷），請再問一次 🙏", q, len(cands)
     answer, picks = parse_answer(ans, len(cands))
     reply = format_reply(answer, cands, picks)
     return reply or "找不到相關的訊息 🤔", q, len(cands)

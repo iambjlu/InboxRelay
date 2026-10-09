@@ -123,6 +123,7 @@ Formatting: Discord has no Markdown tables, so every model call carries `prompts
 - `chat_messages(messages, max_tokens, thinking, temperature, progress=None)` → (text, usage) for multi-turn chat; `progress(n_tokens)` enables streaming.
 - `ping()` → model ids. `memory`, `memory_version` set by MemoryStore.
 - `test_connection(base_url, model, api_key)` → `{ok, message, ms}`: standalone client (timeout 20 s, no retry) for the settings-page test; only calls `GET /models` (HTTP 200 = endpoint and key OK; model name missing from the list → not ok); never generates text; maps 401/connection/status errors to readable messages. Does not touch the running `LLM`.
+- `strip_reasoning(text)`: applied to every `chat`/`chat_messages` result — removes `<think>…</think>`, keeps what follows a lone `</think>`, and returns `""` when the reasoning was cut off (only `<think>`, or a body starting with `Here's a thinking process` / `Thinking Process` / `思考過程`) so reasoning is never shown as an answer; callers treat `""` as "no answer".
 - `is_offline_error(e)`: openai.APIConnectionError / InternalServerError / NotFoundError, httpx.ConnectError / TimeoutException, ConnectionError → treat as "LLM offline" (keep work).
 
 ### prompts.py
@@ -219,7 +220,7 @@ Enabled when `INBOXRELAY_IPC=1`. JSON lines; logs go to stderr.
 - daily: `Item(time, type_label, text, mirror)`, `build_material`, `build_prompt`, `link_citations` (`[↗n](<url>)`), `split_message`.
 
 ### search/engine.py / search/channel.py
-- engine: `parse_query` (LLM SEARCH_PARSE → date range + terms) → `collect`/`select` candidates from KwIndex (excerpt, filename, kw, gist, ocr window) + DAILY summaries (≤ `MAX_CANDIDATES=120`) → SEARCH_ANSWER → `format_reply` (dates, no message ids).
+- engine: `parse_query` (LLM SEARCH_PARSE → date range + ≤20 terms) → the date range is discarded when the question has no time wording (`has_time_hint`) and `expand_terms` adds the common words of the category (e.g. food: 吃/餐/飯/麵/便當/火鍋…, from `CATEGORY_TERMS`, ≤45 terms) → `collect`/`select` candidates from KwIndex (excerpt, filename, kw, gist, ocr window) + DAILY summaries (≤ `MAX_CANDIDATES=150`; all of them when fewer, otherwise the highest term scores) → material capped at `MAX_MATERIAL=50,000` chars (`daily.build_material(per_item, max_chars)`) → SEARCH_ANSWER (thinking mode: `max_tokens` 8000; an empty answer — e.g. thinking cut off — is retried once with thinking off, then a friendly message) → `format_reply` (dates, no message ids).
 - channel: `SearchChannel` (#搜尋 live when SEARCH_LIVE; 搜尋測試 searches AI-test content); follow-ups via reply chain (`MAX_TURNS=3`, `TURN_CHARS=600`), SEARCH_FOLLOWUP routes general vs search.
 
 ### chat.py

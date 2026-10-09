@@ -15,6 +15,21 @@ from mdtable import tables_to_bullets
 log = logging.getLogger("llm")
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.S)
+# 模型把思考直接寫在正文裡（沒有 <think> 標籤）時的開頭
+_LEAK_RE = re.compile(r"^\s*(Here'?s a thinking process|Here is a thinking process|Thinking Process|Thinking process|思考過程)", re.I)
+
+
+def strip_reasoning(text: str) -> str:
+    """去掉模型的思考內容，只留最終答案。
+    - <think>…</think> 整段拿掉；只有結尾 </think>（開頭標籤被樣板吃掉）就取它後面；
+    - 思考寫到一半就被 max_tokens 截斷（只有 <think> 沒有結尾，或正文是以「Here's a thinking process」開頭的思考）＝根本沒有答案 → 回傳空字串，
+      由呼叫端決定要重試還是回報，絕不把思考過程當答案貼出去。"""
+    text = _THINK_RE.sub("", text or "")
+    if "</think>" in text:
+        text = text.split("</think>", 1)[1]
+    elif "<think>" in text or _LEAK_RE.match(text):
+        return ""
+    return text.strip()
 
 
 def is_offline_error(e: BaseException) -> bool:
@@ -109,7 +124,7 @@ class LLM:
                 text = resp.choices[0].message.content or ""
             else:
                 text = await self._stream(kwargs, task, max_tokens)
-        return tables_to_bullets(_THINK_RE.sub("", text).strip())
+        return tables_to_bullets(strip_reasoning(text))
 
     async def chat_messages(self, messages: list[dict], max_tokens: int = 4000, thinking: bool = False,
                             temperature: float = 0.6, progress=None) -> tuple[str, dict]:
@@ -132,20 +147,14 @@ class LLM:
                             parts.append(chunk.choices[0].delta.content)
                             n += 1
                             progress(n)
-                    text = _THINK_RE.sub("", "".join(parts))
-                    if "</think>" in text:
-                        text = text.split("</think>", 1)[1]
-                    return tables_to_bullets(text.strip()), {}
+                    return tables_to_bullets(strip_reasoning("".join(parts))), {}
                 resp = await self.client.chat.completions.create(
                     model=self.model, messages=messages, max_tokens=max_tokens, temperature=temperature,
                     extra_body={"chat_template_kwargs": {"enable_thinking": thinking}})
         finally:
             if not acquired:                       # 等鎖時被取消／出錯：把等待數還回去
                 self._interactive_waiting -= 1
-        text = resp.choices[0].message.content or ""
-        text = _THINK_RE.sub("", text)
-        if "</think>" in text:                     # 沒有開頭標籤的思考內容
-            text = text.split("</think>", 1)[1]
+        text = strip_reasoning(resp.choices[0].message.content or "")
         usage = {}
         u = getattr(resp, "usage", None)
         if u is not None:
@@ -153,7 +162,7 @@ class LLM:
                 v = getattr(u, k, None)
                 if isinstance(v, int):
                     usage[k] = v
-        return tables_to_bullets(text.strip()), usage
+        return tables_to_bullets(text), usage
 
     async def _stream(self, kwargs: dict, task, max_tokens: int) -> str:
         """串流接收，邊收邊回報進度（已產生的 token ÷ 這類呼叫平均長度）。"""
