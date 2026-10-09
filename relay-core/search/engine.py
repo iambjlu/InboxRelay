@@ -206,9 +206,9 @@ async def search(llm, question: str, source, tz_now: datetime,
     material = daily.build_material(items, per_item=max(250, min(2000, MAX_MATERIAL // len(items))),
                                     max_chars=MAX_MATERIAL)
     prompt = prompts.render("SEARCH_ANSWER", question=question)
-    ans = await llm.chat(prompt, material, max_tokens=8000 if thinking else 1500, thinking=thinking)
+    ans = await llm.chat(prompt, material, max_tokens=8000 if thinking else 2500, thinking=thinking)
     if not ans.strip() and thinking:                # 思考到被截斷、沒有答案：關掉思考再問一次
-        ans = await llm.chat(prompt, material, max_tokens=1500, thinking=False)
+        ans = await llm.chat(prompt, material, max_tokens=2500, thinking=False)
     if not ans.strip():
         return "模型這次沒有完整回答（可能是思考太久被截斷），請再問一次 🙏", q, len(cands)
     answer, picks = parse_answer(ans, len(cands))
