@@ -54,6 +54,20 @@ class RankTest(unittest.TestCase):
         self.assertIn("一個答案", r.reply)
         self.assertTrue(all(c.score <= min(x.score for x in engine.page(engine.rank(cs, Query()), 0)) for c in r.rest))
 
+    def test_material_has_full_date_and_prompt_asks_for_year(self):
+        import prompts
+        seen = {}
+
+        class LLM:
+            async def chat(self, prompt, data=None, **k):
+                seen["data"] = data
+                return strip_reasoning("- 答案 [1]\n相關：1")
+        c = Candidate("2026-01-19 12:34", "image", "內容", "節錄", "https://discord.com/channels/1/2/3", 1.0)
+        asyncio.run(engine.answer_page(LLM(), "吃", [c]))
+        self.assertIn("[1] 2026-01-19 12:34｜", seen["data"])                           # 材料給完整日期（含年份）
+        self.assertIn("年-月-日", prompts.get("SEARCH_ANSWER"))
+        self.assertIn("2026-01-19", prompts.get("SEARCH_ANSWER"))
+
 
 class MoreButtonTest(unittest.TestCase):
     def test_custom_id_roundtrip(self):

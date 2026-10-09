@@ -208,7 +208,7 @@ class SearchResult:
 
 async def answer_page(llm, question: str, batch: list[Candidate], thinking: bool = False) -> str:
     """把一批候選（已依時間排序）交給模型回答；沒有答案（例如思考被截斷）會關掉思考重試一次。"""
-    items = [daily.Item(c.date[5:], TYPE_ICON.get(c.type, c.type), c.text, c.url) for c in batch]
+    items = [daily.Item(c.date[:16], TYPE_ICON.get(c.type, c.type), c.text, c.url) for c in batch]      # 完整的 YYYY-MM-DD HH:MM（模型條列時才寫得出年份）
     material = daily.build_material(items, per_item=max(250, min(2000, MAX_MATERIAL // len(items))),
                                     max_chars=MAX_MATERIAL)
     prompt = prompts.render("SEARCH_ANSWER", question=question)
