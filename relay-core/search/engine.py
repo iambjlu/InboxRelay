@@ -39,6 +39,7 @@ class Query:
     date_to: str = ""
     terms: list[str] = field(default_factory=list)
     want: str = ""
+    core: list[str] = field(default_factory=list)      # 使用者／模型原本的搜尋詞（命中的權重比程式補的類別詞高）
 
 
 @dataclass
@@ -114,26 +115,35 @@ def ocr_window(o: str, terms: list[str], n: int = 600) -> str:
     return ("…" if start else "") + o[start:start + n] + ("…" if start + n < len(o) else "")
 
 
-def score_text(text: str, terms: list[str]) -> float:
+def score_text(text: str, terms: list[str], core: list[str] | tuple = ()) -> float:
+    """每個搜尋詞命中算一次（重複出現再加一點）；原本的搜尋詞（core）權重 2，程式補的類別詞權重 1。"""
     low = text.lower()
-    return sum(1.0 + 0.2 * (low.count(t.lower()) - 1) for t in terms if t and t.lower() in low)
+    total = 0.0
+    for t in terms:
+        if t and t.lower() in low:
+            total += (2.0 if t in core else 1.0) * (1.0 + 0.2 * (low.count(t.lower()) - 1))
+    return total
 
 
 def in_range(day: str, q: Query) -> bool:
     return (not q.date_from or day >= q.date_from) and (not q.date_to or day <= q.date_to)
 
 
-def select(cands: list[Candidate], q: Query) -> list[Candidate]:
-    """候選不多（≤120）就全部交給模型判斷（同義、隱含的說法也找得到）；太多才用搜尋詞分數篩。"""
+def rank(cands: list[Candidate], q: Query) -> list[Candidate]:
+    """日期範圍內的候選，依關聯度（分數）由高到低排；同分的日期早的在前。
+    候選不多（≤ 一批）時全部保留（模型看得懂同義、隱含的說法）；太多時只留有命中搜尋詞的。"""
     cands = [c for c in cands if in_range(c.date[:10], q)]
-    if len(cands) <= MAX_CANDIDATES:
-        pool = list(cands)
-    else:
-        pool = [c for c in cands if c.score > 0]
-        pool.sort(key=lambda c: (-c.score, c.date))
-        pool = pool[:MAX_CANDIDATES]
-    pool.sort(key=lambda c: c.date)        # 給模型時依時間排序，比較好理解
-    return pool
+    if len(cands) > MAX_CANDIDATES:
+        cands = [c for c in cands if c.score > 0]
+    return sorted(cands, key=lambda c: (-c.score, c.date))
+
+
+def page(ranked: list[Candidate], start: int = 0, size: int = MAX_CANDIDATES) -> list[Candidate]:
+    """關聯度排名第 start+1 名起的一批；給模型時依時間排序，比較好理解。"""
+    return sorted(ranked[start:start + size], key=lambda c: c.date)
+
+
+select = rank
 
 
 def collect(index_entries, recaps: dict[str, tuple[str, str]], q: Query) -> list[Candidate]:
@@ -150,10 +160,10 @@ def collect(index_entries, recaps: dict[str, tuple[str, str]], q: Query) -> list
         full = "｜".join(x for x in base + [o and f"圖中文字：{o}"] if x)
         text = "｜".join(x for x in base + [o and f"圖中文字：{ocr_window(o, q.terms)}"] if x)
         cands.append(Candidate(r.date, r.type, text or "（無文字）", _excerpt(r, q.terms), r.mirror,
-                               score_text(full, q.terms)))
+                               score_text(full, q.terms, q.core)))
     for day, (body, url) in recaps.items():
-        cands.append(Candidate(day, "daily", body[:600], "每日總結", url, score_text(body, q.terms) * 0.8))
-    return select(cands, q)
+        cands.append(Candidate(day, "daily", body[:600], "每日總結", url, score_text(body, q.terms, q.core) * 0.8))
+    return rank(cands, q)
 
 
 def parse_answer(out: str, n: int) -> tuple[str, list[int]]:
@@ -187,22 +197,18 @@ def format_reply(answer: str, cands: list[Candidate], picks: list[int]) -> str:
     return "\n".join(lines).strip()
 
 
-async def search(llm, question: str, source, tz_now: datetime,
-                 thinking: bool = False) -> tuple[str, Query, int]:
-    """source(q) → 候選清單（async）。回傳 (回覆文字, 解析結果, 候選數)。"""
-    today = tz_now.strftime("%Y-%m-%d")
-    weekday = "星期" + WEEKDAYS[tz_now.weekday()]
-    out = await llm.chat(prompts.render("SEARCH_PARSE", today=today, weekday=weekday), question,
-                         max_tokens=300)
-    q = parse_query(out, question)
-    if not has_time_hint(question):                 # 使用者沒提時間：模型自己編的日期範圍一律不用（會把更早的紀錄擋掉）
-        q.date_from = q.date_to = ""
-    q.terms = expand_terms(question, q.terms)
-    cands = await source(q)
-    if not cands:
-        rng = f"（{q.date_from}～{q.date_to}）" if q.date_from or q.date_to else ""
-        return f"找不到相關的訊息 🤔{rng}", q, 0
-    items = [daily.Item(c.date[5:], TYPE_ICON.get(c.type, c.type), c.text, c.url) for c in cands]
+@dataclass
+class SearchResult:
+    reply: str
+    query: Query
+    total: int                    # 命中的候選總數（已依關聯度排序）
+    shown: int                    # 這次交給模型的筆數
+    rest: list[Candidate] = field(default_factory=list)      # 還沒看的（關聯度較低的），給「顯示更多」用
+
+
+async def answer_page(llm, question: str, batch: list[Candidate], thinking: bool = False) -> str:
+    """把一批候選（已依時間排序）交給模型回答；沒有答案（例如思考被截斷）會關掉思考重試一次。"""
+    items = [daily.Item(c.date[5:], TYPE_ICON.get(c.type, c.type), c.text, c.url) for c in batch]
     material = daily.build_material(items, per_item=max(250, min(2000, MAX_MATERIAL // len(items))),
                                     max_chars=MAX_MATERIAL)
     prompt = prompts.render("SEARCH_ANSWER", question=question)
@@ -210,7 +216,33 @@ async def search(llm, question: str, source, tz_now: datetime,
     if not ans.strip() and thinking:                # 思考到被截斷、沒有答案：關掉思考再問一次
         ans = await llm.chat(prompt, material, max_tokens=2500, thinking=False)
     if not ans.strip():
-        return "模型這次沒有完整回答（可能是思考太久被截斷），請再問一次 🙏", q, len(cands)
-    answer, picks = parse_answer(ans, len(cands))
-    reply = format_reply(answer, cands, picks)
-    return reply or "找不到相關的訊息 🤔", q, len(cands)
+        return "模型這次沒有完整回答（可能是思考太久被截斷），請再問一次 🙏"
+    answer, picks = parse_answer(ans, len(batch))
+    return format_reply(answer, batch, picks) or "找不到相關的訊息 🤔"
+
+
+async def search_ranked(llm, question: str, source, tz_now: datetime, thinking: bool = False) -> SearchResult:
+    """source(q) → 依關聯度排好的候選清單（async）。先看最相關的一批，其餘放在 rest（「顯示更多」再處理）。"""
+    today = tz_now.strftime("%Y-%m-%d")
+    weekday = "星期" + WEEKDAYS[tz_now.weekday()]
+    out = await llm.chat(prompts.render("SEARCH_PARSE", today=today, weekday=weekday), question,
+                         max_tokens=300)
+    q = parse_query(out, question)
+    if not has_time_hint(question):                 # 使用者沒提時間：模型自己編的日期範圍一律不用（會把更早的紀錄擋掉）
+        q.date_from = q.date_to = ""
+    q.core = list(q.terms)
+    q.terms = expand_terms(question, q.terms)
+    ranked = await source(q)
+    if not ranked:
+        rng = f"（{q.date_from}～{q.date_to}）" if q.date_from or q.date_to else ""
+        return SearchResult(f"找不到相關的訊息 🤔{rng}", q, 0, 0)
+    batch = page(ranked, 0)
+    reply = await answer_page(llm, question, batch, thinking)
+    return SearchResult(reply, q, len(ranked), len(batch), ranked[len(batch):])
+
+
+async def search(llm, question: str, source, tz_now: datetime,
+                 thinking: bool = False) -> tuple[str, Query, int]:
+    """（相容用）回傳 (回覆文字, 解析結果, 命中的候選總數)。"""
+    r = await search_ranked(llm, question, source, tz_now, thinking)
+    return r.reply, r.query, r.total

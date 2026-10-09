@@ -23,7 +23,11 @@ import formatting
 import activity
 import prompts
 from recap import daily
-from search.engine import WEEKDAYS, Candidate, Query, collect, score_text, search, select
+from collections import OrderedDict
+from dataclasses import dataclass, field
+
+from search.engine import (MAX_CANDIDATES, WEEKDAYS, Candidate, Query, answer_page, collect, page, score_text,
+                           search_ranked, select)
 
 MAX_TURNS = 3          # 追問最多往回看幾輪（一問一答算一輪）
 TURN_CHARS = 600       # 每段對話截短到幾字
@@ -50,6 +54,48 @@ def parse_followup(out: str, fallback: str) -> tuple[str, str]:
 
 log = logging.getLogger("search")
 
+MORE_PREFIX = "inboxrelay:search_more:"
+MORE_KEEP = 40          # 記憶體裡最多留幾次搜尋的「還沒看的候選」（只留最近的）
+_MORE_HANDLER = [None]  # SearchChannel.on_more（按鈕是持久的，處理函式由頻道物件註冊）
+
+
+class MoreButton(discord.ui.DynamicItem[discord.ui.Button], template=MORE_PREFIX + r"(?P<token>[0-9a-f]{8})"):
+    """「顯示更多」按鈕：custom_id 帶一個短代碼，對應記憶體裡這次搜尋還沒看的候選。App 重開後按鈕還在，但資料沒了會提示重新問。"""
+
+    def __init__(self, token: str, label: str = "顯示更多") -> None:
+        super().__init__(discord.ui.Button(label=label, emoji="➕", style=discord.ButtonStyle.secondary,
+                                           custom_id=MORE_PREFIX + token))
+        self.token = token
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Item, match: re.Match):
+        return cls(match["token"])
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        h = _MORE_HANDLER[0]
+        if h is None:
+            await interaction.response.send_message("還沒準備好，請稍後再按", ephemeral=True)
+            return
+        await h(interaction, self.token)
+
+
+@dataclass
+class MoreState:
+    question: str
+    query: Query
+    rest: list = field(default_factory=list)      # 還沒看的候選（已依關聯度排序）
+    offset: int = 0                               # 已經看了幾筆（＝下一批的名次起點）
+    total: int = 0
+    where: str = ""
+    thinking: bool = False
+    busy: bool = False
+
+
+def more_view(token: str, remaining: int) -> discord.ui.View:
+    v = discord.ui.View(timeout=None)
+    v.add_item(MoreButton(token, f"顯示更多（還有 {remaining:,} 則，每次 {MAX_CANDIDATES} 則）"))
+    return v
+
 
 class SearchChannel:
     def __init__(self, cfg, dc, llm, index, recap_channel, live_ids: set[int],
@@ -63,6 +109,12 @@ class SearchChannel:
         self.test_ids = test_ids
         self.aitest = aitest        # aitest.AiTestChannel（取分析快取）
         dc.add_message_handler(self.on_message)
+        self._more: "OrderedDict[str, MoreState]" = OrderedDict()
+        _MORE_HANDLER[0] = self.on_more
+        try:
+            dc.client.add_dynamic_items(MoreButton)         # 「顯示更多」按鈕（持久；App 重開後仍能收到點擊）
+        except Exception:
+            log.warning("註冊「顯示更多」按鈕失敗", exc_info=True)
 
     # ------------------------------------------------------------ 資料來源
     def _recaps(self) -> dict[str, tuple[str, str]]:
@@ -116,11 +168,66 @@ class SearchChannel:
             cands.append(Candidate(when, kind, text[:3000], ex, m.jump_url, score_text(text, q.terms)))
         return select(cands, q)
 
-    async def _send(self, m: discord.Message, text: str) -> None:
+    async def _send(self, m: discord.Message, text: str, view: discord.ui.View | None = None) -> discord.Message:
+        """回覆並依長度拆成多則；view（按鈕）附在最後一則。回傳最後一則。"""
         chunks = daily.split_message(text)
-        await m.reply(chunks[0], mention_author=False, suppress_embeds=True)
-        for c in chunks[1:]:
-            await m.channel.send(c, suppress_embeds=True)
+        last = None
+        for i, c in enumerate(chunks):
+            v = view if i == len(chunks) - 1 else None
+            kw = {"view": v} if v is not None else {}
+            if i == 0:
+                last = await m.reply(c, mention_author=False, suppress_embeds=True, **kw)
+            else:
+                last = await m.channel.send(c, suppress_embeds=True, **kw)
+        return last
+
+    def _remember_more(self, st: MoreState) -> str:
+        import secrets
+        token = secrets.token_hex(4)
+        self._more[token] = st
+        while len(self._more) > MORE_KEEP:
+            self._more.popitem(last=False)
+        return token
+
+    async def on_more(self, interaction: discord.Interaction, token: str) -> None:
+        """按了「顯示更多」：把下一批（關聯度排名接下來的 MAX_CANDIDATES 則）交給模型，結果貼成新的一則回覆。"""
+        st = self._more.get(token)
+        if st is None:
+            await interaction.response.send_message("這次搜尋的資料已經不在了（App 重開過或太久以前），請再問一次", ephemeral=True)
+            return
+        if st.busy:
+            await interaction.response.send_message("正在整理上一批，請稍等", ephemeral=True)
+            return
+        st.busy = True
+        await interaction.response.defer()
+        task = activity.start(f"搜尋（更多）：{st.question[:20]}", background=False)
+        try:
+            batch = page(st.rest, 0)
+            lo, hi = st.offset + 1, st.offset + len(batch)
+            reply = await answer_page(self.llm, st.question, batch, st.thinking)
+            st.rest = st.rest[len(batch):]
+            st.offset = hi
+            footer = f"\n-# 搜尋：{st.where}｜關聯度第 {lo:,}～{hi:,} 名（共命中 {st.total:,} 則）｜搜尋詞：{'、'.join(st.query.terms[:8])}"
+            view = None
+            if st.rest:
+                view = more_view(token, len(st.rest))
+            else:
+                footer += "｜已經是最後一批"
+            msg = interaction.message
+            try:
+                await msg.edit(view=None)                     # 這顆按鈕用掉了（下一批的按鈕在新的回覆上）
+            except discord.HTTPException:
+                pass
+            await self._send(msg, reply + footer, view)
+            if not st.rest:
+                self._more.pop(token, None)
+            log.info("搜尋「%s」顯示更多：第 %d～%d 名", st.question[:30], lo, hi)
+        except Exception as e:
+            log.exception("顯示更多失敗")
+            await interaction.followup.send(f"⚠️ 失敗：{type(e).__name__}: {str(e)[:150]}", ephemeral=True)
+        finally:
+            st.busy = False
+            activity.finish(task)
 
     # ------------------------------------------------------------ 處理
     async def on_message(self, m: discord.Message) -> None:
@@ -176,13 +283,19 @@ class SearchChannel:
                         return
                     q = query      # 補完整後重新搜尋
                 source = self._test_source if test else self._live_source
-                reply, parsed, n = await search(self.llm, q, source, now,
-                                                thinking=getattr(self.cfg, "search_thinking", False))
+                thinking = getattr(self.cfg, "search_thinking", False)
+                res = await search_ranked(self.llm, q, source, now, thinking=thinking)
+            parsed, n = res.query, res.total
             rng = f"{parsed.date_from or '最早'}～{parsed.date_to or '最新'}" if parsed.date_from or parsed.date_to else "全部時間"
             follow = f"｜追問改寫：{q}" if turns else ""
-            footer = f"\n-# 搜尋：{where}｜範圍：{rng}｜搜尋詞：{'、'.join(parsed.terms[:8])}｜候選 {n} 則{follow}"
-            await self._send(m, reply + footer)
-            log.info("搜尋（%s）「%s」→ 候選 %d 則", where, q, n)
+            shown = f"，先看關聯度最高的 {res.shown} 則" if res.rest else ""
+            footer = f"\n-# 搜尋：{where}｜範圍：{rng}｜搜尋詞：{'、'.join(parsed.terms[:8])}｜命中 {n} 則{shown}{follow}"
+            view = None
+            if res.rest:
+                token = self._remember_more(MoreState(q, parsed, res.rest, res.shown, n, where, thinking))
+                view = more_view(token, len(res.rest))
+            await self._send(m, res.reply + footer, view)
+            log.info("搜尋（%s）「%s」→ 命中 %d 則（先看 %d 則）", where, q, n, res.shown)
         except Exception as e:
             log.exception("搜尋失敗")
             await m.reply(f"⚠️ 搜尋失敗：{type(e).__name__}: {str(e)[:200]}", mention_author=False)
