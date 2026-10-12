@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 
@@ -26,22 +27,46 @@ Key = tuple
 
 
 class _Gap:
-    """編輯間隔會自動調整：discord.http 回報被限流（429）就拉長，之後順利時慢慢縮回去。"""
-    value = 1.0
+    """編輯間隔會自動調整：#關鍵字庫 的編輯被 Discord 限流（429）就拉長，之後隨時間很快縮回去。
+    - 只認 #關鍵字庫 頻道的 429（別的頻道的編輯不該拖慢這裡）；
+    - 一次編輯（discord.py 會重試好幾次）最多加碼一次；
+    - 上限 MAX_GAP_SEC；沒再被限流就約每 HALF_LIFE_SEC 秒減半（不是要連續成功很多次才降）。"""
+    value = 0.0                      # 最近一次加碼後的額外間隔
+    at = 0.0                         # 加碼的時間（monotonic）
     bumped = False
+    channels: set = set()            # 要關注的頻道 ID（KwIndex 建立時登記）
+
+    @classmethod
+    def current(cls) -> float:
+        if cls.value <= 0:
+            return EDIT_GAP_SEC
+        decayed = cls.value * 0.5 ** ((time.monotonic() - cls.at) / HALF_LIFE_SEC)
+        return max(EDIT_GAP_SEC, decayed)
+
+
+_CH_RE = re.compile(r"channels/(\d+)/")
 
 
 class _RateWatch(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         msg = record.getMessage()
-        if "rate limited" in msg and "PATCH" in msg:
-            _Gap.value = min(_Gap.value * 1.5 + 0.5, 10.0)
-            _Gap.bumped = True
+        if "rate limited" not in msg or "PATCH" not in msg:
+            return
+        m = _CH_RE.search(msg)
+        if _Gap.channels and (not m or int(m.group(1)) not in _Gap.channels):
+            return
+        if _Gap.bumped:                                  # 同一次編輯的重試：已經加碼過了
+            return
+        _Gap.value = min(_Gap.current() * 1.5 + 0.3, MAX_GAP_SEC)
+        _Gap.at = time.monotonic()
+        _Gap.bumped = True
 
 
 logging.getLogger("discord.http").addHandler(_RateWatch())
 
-EDIT_GAP_SEC = 1.0      # 同一頻道的編輯最短間隔（OCR／截圖兩條車道共用）；被限流（429）時 _Gap 會自動拉長到最多 10 秒，順利時慢慢縮回 1 秒
+EDIT_GAP_SEC = 1.0      # 同一頻道的編輯最短間隔（OCR／截圖兩條車道共用）
+MAX_GAP_SEC = 4.0       # 被限流時最多拉長到這麼久
+HALF_LIFE_SEC = 20.0    # 沒再被限流後，額外的間隔每這麼多秒減半
 
 
 @dataclass
@@ -60,11 +85,14 @@ class KwIndex:
         self.last_msg_id = 0
         self._edit_lock = asyncio.Lock()
         self._last_edit = 0.0
+        cid = getattr(channel, "id", None)
+        if cid:
+            _Gap.channels.add(cid)
 
     async def _edit(self, message_id: int, content: str) -> None:
         """編輯訊息：所有編輯排隊、每次至少間隔 EDIT_GAP_SEC（速度由這裡統一控制）。"""
         async with self._edit_lock:
-            wait = self._last_edit + max(EDIT_GAP_SEC, _Gap.value) - time.monotonic()
+            wait = self._last_edit + _Gap.current() - time.monotonic()
             if wait > 0:
                 await asyncio.sleep(wait)
             _Gap.bumped = False
@@ -72,8 +100,6 @@ class KwIndex:
                 await self.channel.get_partial_message(message_id).edit(content=content)
             finally:
                 self._last_edit = time.monotonic()
-                if not _Gap.bumped:
-                    _Gap.value = max(EDIT_GAP_SEC, _Gap.value * 0.97)
 
     def __contains__(self, key: Key) -> bool:
         return key in self.entries

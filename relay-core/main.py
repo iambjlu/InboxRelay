@@ -154,6 +154,10 @@ async def run(check_only: bool) -> int:
     _shot.IGNORE_CERT = cfg.ignore_cert
     act = activity.init()
     lanes.setup(cfg)                       # 外部 LLM／本機 ANE 兩條車道的排程
+    try:
+        asyncio.get_running_loop().add_signal_handler(signal.SIGUSR1, dump_tasks)
+    except (NotImplementedError, RuntimeError):
+        pass
     restore_console = None
     llm = LLM(cfg.ai_server, cfg.ai_model, cfg.ai_key, cfg.ai_image_support) \
         if cfg.ai_server and cfg.ai_model else None
@@ -164,6 +168,7 @@ async def run(check_only: bool) -> int:
     queue: "asyncio.Queue[RelayItem]" = asyncio.Queue()
     tg = TelegramIntake(cfg.tg_token, cfg.tg_inbox_chat_id, cfg.tz, cfg.src_link, queue)
     relayer = Relayer(cfg, dc, tg.bot, queue)
+    _DIAG["relayer"] = relayer
     worker: asyncio.Task | None = None
     background: list[asyncio.Task] = []
     mem = None
@@ -686,6 +691,39 @@ async def run_recap(args: argparse.Namespace) -> int:
         return 0
     finally:
         await dc.close()
+
+
+_DIAG: dict = {}
+
+
+def dump_tasks() -> None:
+    """診斷：收到 SIGUSR1（kill -USR1 <核心 PID>）就把所有非同步任務現在停在哪裡、各車道與佇列狀態寫到
+    ~/Library/Application Support/InboxRelay/tasks-dump.txt（只在要求時寫一次，平常不寫檔）。"""
+    from datetime import datetime
+    from paths import data_dir
+    out = [f"# {datetime.now().isoformat(timespec='seconds')}"]
+    try:
+        import kwindex
+        out.append(f"編輯間隔（#關鍵字庫）：目前 {kwindex._Gap.current():.2f}s，額外 {kwindex._Gap.value:.2f}s")
+        for name, lane in lanes.LANES.items():
+            out.append(f"車道 {name}：state={lane.state} paused={lane.paused} available={getattr(lane, 'available', '?')} "
+                       f"offline={lane.offline} 說明={lane.describe()}")
+        r = _DIAG.get("relayer")
+        if r is not None and getattr(r, "ocr", None) is not None:
+            o = r.ocr
+            out.append(f"OCR：佇列 {len(o.queue)}｜背景寫入 {len(o._pending)}｜holding={o._holding}｜backoff={o._backoff:.0f}s｜"
+                       f"連續失敗={o._fail_streak}｜原因={o._why or '-'}｜等結果 {len(o._futures)} 個")
+        if r is not None and r.enricher is not None:
+            out.append(f"分析：backlog={r.enricher.backlog}")
+    except Exception as e:
+        out.append(f"（狀態讀取失敗：{type(e).__name__}）")
+    for t in sorted(asyncio.all_tasks(), key=lambda t: t.get_name()):
+        coro = getattr(t.get_coro(), "__qualname__", "?")
+        out.append(f"--- 任務 {coro}")
+        for f in t.get_stack(limit=5):
+            out.append(f"      {f.f_code.co_filename.rsplit('/', 1)[-1]}:{f.f_lineno} {f.f_code.co_name}")
+    (data_dir() / "tasks-dump.txt").write_text("\n".join(out) + "\n")
+    log.info("已寫出診斷檔 tasks-dump.txt")
 
 
 async def run_reset_recap_cmd(args: argparse.Namespace) -> int:

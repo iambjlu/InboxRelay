@@ -16,6 +16,7 @@ import asyncio
 import itertools
 import logging
 import re
+import time
 from collections import deque
 
 import activity
@@ -472,8 +473,11 @@ class OcrWorker:
             fut = asyncio.get_running_loop().create_future()
             self._futures[rid] = fut
             self.send({"type": "ocr_request", "id": rid, "url": att.url, "name": att.filename})
+            t_ask = time.monotonic()
+            self._detail(f"辨識 {att.filename[:30]}")
             try:
                 res = await asyncio.wait_for(fut, timeout=TIMEOUT)
+                self._detail(f"上一張 {att.filename[:24]}：App 回應 {time.monotonic() - t_ask:.1f} 秒")
             except asyncio.TimeoutError:
                 self._futures.pop(rid, None)
                 n = self._fails.get(e.rec.key, 0) + 1
