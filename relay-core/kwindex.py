@@ -83,6 +83,7 @@ class KwIndex:
         self.bot_id = bot_id
         self.entries: dict[Key, KwEntry] = {}
         self.last_msg_id = 0
+        self.on_progress = None                      # callable(已讀幾則)：啟動時回報進度給 App
         self._edit_lock = asyncio.Lock()
         self._last_edit = 0.0
         cid = getattr(channel, "id", None)
@@ -141,8 +142,11 @@ class KwIndex:
         async for m in self.channel.history(limit=None, oldest_first=True):
             self._ingest(m)
             n += 1
-            if n % 1000 == 0:      # 幾千筆要讀 1～3 分鐘（Discord 一次只給 100 則），定期回報免得以為當掉
-                log.info("#關鍵字庫 載入中… 已讀 %s 則", f"{n:,}")
+            if n % 500 == 0:       # 幾千筆要讀 1～3 分鐘（Discord 一次只給 100 則），定期回報免得以為當掉
+                if n % 1000 == 0:
+                    log.info("#關鍵字庫 載入中… 已讀 %s 則", f"{n:,}")
+                if self.on_progress is not None:
+                    self.on_progress(n)
         log.info("#關鍵字庫 載入 %d 筆（未分析 %d 筆）", len(self.entries),
                  sum(1 for e in self.entries.values() if not e.rec.enriched))
 

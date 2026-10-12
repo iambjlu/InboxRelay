@@ -15,7 +15,9 @@ extension CoreController {
     var stateLabel: String {
         switch state {
         case .running: return status.paused ? "已暫停" : "運行中"
-        case .starting: return "啟動中…"
+        case .starting:
+            if let st = startup, st.step > 0 { return "啟動中 \(st.step)/\(st.steps)：\(st.stage)" }
+            return "啟動中…"
         case .restarting(let s): return "\(s) 秒後重試"
         case .stopped: return "已停止"
         }
@@ -56,9 +58,20 @@ struct StateBadge: View {
     @ObservedObject var core: CoreController
 
     var body: some View {
-        HStack(spacing: 6) {
-            Circle().fill(core.stateColor).frame(width: 9, height: 9)
-            Text(core.stateLabel).font(.headline)
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Circle().fill(core.stateColor).frame(width: 9, height: 9)
+                Text(core.stateLabel).font(.headline)
+            }
+            if core.state == .starting, let text = core.startupText {
+                // 啟動要花幾分鐘（尤其是讀 #關鍵字庫）：直接顯示做到哪，不用看日誌
+                if let f = core.startupFraction {
+                    ProgressView(value: f).progressViewStyle(.linear)
+                } else {
+                    ProgressView().progressViewStyle(.linear)
+                }
+                Text(text).font(.caption).foregroundStyle(.secondary)
+            }
         }
     }
 }

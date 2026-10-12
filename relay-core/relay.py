@@ -84,7 +84,11 @@ class Relayer:
         ch = await self.dc.channel(self.cfg.ch_keywords)
         log.info("讀取 #關鍵字庫（紀錄多時要 1～3 分鐘）…")
         self.index = KwIndex(ch, self.dc.client.user.id)  # type: ignore[arg-type,union-attr]
+        import startup
+        self.index.on_progress = lambda n: startup.stage("載入 #關鍵字庫", f"已讀 {n:,} 則", done=n)
         await self.index.load()
+        startup.stage("載入 #關鍵字庫", f"完成，共讀 {len(self.index.entries):,} 筆紀錄", done=len(self.index.entries),
+                      total=len(self.index.entries))
         log.info("最後的日期標頭：%s；#關鍵字庫 已有 %d 筆紀錄",
                  self.last_header_date or "（無）", len(self.index.entries))
 

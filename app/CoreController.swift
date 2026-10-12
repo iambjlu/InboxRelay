@@ -21,6 +21,16 @@ struct LaneStatus: Codable, Hashable {
     var next_start: String = ""
 }
 
+/// 核心啟動中回報的進度（見 relay-core/startup.py）
+struct StartupInfo: Equatable {
+    var stage: String
+    var detail: String
+    var step: Int
+    var steps: Int
+    var done: Int?
+    var total: Int?
+}
+
 struct CoreStatus: Codable {
     var paused: Bool = false
     var tasks: [CoreTask] = []
@@ -44,6 +54,8 @@ final class CoreController: ObservableObject {
     @Published var state: State = .stopped
     @Published var status = CoreStatus()
     @Published var logs: [String] = []
+    /// 啟動中的進度（核心開始送一般狀態列後就是 nil）
+    @Published var startup: StartupInfo? = nil
     private var instantPending = CommandLine.arguments.contains("--instant")   // 啟動後立即執行 LLM 與 OCR 車道一次
     @Published var lastError: String = ""
     /// 設定頁「測試連線」：nil＝沒在測；結果由核心回傳
@@ -222,6 +234,42 @@ final class CoreController: ObservableObject {
         }
     }
 
+    private func handleStartup(_ json: [String: Any]) {
+        if (json["finished"] as? Bool) == true { startup = nil; return }
+        let info = StartupInfo(stage: (json["stage"] as? String) ?? "", detail: (json["detail"] as? String) ?? "",
+                               step: (json["step"] as? Int) ?? 0, steps: (json["steps"] as? Int) ?? 0,
+                               done: json["done"] as? Int, total: json["total"] as? Int)
+        startup = info
+        // 記住上次 #關鍵字庫 一共有幾筆：下次啟動讀取時就能算出大約完成幾 %
+        if info.stage.hasPrefix("載入 #關鍵字庫"), let t = info.total, t > 0 {
+            UserDefaults.standard.set(t, forKey: "lastKeywordTotal")
+        }
+    }
+
+    /// 啟動進度 0～1：每個步驟各佔一份；讀 #關鍵字庫 時用「已讀數 ÷ 上次的總數」細分
+    var startupFraction: Double? {
+        guard let s = startup, s.steps > 0, s.step > 0 else { return nil }
+        var within = 0.0
+        if let done = s.done {
+            let last = UserDefaults.standard.integer(forKey: "lastKeywordTotal")
+            let total = s.total ?? (last > 0 ? last : 0)
+            if total > 0 { within = min(Double(done) / Double(total), 0.97) }
+        }
+        return min((Double(s.step - 1) + within) / Double(s.steps), 0.99)
+    }
+
+    /// 啟動中這一步的說明（例如「步驟 6/8：載入 #關鍵字庫｜已讀 4,000 則（約 42%）」）
+    var startupText: String? {
+        guard let s = startup, s.step > 0 else { return nil }
+        var t = "步驟 \(s.step)/\(s.steps)：\(s.stage)"
+        if !s.detail.isEmpty { t += "｜\(s.detail)" }
+        if let done = s.done, s.total == nil {
+            let last = UserDefaults.standard.integer(forKey: "lastKeywordTotal")
+            if last > 0 { t += "（約 \(min(Int(Double(done) / Double(last) * 100), 99))%）" }
+        }
+        return t
+    }
+
     private func handleOCR(_ obj: [String: Any]) {
         guard let id = obj["id"] as? Int, let url = obj["url"] as? String else { return }
         ocr.recognize(urlString: url) { [weak self] text, error, ms, retry, wait in
@@ -312,6 +360,7 @@ final class CoreController: ObservableObject {
         if pendingAction == "restart" { pendingAction = nil }
         status.recap_phase = ""
         status.tasks = []
+        startup = nil
         appendLog("— 核心結束（代碼 \(code)）—")
         guard wantRunning else {
             state = .stopped
@@ -357,6 +406,10 @@ final class CoreController: ObservableObject {
                 handleOCR(json)
             } else if !isErr, line.hasPrefix("{"), let d = line.data(using: .utf8),
                let json = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+               (json["type"] as? String) == "startup" {
+                handleStartup(json)
+            } else if !isErr, line.hasPrefix("{"), let d = line.data(using: .utf8),
+               let json = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
                (json["type"] as? String) == "llm_test_result" {
                 if (json["id"] as? Int) == llmTestId {
                     llmTesting = false
@@ -365,6 +418,7 @@ final class CoreController: ObservableObject {
             } else if !isErr, line.hasPrefix("{"), let d = line.data(using: .utf8),
                let obj = try? JSONDecoder().decode(CoreStatus.self, from: d) {
                 if pendingAction != "restart" { pendingAction = nil }   // 核心回報新狀態 → 解鎖
+                startup = nil                                              // 開始送一般狀態列＝啟動完成
                 status = obj
                 if instantPending, let lanes = obj.lanes, lanes["llm"] != nil,
                    let ane = lanes["ane"], ane.state != "unavailable" {

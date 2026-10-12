@@ -149,6 +149,7 @@ def install_console(act, relayer, get_recapper):
 
 async def run(check_only: bool) -> int:
     cfg = config.load()
+    import startup
     import enrich.screenshot as _shot
     _shot.ALLOW_PRIVATE = cfg.private_urls
     _shot.IGNORE_CERT = cfg.ignore_cert
@@ -176,11 +177,13 @@ async def run(check_only: bool) -> int:
     recapper = None
 
     try:
+        startup.stage("連線 Discord")
         try:
             await dc.start()
         except discord.PrivilegedIntentsRequired:
             log.error("AI 功能需要 Message Content Intent：請到 Developer Portal → Bot 開啟後重試")
             return 2
+        startup.stage("檢查頻道與權限")
         chans = cfg.channel_map()
         problems = await dc.check_channels(chans)
         for p in problems:
@@ -222,6 +225,7 @@ async def run(check_only: bool) -> int:
             aitest = AiTestChannel(cfg, dc, llm)  # type: ignore[arg-type]
 
         if llm:
+            startup.stage("連線外部 LLM", cfg.ai_server)
             try:
                 models = await asyncio.wait_for(llm.ping(), timeout=15)
                 ok = cfg.ai_model in models
@@ -235,6 +239,7 @@ async def run(check_only: bool) -> int:
                 if lane is not None:
                     lane.go_offline(type(e).__name__)
         if llm:
+            startup.stage("載入記憶與提示詞")
             from memory import MemoryStore
             guild = dc.guild
             editors = set(cfg.memory_editors) | ({guild.owner_id} if guild and guild.owner_id else set())
@@ -259,11 +264,14 @@ async def run(check_only: bool) -> int:
         if use_test:
             log.info("AI 測試頻道已啟用：%s", cfg.ch_ai_test)
 
+        startup.stage("連線 Telegram")
         await tg.initialize()
         me = await tg.bot.get_me()
         log.info("Telegram bot：@%s（可讀所有群組訊息：%s）", me.username, me.can_read_all_group_messages)
 
+        startup.stage("載入 #關鍵字庫", "讀取紀錄中…")
         await relayer.load_state()
+        startup.stage("載入 #總結與狀態")
 
         # 同一時間只允許一台電腦在跑（設定同步到多台 Mac 時避免互搶 Telegram 訊息）
         live = state.DbRecord(await dc.channel(cfg.ch_db), dc.client.user.id, "LIVE")  # type: ignore[union-attr]
@@ -314,6 +322,7 @@ async def run(check_only: bool) -> int:
         progress_channel = await dc.channel(cfg.ch_inbox_mirror)
         for cid in {cfg.ch_inbox_mirror, cfg.ch_screenshot, cfg.ch_keywords} - {None}:
             await act.cleanup_old(await dc.channel(cid), dc.client.user.id)  # type: ignore[union-attr]
+        startup.stage("啟動各項工作")
         background.append(asyncio.create_task(act.reporter(progress_channel)))
         if relayer.enricher:
             background.append(asyncio.create_task(relayer.enricher.run()))
