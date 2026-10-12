@@ -706,8 +706,8 @@ _DIAG: dict = {}
 
 
 def dump_tasks() -> None:
-    """診斷：收到 SIGUSR1（kill -USR1 <核心 PID>）就把所有非同步任務現在停在哪裡、各車道與佇列狀態寫到
-    ~/Library/Application Support/InboxRelay/tasks-dump.txt（只在要求時寫一次，平常不寫檔）。"""
+    """診斷：收到 SIGUSR1（kill -USR1 <核心 PID>）就把所有非同步任務現在停在哪裡、各車道與佇列狀態印到日誌；
+    診斷模式（diag.enabled）打開時另外寫到 ~/Library/Application Support/InboxRelay/tasks-dump.txt（關閉時完全不寫檔）。"""
     from datetime import datetime
     from paths import data_dir
     out = [f"# {datetime.now().isoformat(timespec='seconds')}"]
@@ -731,8 +731,13 @@ def dump_tasks() -> None:
         out.append(f"--- 任務 {coro}")
         for f in t.get_stack(limit=5):
             out.append(f"      {f.f_code.co_filename.rsplit('/', 1)[-1]}:{f.f_lineno} {f.f_code.co_name}")
-    (data_dir() / "tasks-dump.txt").write_text("\n".join(out) + "\n")
-    log.info("已寫出診斷檔 tasks-dump.txt")
+    import diag
+    if diag.enabled:
+        (data_dir() / "tasks-dump.txt").write_text("\n".join(out) + "\n")
+        log.info("已寫出診斷檔 tasks-dump.txt")
+    else:                                   # 診斷模式關閉：只顯示（App 日誌分頁），不寫檔
+        for line in out:
+            log.info("診斷｜%s", line)
 
 
 async def run_reset_recap_cmd(args: argparse.Namespace) -> int:

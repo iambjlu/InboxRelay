@@ -4,7 +4,7 @@
 - 啟動時環境變數 INBOXRELAY_IPC=1 才啟用。
 - App → 核心：stdin 每行一個 JSON：
   {"type": "lane", "lane": "llm|ane|shot", "action": "run_now|pause|resume"}、{"type": "hello", "ocr": true}、
-  {"type": "ocr_result", "id": 1, "text": "…", "ms": 120}、{"type": "llm_test", "id": 1, "server", "model", "key"}、{"type": "stop"}；
+  {"type": "ocr_result", "id": 1, "text": "…", "ms": 120}、{"type": "llm_test", "id": 1, "server", "model", "key"}、{"type": "diag", "on": true|false}、{"type": "stop"}；
   舊指令 recap_now／pause／resume 仍可用（＝外部 LLM 車道）。
 - 核心 → App：stdout 每行一個 JSON：狀態（type=status，每 2 秒、有變化才送）、
   文字辨識請求 {"type": "ocr_request", "id": 1, "url": "…", "name": "a.jpg"}、
@@ -134,6 +134,11 @@ class IpcServer:
                         log.info("🧾 App 要求外部 LLM 立即執行（分析＋總結）")
                 elif lane.run_now():
                     log.info("🔤 App 要求%s立即執行", lane.label)
+        elif t == "diag":
+            import diag
+            diag.set_enabled(bool(cmd.get("on")))
+            log.info("診斷模式：%s", "開（診斷資料會寫成檔案）" if diag.enabled else "關（只顯示、不寫檔）")
+            return
         elif t == "llm_test":
             asyncio.get_running_loop().create_task(self._llm_test(cmd))
             return

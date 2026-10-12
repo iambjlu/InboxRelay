@@ -270,6 +270,18 @@ final class CoreController: ObservableObject {
         return t
     }
 
+    /// 診斷模式（寫檔）開關：存偏好、通知核心（核心的診斷快照也只在打開時才寫檔），關掉時把日誌檔關起來
+    func setDiagnostic(_ on: Bool) {
+        UserDefaults.standard.set(on, forKey: AppPrefs.diagnosticKey)
+        if on { appendLog("— 診斷模式開啟：日誌會寫入 \(DiagnosticLog.file.path) —") }
+        else { appendLog("— 診斷模式關閉：日誌只顯示、不寫檔 —"); DiagnosticLog.close() }
+        sendDiagnostic()
+    }
+
+    func sendDiagnostic() {
+        sendAny(["type": "diag", "on": DiagnosticLog.enabled] as [String: Any])
+    }
+
     private func handleOCR(_ obj: [String: Any]) {
         guard let id = obj["id"] as? Int, let url = obj["url"] as? String else { return }
         ocr.recognize(urlString: url) { [weak self] text, error, ms, retry, wait in
@@ -347,6 +359,7 @@ final class CoreController: ObservableObject {
             lastError = ""
             // 告訴核心：這個 App 會做本機文字辨識（核心讀到後「本機 ANE」車道才會開始）
             sendAny(["type": "hello", "ocr": true, "device": "Vision／Apple Neural Engine"] as [String: Any])
+            sendDiagnostic()
             appendLog("— 啟動核心（\(runSh == bundled ? "App 內建" : workDir)）—")
         } catch {
             lastError = "無法啟動：\(error.localizedDescription)"
@@ -439,6 +452,7 @@ final class CoreController: ObservableObject {
     }
 
     private func appendLog(_ line: String) {
+        DiagnosticLog.write(line)                                      // 診斷模式打開時才會真的寫檔
         logs.append(line)
         if logs.count > 500 { logs.removeFirst(logs.count - 500) }   // 只留在記憶體的環狀緩衝（500 行）
     }

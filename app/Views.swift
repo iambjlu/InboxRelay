@@ -356,6 +356,7 @@ struct SettingsView: View {
     @ObservedObject var settings: SettingsStore
     @State private var loginItem = LoginItem.enabled
     @AppStorage(AppPrefs.showMainWindowKey) private var showMainWindow = true
+    @AppStorage(AppPrefs.diagnosticKey) private var diagnostic = false
     @State private var message = ""
     @State private var revealed: Set<String> = []     // 目前顯示明碼的欄位（關掉視窗就恢復隱藏）
 
@@ -389,6 +390,21 @@ struct SettingsView: View {
             Section("一般") {
                 Toggle("App 開啟時顯示主視窗", isOn: $showMainWindow)
                     .help("關閉的話，App 開啟後只會出現在選單列，要從選單列的「主視窗」才打開")
+                Toggle("診斷模式（把日誌寫入檔案）", isOn: $diagnostic)
+                    .onChange(of: diagnostic) { _, on in core.setDiagnostic(on) }
+                    .help("預設關閉：日誌只顯示在「日誌」分頁、不寫任何檔案。打開後才寫入檔案，方便出問題時把日誌交給別人看。")
+                if diagnostic {
+                    HStack {
+                        Text("日誌檔：\(DiagnosticLog.file.path)（最多約 10 MB）")
+                            .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                        Spacer()
+                        Button("在 Finder 顯示") {
+                            try? FileManager.default.createDirectory(at: DiagnosticLog.directory, withIntermediateDirectories: true)
+                            NSWorkspace.shared.open(DiagnosticLog.directory)
+                        }
+                        .buttonStyle(.borderless)
+                    }
+                }
                 Toggle("登入時自動啟動 InboxRelay", isOn: $loginItem)
                     .onChange(of: loginItem) { _, on in
                         if let err = LoginItem.set(on) {

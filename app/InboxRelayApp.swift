@@ -81,6 +81,54 @@ struct MenuIcon: View {
 /// 每台電腦各自的 App 介面偏好（存在 UserDefaults，不隨設定資料夾同步）。
 enum AppPrefs {
     static let showMainWindowKey = "showMainWindowOnLaunch"
+    static let diagnosticKey = "diagnosticLogging"          // 診斷模式：預設關閉＝日誌只顯示、不寫檔
+}
+
+/// 診斷日誌檔（只有「診斷模式」打開時才寫；平常日誌只留在記憶體的 500 行環狀緩衝）。
+/// ~/Library/Logs/InboxRelay/diagnostic.log，超過 5 MB 就換成 diagnostic.1.log（只留一份舊的），所以最多約 10 MB。
+enum DiagnosticLog {
+    static let maxBytes = 5 * 1024 * 1024
+    static var directory: URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/InboxRelay")
+    }
+    static var file: URL { directory.appendingPathComponent("diagnostic.log") }
+    private static let queue = DispatchQueue(label: "tw.iambjlu.InboxRelay.diaglog", qos: .utility)
+    private static var handle: FileHandle?
+
+    static var enabled: Bool { UserDefaults.standard.bool(forKey: AppPrefs.diagnosticKey) }
+
+    static func write(_ line: String) {
+        guard enabled else { return }
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        queue.async {
+            do {
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                if handle == nil {
+                    if !FileManager.default.fileExists(atPath: file.path) {
+                        FileManager.default.createFile(atPath: file.path, contents: nil)
+                    }
+                    handle = try FileHandle(forWritingTo: file)
+                }
+                if let size = try handle?.seekToEnd(), size > UInt64(maxBytes) {
+                    try handle?.close()
+                    handle = nil
+                    let old = directory.appendingPathComponent("diagnostic.1.log")
+                    try? FileManager.default.removeItem(at: old)
+                    try FileManager.default.moveItem(at: file, to: old)
+                    FileManager.default.createFile(atPath: file.path, contents: nil)
+                    handle = try FileHandle(forWritingTo: file)
+                }
+                try handle?.write(contentsOf: Data("\(stamp) \(line)\n".utf8))
+            } catch {
+                handle = nil                        // 寫不進去就算了（不影響 App）；下次再試
+            }
+        }
+    }
+
+    /// 關掉診斷模式時把檔案關起來
+    static func close() {
+        queue.async { try? handle?.close(); handle = nil }
+    }
 }
 
 enum LoginItem {
