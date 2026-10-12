@@ -33,6 +33,8 @@ TIMEOUT = 120
 MAX_TRIES = 3          # 同一張圖辨識失敗幾次才標「無法取得圖片」
 PACE_SEC = 0.4          # 每張圖之間稍微停一下，避免 Discord 圖片伺服器限流
 WRITE_AHEAD = 30        # 辨識可以領先 Discord 寫入幾張（寫入慢、辨識快；超過就等寫入追上來）
+DL_TRIES = 5            # 下載暫時失敗（HTTP 429／5xx／網路）同一張圖最多試幾次，試滿當成無法取得（不然壞掉的連結會永遠重試）
+FLUSH_SEC = 180         # 等背景寫入追上來最久等多久（Discord 卡住時不要讓辨識整個停住）
 WAIT_SEC = 1800         # AI 分析最多等這則的 OCR 多久（安全上限）
 _CARD = re.compile(r"(?<!\d)(?:\d[ -]?){12,18}\d(?!\d)")
 
@@ -157,6 +159,10 @@ class OcrWorker:
         self._fails: dict = {}                 # 紀錄 → 辨識失敗次數
         self._retry_keys: set = set()          # 標過「無法取得圖片」但要再試一次的紀錄
         self._backoff = 30.0
+        self._fail_streak = 0                 # 連續幾個鏡像失敗（整個佇列都在失敗才需要等）
+        self._dl_fails: dict = {}             # 紀錄 → 下載暫時失敗次數
+        self._why = ""                          # 最近一次失敗的原因（顯示在儀表板）
+        self._task = None                     # 目前的進度任務（顯示「正在等什麼」）
         self._waiters: dict[str, list] = {}    # 鏡像連結 → 等這則辨識完的 Future（AI 分析要拿 OCR 當參考）
         self._pending: set = set()             # 寫進 #關鍵字庫 還沒完成的工作（辨識不等寫入）
         self._write_slots = asyncio.Semaphore(WRITE_AHEAD)
@@ -229,9 +235,20 @@ class OcrWorker:
         self._pending.add(t)
         t.add_done_callback(self._pending.discard)
 
+    def _detail(self, text: str) -> None:
+        """在儀表板的進度列顯示現在在等什麼（不然卡住時看起來像壞掉）。"""
+        if self._task is not None:
+            self._task.set(detail=text)
+
     async def flush(self, mirror_url: str | None = None) -> None:
-        if self._pending:
-            await asyncio.gather(*list(self._pending), return_exceptions=True)
+        """等背景寫入追上來；最多等 FLUSH_SEC，Discord 卡住時不讓辨識整個停住（沒寫完的繼續在背景寫）。"""
+        if not self._pending:
+            return
+        self._detail(f"等待寫入 Discord（{len(self._pending)} 筆）")
+        _, still = await asyncio.wait(list(self._pending), timeout=FLUSH_SEC)
+        if still:
+            log.warning("寫入 Discord 太慢，%d 筆先留在背景繼續寫", len(still))
+        self._detail("")
 
     async def _clear_stale(self, entries) -> None:
         for e in entries:
@@ -262,6 +279,7 @@ class OcrWorker:
         for e in sorted(retry, key=lambda e: e.msg_id):      # 先前「無法取得圖片」的每次都重試
             self._retry_keys.add(e.rec.key)
             self._fails.pop(e.rec.key, None)
+            self._dl_fails.pop(e.rec.key, None)
             self.submit(e.rec.mirror)
         if retry:
             log.info("圖片文字辨識：%d 張先前無法取得或辨識失敗的圖片會再試一次", len(retry))
@@ -326,19 +344,28 @@ class OcrWorker:
             try:
                 if task is None:
                     task = activity.start("圖片文字辨識（本機 ANE）")
+                self._task = task
                 task.set(done=done, total=done + 1 + len(self.queue))
+                self._why = ""
                 ok = await self.process(mirror)
                 if ok:
                     await self.flush()                       # 等寫入追上來，AI 分析才讀得到這則的 OCR
                     self._release(mirror)
-                if not ok:                       # 暫時失敗（App 沒回應、下載被限流…）：放回去，等一下再試
-                    self.queue.appendleft(mirror)
+                if not ok:                       # 暫時失敗（App 沒回應、下載被限流…）：排到最後面，不擋住後面的
+                    self.queue.append(mirror)
                     self._queued.add(mirror)
-                    log.info("圖片文字辨識暫停 %.0f 秒後重試", self._backoff)
-                    await asyncio.sleep(self._backoff)
-                    self._backoff = min(self._backoff * 2, 900)
+                    self._fail_streak += 1
+                    if self._fail_streak >= len(self.queue):   # 整個佇列連續都在失敗才需要等一下
+                        wait = self._backoff
+                        log.info("圖片文字辨識暫停 %.0f 秒後重試（%s）", wait, self._why or "暫時失敗")
+                        self._detail(f"暫時失敗，{wait:.0f} 秒後重試：{self._why or '未知'}")
+                        await asyncio.sleep(wait)
+                        self._backoff = min(self._backoff * 2, 900)
+                        self._fail_streak = 0
+                        self._detail("")
                     continue
                 self._backoff = 30.0
+                self._fail_streak = 0
                 done += 1
                 task.set(done=done)
             except Exception:
@@ -376,8 +403,13 @@ class OcrWorker:
         for url in (e.rec.img or "").split():
             res = await self._ask(url, url.rsplit("/", 1)[-1][:80])
             if res is None:
-                log.warning("App 沒有回傳文字辨識結果（%s），稍後再試", url)
-                return False
+                n = self._fails.get((e.rec.key, url), 0) + 1
+                self._fails[(e.rec.key, url)] = n
+                self._why = f"App 沒有回傳辨識結果（{url[:50]}）"
+                log.warning("App 沒有回傳文字辨識結果（%s，第 %d 次）", url, n)
+                if n < MAX_TRIES:
+                    return False
+                continue                                         # 試滿：這個網址放棄
             if res.get("error"):
                 tries = self._fails.get((e.rec.key, url), 0) + 1
                 self._fails[(e.rec.key, url)] = tries
@@ -444,14 +476,26 @@ class OcrWorker:
                 res = await asyncio.wait_for(fut, timeout=TIMEOUT)
             except asyncio.TimeoutError:
                 self._futures.pop(rid, None)
-                log.warning("App 沒有回傳文字辨識結果（%s），稍後再試", att.filename)
-                return False
+                n = self._fails.get(e.rec.key, 0) + 1
+                self._fails[e.rec.key] = n
+                self._why = f"App 沒有回傳辨識結果（{att.filename}）"
+                log.warning("App 沒有回傳文字辨識結果（%s，第 %d 次）", att.filename, n)
+                if n < MAX_TRIES:
+                    return False
+                self._fails[e.rec.key] = MAX_TRIES - 1           # 試滿：當成無法取得（下面照辨識失敗處理）
+                res = {"error": "逾時", "retry": False}
             if res.get("error") and res.get("retry"):
                 wait = float(res.get("retry_after") or 0)
                 if wait > self._backoff:
                     self._backoff = min(wait, 900)
-                log.warning("圖片下載暫時失敗（%s）：%s，稍後重試", att.filename, res["error"])
-                return False
+                n = self._dl_fails.get(e.rec.key, 0) + 1
+                self._dl_fails[e.rec.key] = n
+                self._why = f"下載暫時失敗：{str(res['error'])[:50]}"
+                log.warning("圖片下載暫時失敗（%s，第 %d/%d 次）：%s", att.filename, n, DL_TRIES, res["error"])
+                if n < DL_TRIES:
+                    return False
+                self._fails[e.rec.key] = MAX_TRIES - 1           # 一直下載不到：當成無法取得
+                res = {"error": res["error"], "retry": False}
             if res.get("error"):
                 tries = self._fails.get(e.rec.key, 0) + 1
                 self._fails[e.rec.key] = tries
@@ -461,6 +505,7 @@ class OcrWorker:
                 text = NO_IMAGE
             self._retry_keys.discard(e.rec.key)
             self._fails.pop(e.rec.key, None)
+            self._dl_fails.pop(e.rec.key, None)
             if not res.get("error"):
                 text = clean(str(res.get("text", "")))
             await self._write(e.rec.key, ocr=text)

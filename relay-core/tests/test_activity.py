@@ -2,6 +2,7 @@
 import asyncio
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -59,6 +60,19 @@ class TestActivity(unittest.TestCase):
             finally:
                 activity.DISCORD_AFTER_SEC, activity.DISCORD_EVERY_SEC = old
         asyncio.run(go())
+
+    def test_eta_uses_recent_speed_and_shows_stall(self):
+        t = activity.Task(1, "測試", total=10)
+        clock = {"t": 1000.0}
+        with mock.patch.object(activity.time, "monotonic", lambda: clock["t"]):
+            t.done = 2
+            t.line()
+            clock["t"] += 60
+            t.done = 4
+            self.assertIn("剩約 3 分", t.line())                      # 60 秒做了 2 個，還剩 6 個 → 3 分
+            clock["t"] += 400                                          # 400 秒都沒有進度
+            self.assertIn("停滯中", t.line())
+            self.assertNotIn("剩約", t.line())
 
     def test_pause_blocks_gate(self):
         async def go():

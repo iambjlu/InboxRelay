@@ -22,6 +22,8 @@ import lanes
 log = logging.getLogger("activity")
 
 STATUS_HEAD = "⏳ **背景工作中（外部 LLM／本機 ANE）**"
+ETA_WINDOW_SEC = 600         # 剩餘時間用最近這麼久的進度速度估算
+STALL_SEC = 300              # 這麼久沒有進度就顯示「停滯中」
 DISCORD_AFTER_SEC = 10
 DISCORD_EVERY_SEC = 15
 TERMINAL_EVERY_SEC = 15
@@ -40,6 +42,9 @@ class Task:
     item_steps: int = 0
     item_step: int = 0
     llm_frac: float = 0.0
+    _hist: list = field(default_factory=list)                   # (時間, 進度)：算「剩約」用最近的速度，不是從開始到現在的平均
+    _last_p: float = -1.0
+    _last_change: float = field(default_factory=time.monotonic)
 
     def begin_item(self, steps: int) -> None:
         self.item_steps, self.item_step, self.llm_frac = max(steps, 0), 0, 0.0
@@ -86,11 +91,21 @@ class Task:
             p = self.progress or 0.0
             pct = 100 * p
             prog = f" {self.done:,}/{self.total:,}（{pct:.1f}%）"
-            elapsed = time.monotonic() - self.started
-            if 0.01 < p < 1 and elapsed > 30:
-                eta = elapsed / p * (1 - p)
-                h, rem = divmod(int(eta), 3600)
-                prog += f"｜剩約 {h}h{rem // 60:02d}m" if h else f"｜剩約 {max(rem // 60, 1)} 分"
+            now = time.monotonic()
+            if p != self._last_p:
+                self._last_p, self._last_change = p, now
+            if not self._hist or self._hist[-1][1] != p or now - self._hist[-1][0] > 30:
+                self._hist.append((now, p))
+            while len(self._hist) > 2 and now - self._hist[0][0] > ETA_WINDOW_SEC:
+                self._hist.pop(0)
+            if 0.0 < p < 1:
+                t0, p0 = self._hist[0]
+                if now - self._last_change > STALL_SEC:
+                    prog += "｜停滯中"                                   # 好一陣子沒有進度：不要顯示一個不準的剩餘時間
+                elif p > p0 and now - t0 >= 30:
+                    eta = (1 - p) * (now - t0) / (p - p0)               # 用最近 ETA_WINDOW_SEC 秒的速度估算
+                    h, rem = divmod(int(eta), 3600)
+                    prog += f"｜剩約 {h}h{rem // 60:02d}m" if h else f"｜剩約 {max(rem // 60, 1)} 分"
         else:
             prog = ""
         return f"{self.label}{prog}" + (f"｜{self.detail}" if self.detail else "")

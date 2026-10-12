@@ -85,5 +85,64 @@ class OcrWaitTest(unittest.TestCase):
         asyncio.run(go())
 
 
+class QueueOrderTest(unittest.TestCase):
+    def _worker(self, order, fail_first=()):
+        idx = Index([])
+        w = ocr.OcrWorker(None, idx, lambda d: None)
+        w._backoff = 0.01
+        seen = {}
+
+        async def process(m):
+            order.append(m)
+            if m in fail_first and not seen.get(m):
+                seen[m] = True
+                w._why = "測試：App 沒有回傳"
+                return False
+            return True
+        w.process = process
+
+        async def gate(name):
+            return None
+        return w, gate
+
+    def test_failing_mirror_goes_to_back_and_does_not_block_others(self):
+        async def go():
+            import activity
+            order = []
+            w, gate = self._worker(order, fail_first={"A"})
+            with mock.patch.object(activity, "gate", gate):
+                for m in ("A", "B", "C"):
+                    w.submit(m)
+                t = asyncio.create_task(w.run())
+                for _ in range(100):
+                    await asyncio.sleep(0.01)
+                    if w.drained:
+                        break
+                t.cancel()
+            self.assertEqual(order, ["A", "B", "C", "A"])               # A 失敗後排到最後，B、C 不用等它
+        asyncio.run(go())
+
+    def test_single_failing_mirror_waits_backoff_and_shows_reason(self):
+        async def go():
+            import activity
+            order = []
+            w, gate = self._worker(order, fail_first={"A"})
+            details = []
+            real = activity.Activity()
+            with mock.patch.object(activity, "current", real), mock.patch.object(activity, "gate", gate):
+                w.submit("A")
+                t = asyncio.create_task(w.run())
+                for _ in range(100):
+                    await asyncio.sleep(0.01)
+                    if w._task is not None and "暫時失敗" in w._task.detail:
+                        details.append(w._task.detail)
+                    if w.drained and order.count("A") >= 2:
+                        break
+                t.cancel()
+            self.assertEqual(order[:2], ["A", "A"])
+            self.assertTrue(details and "測試：App 沒有回傳" in details[0])    # 儀表板看得到在等什麼
+        asyncio.run(go())
+
+
 if __name__ == "__main__":
     unittest.main()
