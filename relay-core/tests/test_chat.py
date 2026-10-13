@@ -557,3 +557,14 @@ class ControlsTest(unittest.TestCase):
             t = await c._target_thread(N(channel=parent, message=N(content=content)))
             self.assertIs(t, threads[500])                                      # 按鈕找得到對應的對話串
         asyncio.run(go())
+
+
+class ForwardTest(unittest.TestCase):
+    def test_forwarded_snapshot_counts(self):
+        from types import SimpleNamespace as N
+        import chat
+        snap = N(content="# 2026-10-12", attachments=[N(filename="a.jpg")])
+        h = N(attachments=[N(filename="b.jpg")], message_snapshots=[snap])
+        self.assertEqual([a.filename for a in chat._atts(h)], ["b.jpg", "a.jpg"])
+        self.assertEqual(chat._fwd_text(h), "（轉發的訊息）# 2026-10-12")
+        self.assertEqual(chat._fwd_text(N(attachments=[])), "")

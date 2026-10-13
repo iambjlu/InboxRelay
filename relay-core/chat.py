@@ -48,7 +48,8 @@ from recap import daily
 log = logging.getLogger("chat")
 
 MAX_HISTORY_CHARS = 60_000     # 沒指定時的文字歷史上限（實際依 context window 計算）
-MAX_IMAGES = 4                 # 最近幾張圖片以圖片交給模型
+MAX_IMAGES = 20                # 最近幾張圖片以圖片交給模型（一次丟一批聊天截圖要全部看得到）
+MAX_IMAGES_BYTES = 40 * 1024 * 1024    # 這些圖片加起來的上限（8GB 電腦，base64 只在組訊息時暫存於記憶體）
 DOC_CHARS = 20_000             # 每份文件最多放多少字
 LINK_CHARS = 6_000
 MAX_IMAGE_BYTES = 15 * 1024 * 1024
@@ -97,6 +98,23 @@ IMAGE_EXT = (".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif", ".gif", ".bmp")
 
 def _is_image(a) -> bool:
     return (a.content_type or "").startswith("image/") or a.filename.lower().endswith(IMAGE_EXT)
+
+
+def _atts(h) -> list:
+    """訊息的附件；轉發的訊息（message_snapshots）內容和附件在快照裡，一併算進來。"""
+    out = list(h.attachments)
+    for snap in getattr(h, "message_snapshots", None) or []:
+        out += list(snap.attachments)
+    return out
+
+
+def _fwd_text(h) -> str:
+    """轉發訊息快照裡的文字，標明是轉發的。沒有轉發就回空字串。"""
+    parts = []
+    for snap in getattr(h, "message_snapshots", None) or []:
+        c = (snap.content or "").strip()
+        parts.append(f"（轉發的訊息）{c}" if c else "（轉發的訊息）")
+    return "\n".join(parts)
 
 
 def _mime(a) -> str:
@@ -516,10 +534,10 @@ class ChatChannel:
             head, text = h.content.split("\n", 1)[0], copied_user_text(h.content)
         else:
             name = " ".join(h.author.display_name.replace("*", "").split())[:40] or "使用者"
-            head, text = f"{USER_HEAD}{name}**", h.clean_content.strip()
+            head, text = f"{USER_HEAD}{name}**", "\n".join(x for x in [h.clean_content.strip(), _fwd_text(h)] if x)
         limit = getattr(dst.guild, "filesize_limit", 10 * 1024 * 1024) or 10 * 1024 * 1024
         files, notes, total = [], [], 0
-        for a in h.attachments:
+        for a in _atts(h):
             if len(files) >= 10 or total + a.size > limit:
                 notes.append(f"（附件 {a.filename} 太大或太多，沒有搬移）")
                 continue
@@ -657,7 +675,7 @@ class ChatChannel:
             thread = m.channel
         else:                                        # 在主頻道發 → 開新的對話串
             thread = await m.create_thread(name=thread_title(m.clean_content,
-                                                             m.attachments[0].filename if m.attachments else "新對話"),
+                                                             _atts(m)[0].filename if _atts(m) else "新對話"),
                                            auto_archive_duration=10080)
             self._starters[thread.id] = m
             self._auto.add(thread.id)
@@ -1012,13 +1030,16 @@ class ChatChannel:
         latest_id = latest.id if latest is not None else (msgs[-1].id if msgs else 0)
         # 哪些圖片要以圖片交給模型：最近 MAX_IMAGES 張
         image_ids: list[int] = []
+        image_bytes = 0
         if self.llm.image_support:
             for h in reversed(msgs):
                 if self._is_bot_turn(h):
                     continue
-                for a in reversed(h.attachments):
-                    if _is_image(a) and a.size <= MAX_IMAGE_BYTES and len(image_ids) < MAX_IMAGES:
+                for a in reversed(_atts(h)):
+                    if (_is_image(a) and a.size <= MAX_IMAGE_BYTES and len(image_ids) < MAX_IMAGES
+                            and image_bytes + a.size <= MAX_IMAGES_BYTES):
                         image_ids.append(a.id)
+                        image_bytes += a.size
         thinking = False
         user_text = ""
         turns: list[dict] = []
@@ -1028,7 +1049,8 @@ class ChatChannel:
                 if body.strip():
                     turns.append({"role": "assistant", "content": body})
                 continue
-            text = copied_user_text(h.content).strip() if is_copied_user(h.content) else h.clean_content.strip()
+            text = copied_user_text(h.content).strip() if is_copied_user(h.content) else "\n".join(
+                x for x in [h.clean_content.strip(), _fwd_text(h)] if x)
             if h.id == latest_id and not dry:
                 if text.startswith(THINK_PREFIX):
                     thinking, text = True, text[len(THINK_PREFIX):].strip()
@@ -1039,7 +1061,7 @@ class ChatChannel:
                 continue
             pieces: list[str] = [text] if text else []
             images: list[dict] = []
-            for a in h.attachments:
+            for a in _atts(h):
                 if _is_image(a):
                     if a.id in image_ids:
                         data = await a.read()
