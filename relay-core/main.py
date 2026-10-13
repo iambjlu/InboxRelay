@@ -380,6 +380,7 @@ async def run(check_only: bool) -> int:
                 log.info("通知頻道互動已啟用：%s", cfg.ch_notify)
         queue_backlog(cfg, relayer)
         queue_ocr_redo(cfg, relayer)
+        queue_album_redo(cfg, relayer)
         background.append(asyncio.create_task(poll_new_records(relayer)))
 
         async def heartbeat() -> None:
@@ -601,6 +602,30 @@ def queue_ocr_redo(cfg, relayer: Relayer) -> None:
         relayer.enricher.submit(keys, mirror)
     if redo:
         log.info("🔁 %d 則圖片先前分析時沒有圖中文字，已排入重新分析", len(redo))
+
+
+def queue_album_redo(cfg, relayer: Relayer) -> None:
+    """一次性：以前相簿（同一則鏡像有好幾筆紀錄）的每一張圖，關鍵字與重點是拿「整則相簿所有摘要」做的，會把別張圖的人事物混進來。
+    現在改成每張只看自己的，所以把已分析過的相簿重新分析一次，並標記那幾天重新總結。"""
+    from paths import data_dir
+    flag = data_dir() / "gist-per-image-v1"
+    if flag.exists() or relayer.index is None or relayer.enricher is None or not cfg.enrich_backlog:
+        return
+    groups: dict[str, list] = {}
+    for e in relayer.index.entries.values():
+        if e.rec.enriched and e.rec.origin != "extra":
+            groups.setdefault(e.rec.mirror, []).append(e)
+    days: set[str] = set()
+    n = 0
+    for mirror, es in groups.items():
+        if len(es) >= 2 and any(e.rec.type in ("image", "album") for e in es):
+            relayer.enricher.submit([e.rec.key for e in es], mirror)
+            days |= {e.rec.date[:10] for e in es}
+            n += 1
+    flag.write_text("done")
+    if days and relayer.dirty is not None:
+        asyncio.get_running_loop().create_task(relayer.dirty.mark_many(sorted(days)))
+    log.info("🔁 %d 則相簿（涉及 %d 天）的重點要重做（每張圖只看自己的摘要），已排入重新分析", n, len(days))
 
 
 def queue_backlog(cfg, relayer: Relayer) -> None:

@@ -17,7 +17,7 @@ import discord
 
 import activity
 import lanes
-from ocr import useful
+from ocr import match_attachments, useful
 
 from config import Config
 from dc_output import DiscordOut
@@ -148,6 +148,23 @@ class Enricher:
         e = self.index.get(key)
         return self.text_cache.get(key) or (e.rec.excerpt if e and e.rec.excerpt else "")
 
+    def _own_summaries(self, key, text: str, parts, part_owner, att_keys: dict, n_keys: int) -> str:
+        """這筆紀錄自己的摘要：它文字裡的連結、和對應到它的那張圖／檔案。
+        一則相簿有很多張圖時，每張圖的關鍵字與重點只看自己的，不能把整則的摘要全塞給每一張（會把別張圖的人事物混進來）。"""
+        from ocr import _norm
+        ent = self.index.get(key)
+        mine = _norm(ent.rec.filename) if ent is not None and ent.rec.filename else ""
+        urls = set(find_urls(text))
+        out = []
+        for (title, summ), (kind, ref) in zip(parts, part_owner):
+            if kind == "link":
+                ok = ref in urls
+            else:
+                ok = key in att_keys.get(ref, []) or (bool(mine) and mine == _norm(ref)) or (n_keys == 1 and not att_keys)
+            if ok:
+                out.append(f"{title}：{summ}")
+        return "；".join(out)
+
     async def process(self, job: EnrichJob) -> None:
         cfg = self.cfg
         keys = [k for k in job.keys if k in self.index]
@@ -163,6 +180,7 @@ class Enricher:
         full = records.mirror_texts([e.rec for e in self.index.by_mirror(job.mirror_url)], mirror.content or "")
         texts = {k: self.text_cache.get(k) or full.get(k) or self._text(k) for k in keys}   # 摘錄只有 200 字，盡量用全文
         parts: list[tuple[str, str]] = []
+        part_owner: list[tuple[str, str]] = []        # 和 parts 一一對應：("link", 網址) 或 ("att", 檔名)，之後每筆紀錄只取屬於自己的那幾段
         # 細部進度：連結摘要＋附件＋每則關鍵字，各算一步
         n_urls = len({u for t in texts.values() for u in find_urls(t)}) if cfg.link_summary else 0
         n_atts = sum(1 for a in mirror.attachments if a.size <= MAX_FILE and not is_converted_copy(a.filename))
@@ -195,11 +213,17 @@ class Enricher:
                                            caption, describe_image=cfg.image_summary)
                 probed, png = None, None
                 parts.append((r.title, r.summary))
+                part_owner.append(("link", u))
                 if r.image is not None:
                     img_links.append(u)
                 activity.step()
         shot_posts.clear()
 
+        att_keys: dict[str, list] = {}                              # 附件檔名 → 對應的紀錄 key（相簿裡每張圖各對各的）
+        for ent, att in match_attachments(self.index.by_mirror(job.mirror_url), list(mirror.attachments),
+                                          mirror.content or ""):
+            if att is not None and ent.rec.key in keys:
+                att_keys.setdefault(att.filename, []).append(ent.rec.key)
         for a in mirror.attachments:
             name = a.filename
             if a.size > MAX_FILE or is_converted_copy(name):      # HEIC 的 JPEG 副本不重複分析
@@ -207,15 +231,17 @@ class Enricher:
             is_img = (a.content_type or "").startswith("image/") or ext_of(name) in MIME
             if is_img and cfg.image_summary:
                 data = await a.read()
-                caption = " ".join(texts.values())[:300]
-                ocr_txt = " ".join(useful(e.rec.ocr) for e in self.index.by_mirror(job.mirror_url)
-                                   if e.rec.filename == name)
+                own = att_keys.get(name, [])                        # 這張圖對應的紀錄（Discord 會改檔名，用 match_attachments 對）
+                caption = " ".join(texts.get(k, "") for k in (own or texts))[:300]
+                ocr_txt = " ".join(useful(self.index.get(k).rec.ocr) for k in own if self.index.get(k))
                 if ocr_txt:
-                    caption = f"{caption}\n圖中文字（本機辨識）：{ocr_txt[:800]}"
+                    caption = f"{caption}\n圖中文字（本機辨識，只有字、沒有左右位置，不能用來判斷是誰說的）：{ocr_txt[:800]}"
                 parts.append((f"🖼️ {name}", await summarize_image(self.llm, data, name, caption)))
+                part_owner.append(("att", name))
             elif not is_img and cfg.document_summary and (is_supported(name) or ext_of(name) in LEGACY_EXT):
                 data = await a.read()
                 parts.append((f"📄 {name}", await summarize_document(self.llm, name, data)))
+                part_owner.append(("att", name))
             data = b""
             activity.step()
 
@@ -238,7 +264,6 @@ class Enricher:
             reply_url = reply.jump_url
             for old in old_replies - {reply_url}:             # 重新分析（舊的是沒有 OCR 時做的）：新回覆發出後才刪舊的
                 await self.dc.delete_by_url(old)
-        summaries = "；".join(f"{t}：{s}" for t, s in parts)
         # 這次分析有沒有拿到 OCR 當參考：沒有 ocr_worker（終端機模式）或圖片都辨識完了才算；之後 OCR 出來會自動補做
         import ipc
         ocr_done = (not ipc.enabled()) if self.ocr_worker is None else not self.ocr_worker.pending_for(job.mirror_url)
@@ -247,6 +272,7 @@ class Enricher:
             kw, gist = [], ""
             ent = self.index.get(k)
             ocr_txt = useful(ent.rec.ocr) if ent else ""
+            summaries = self._own_summaries(k, texts[k], parts, part_owner, att_keys, len(keys))
             material = "；".join(x for x in (texts[k], summaries, ocr_txt and f"圖中文字：{ocr_txt[:1500]}") if x)
             if cfg.keywords and material.strip():
                 kw, gist = await extract_keywords(self.llm, material, list(self._recent))

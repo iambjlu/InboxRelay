@@ -61,7 +61,7 @@ async def summarize_image(llm: LLM, data: bytes, filename: str, caption: str = "
     if prep is None:
         return "（圖片格式無法轉換，略過）"
     data, mime = prep
-    prompt = prompts.get("IMAGE")
+    prompt = prompts.get("IMAGE") + "\n" + prompts.CHAT_RULE
     try:
         return await llm.chat(prompt, data=f"使用者附註：{caption}" if caption else None,
                               image=data, image_mime=mime, max_tokens=400)
