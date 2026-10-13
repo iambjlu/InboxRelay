@@ -97,6 +97,7 @@ class OfflineTest(unittest.TestCase):
             en = Enricher.__new__(Enricher)
             en.queue = asyncio.Queue()
             en._queued, en._front, en._posted, en._holding = set(), __import__("collections").deque(), [], False
+            en._skip_once = set()
             en.index = type("I", (), {"get": lambda self, k: None})()
             deleted = []
 
