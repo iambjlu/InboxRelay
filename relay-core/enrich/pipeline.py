@@ -34,6 +34,14 @@ log = logging.getLogger("enrich")
 MAX_FILE = 20 * 1024 * 1024
 
 
+def ocr_caption(ocr_txt: str) -> str:
+    """給圖片分析的「圖中文字」說明。新的 OCR 在聊天截圖會帶〔左〕〔右〕（該行文字在畫面左／右側），舊的沒有。"""
+    if "〔左〕" in ocr_txt or "〔右〕" in ocr_txt:
+        return ("圖中文字（本機辨識；行首的〔左〕〔右〕是該行在畫面左側／右側，聊天截圖的右側是使用者本人、左側是對方，"
+                "沒有標記的行位置不明；僅供參考，仍以圖片為準）：" + ocr_txt[:1200])
+    return "圖中文字（本機辨識，只有字、沒有左右位置，不能用來判斷是誰說的）：" + ocr_txt[:800]
+
+
 @dataclass
 class EnrichJob:
     keys: list
@@ -235,7 +243,7 @@ class Enricher:
                 caption = " ".join(texts.get(k, "") for k in (own or texts))[:300]
                 ocr_txt = " ".join(useful(self.index.get(k).rec.ocr) for k in own if self.index.get(k))
                 if ocr_txt:
-                    caption = f"{caption}\n圖中文字（本機辨識，只有字、沒有左右位置，不能用來判斷是誰說的）：{ocr_txt[:800]}"
+                    caption = f"{caption}\n{ocr_caption(ocr_txt)}"
                 parts.append((f"🖼️ {name}", await summarize_image(self.llm, data, name, caption)))
                 part_owner.append(("att", name))
             elif not is_img and cfg.document_summary and (is_supported(name) or ext_of(name) in LEGACY_EXT):

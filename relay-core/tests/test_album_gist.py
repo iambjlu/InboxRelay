@@ -73,6 +73,19 @@ class AlbumTest(unittest.TestCase):
         self.assertTrue(all("只有字、沒有左右位置" in cap for _, cap in captions))   # 圖片分析的 OCR 說明
         self.assertEqual(len(captions), 3)
 
+    def test_ocr_caption_explains_markers_only_when_present(self):
+        from enrich.pipeline import ocr_caption
+        new = ocr_caption("〔左〕你好\n〔右〕在嗎")
+        self.assertIn("〔左〕〔右〕", new)
+        self.assertIn("右側是使用者本人", new)
+        old = ocr_caption("你好\n在嗎")
+        self.assertIn("沒有左右位置", old)                                        # 舊的 OCR（沒有標記）維持原本說明
+        self.assertNotIn("〔右〕", old)
+
+    def test_ocr_clean_keeps_markers(self):
+        import ocr
+        self.assertEqual(ocr.clean("〔左〕你好嗎\n〔右〕我很好\n〔右〕謝謝你"), "〔左〕你好嗎\n〔右〕我很好\n〔右〕謝謝你")
+
     def test_chat_rule_is_added_to_image_prompt(self):
         import prompts
         from enrich.image import summarize_image

@@ -79,10 +79,25 @@ final class OCRService: @unchecked Sendable {
                 lastError = (useANE ? "ANE：" : attempt == 1 ? "CPU/GPU：" : "重繪後：") + error.localizedDescription
                 continue
             }
-            let lines = (req.results ?? []).compactMap { $0.topCandidates(1).first?.string }
-            return (lines.joined(separator: "\n"), nil)
+            let items: [(String, CGRect)] = (req.results ?? []).compactMap { o in
+                o.topCandidates(1).first.map { ($0.string, o.boundingBox) }
+            }
+            return (OCRService.layoutText(items), nil)
         }
         return (nil, lastError)
+    }
+
+    /// 把辨識出的每一行組成文字。像聊天截圖（左右兩邊都有好幾行文字）時，行首標上〔左〕〔右〕並由上到下排好：
+    /// 右側通常是「使用者本人」、左側是對方；之後分析才分得清楚「誰說了什麼」。其他圖片維持原樣（Vision 回傳的順序、不加標記）。
+    /// boundingBox 是 0～1 的座標（已依圖片方向轉正），x 越大越靠右、y 越大越靠上。
+    static func layoutText(_ items: [(String, CGRect)]) -> String {
+        let left = items.filter { $0.1.midX < 0.42 }.count
+        let right = items.filter { $0.1.midX > 0.58 }.count
+        guard left >= 3, right >= 3 else { return items.map { $0.0 }.joined(separator: "\n") }
+        return items.sorted { $0.1.maxY > $1.1.maxY }.map { item in
+            let x = item.1.midX
+            return (x > 0.58 ? "〔右〕" : x < 0.42 ? "〔左〕" : "") + item.0
+        }.joined(separator: "\n")
     }
 
     /// 重繪成標準 sRGB／8-bit／RGBA 點陣圖（長邊最多 4096），避開 Vision 讀不了的特殊格式。
