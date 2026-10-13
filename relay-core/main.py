@@ -381,6 +381,7 @@ async def run(check_only: bool) -> int:
         queue_backlog(cfg, relayer)
         queue_ocr_redo(cfg, relayer)
         queue_album_redo(cfg, relayer)
+        queue_note_redo(cfg, relayer)
         background.append(asyncio.create_task(poll_new_records(relayer)))
 
         async def heartbeat() -> None:
@@ -634,6 +635,37 @@ def queue_album_redo(cfg, relayer: Relayer) -> None:
         asyncio.get_running_loop().create_task(relayer.dirty.mark_many(sorted(days)))
     log.info("🔁 最近 %d 天有 %d 則相簿（涉及 %d 天）的重點要重做（每張圖只看自己的摘要，最新的先做），已排入重新分析",
              ALBUM_REDO_DAYS, len(albums), len(days))
+
+
+NOTE_REDO_WORDS = ("欠", "債", "借", "還款", "還錢", "討", "匯款", "轉帳", "請求", "催")
+NOTE_REDO_DAYS = 60
+
+
+def queue_note_redo(cfg, relayer: Relayer) -> None:
+    """一次性：以前的重點沒有「訊息是使用者本人寫的、『某人：事項』的某人是對象」這個前提，涉及金錢往來（欠、還、借、討債…）的
+    文字紀錄可能把誰欠誰、誰做事弄反了。把最近 NOTE_REDO_DAYS 天這類文字紀錄重新分析（插隊、最新的先做），並標記那幾天重新總結。"""
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+    from paths import data_dir
+    flag = data_dir() / "gist-person-v1"
+    if flag.exists() or relayer.index is None or relayer.enricher is None or not cfg.enrich_backlog:
+        return
+    since = (datetime.now(ZoneInfo(cfg.tz)) - timedelta(days=NOTE_REDO_DAYS)).strftime("%Y-%m-%d")
+    picks: dict[str, list] = {}
+    for e in relayer.index.entries.values():
+        r = e.rec
+        if (r.enriched and r.origin != "extra" and r.type == "text" and r.date[:10] >= since
+                and any(w in (r.excerpt or "") for w in NOTE_REDO_WORDS)):
+            picks.setdefault(r.mirror, []).append(e)
+    order = sorted(picks.values(), key=lambda es: max(e.rec.date for e in es))     # 由舊到新插隊 → 最新的最先做
+    days: set[str] = set()
+    for es in order:
+        relayer.enricher.submit([e.rec.key for e in es], es[0].rec.mirror, front=True)
+        days |= {e.rec.date[:10] for e in es}
+    flag.write_text("done")
+    if days and relayer.dirty is not None:
+        asyncio.get_running_loop().create_task(relayer.dirty.mark_many(sorted(days)))
+    log.info("🔁 最近 %d 天有 %d 則涉及金錢往來的文字要重新分析（主詞與方向），涉及 %d 天", NOTE_REDO_DAYS, len(order), len(days))
 
 
 def queue_backlog(cfg, relayer: Relayer) -> None:

@@ -72,6 +72,6 @@ def filter_keywords(kw: list[str], gist: str, material: str, context: list[str] 
 
 async def extract_keywords(llm: LLM, material: str, context: list[str] | None = None) -> tuple[list[str], str]:
     material = clean_material(material)
-    out = await llm.chat(prompts.render("KEYWORDS"), build_data(material, context), max_tokens=300)
+    out = await llm.chat(prompts.render("KEYWORDS") + "\n" + prompts.PERSON_RULE, build_data(material, context), max_tokens=300)
     kw, gist = parse(out)
     return filter_keywords(kw, gist, material, context)

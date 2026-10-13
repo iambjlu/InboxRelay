@@ -145,6 +145,47 @@ class AlbumTest(unittest.TestCase):
         self.assertEqual(asyncio.run(go()), ["D", "C", "A", "B"])
 
 
+    def test_person_rule_in_keywords_and_recap_and_note_redo(self):
+        import prompts
+        from enrich import keywords
+        seen = {}
+
+        class LLM:
+            async def chat(self, prompt, data=None, **k):
+                seen["prompt"] = prompt
+                return '{"kw": ["吳否"], "gist": "我11/1要向吳否請求償還1000元"}'
+        asyncio.run(keywords.extract_keywords(LLM(), "吳否： 11/1請求債務償還1000", []))
+        self.assertIn(prompts.PERSON_RULE, seen["prompt"])
+        self.assertIn("「某人：事項」的條列格式", prompts.PERSON_RULE)
+        self.assertIn("不要猜", prompts.PERSON_RULE)
+        self.assertIn("某人：事項", prompts.RECAP_RULE)                           # 總結也帶同一組人稱說明
+
+        import tempfile
+        from datetime import datetime, timedelta
+        from unittest import mock
+        from zoneinfo import ZoneInfo
+        import main as m
+        today = datetime.now(ZoneInfo("Asia/Taipei"))
+        d = lambda n: (today - timedelta(days=n)).strftime("%Y-%m-%d 12:00")
+        recs = [rec(1, mirror="M1", date=d(2), type="text", enriched=True, excerpt="吳否： 11/1請求債務償還1000"),
+                rec(2, mirror="M2", date=d(1), type="text", enriched=True, excerpt="今天吃拉麵"),
+                rec(3, mirror="M3", date=d(300), type="text", enriched=True, excerpt="借我錢"),
+                rec(4, mirror="M4", date=d(0), type="text", enriched=True, excerpt="明天要轉帳給房東")]
+        idx = FakeIndex(recs)
+        submitted = []
+
+        class Dirty:
+            async def mark_many(self, days):
+                pass
+
+        async def go():
+            relayer = N(index=idx, enricher=N(submit=lambda keys, mirror, front=False: submitted.append((mirror, front))), dirty=Dirty())
+            with tempfile.TemporaryDirectory() as tmp, mock.patch("paths.data_dir", lambda: Path(tmp)):
+                m.queue_note_redo(N(tz="Asia/Taipei", enrich_backlog=True), relayer)
+                m.queue_note_redo(N(tz="Asia/Taipei", enrich_backlog=True), relayer)      # 只做一次
+        asyncio.run(go())
+        self.assertEqual(submitted, [("M1", True), ("M4", True)])                  # 只有近期且有金錢往來字眼的；由舊到新插隊
+
     def test_ocr_caption_explains_markers_only_when_present(self):
         from enrich.pipeline import ocr_caption
         new = ocr_caption("〔左〕你好\n〔右〕在嗎")
