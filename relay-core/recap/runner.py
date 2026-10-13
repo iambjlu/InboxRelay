@@ -351,7 +351,7 @@ class Recapper:
             items.append(daily.Item(d[5:], "每日總結", text, m.jump_url))
         if not items:
             return
-        out = await self.llm.chat(self._with_note(prompts.render("RECAP_MONTHLY", month=month), month),
+        out = await self.llm.chat(self._with_note(daily.with_rule(prompts.render("RECAP_MONTHLY", month=month)), month),
                                   daily.build_material(items), max_tokens=3000)
         body = daily.link_citations(out, [it.url for it in items])
         footer = f"-# 根據 {len(items)} 天的每日總結"
@@ -371,7 +371,7 @@ class Recapper:
             items.append(daily.Item(mo, "月總結", text, m.jump_url))
         if not items:
             return
-        out = await self.llm.chat(self._with_note(prompts.render("RECAP_YEARLY", year=year), year),
+        out = await self.llm.chat(self._with_note(daily.with_rule(prompts.render("RECAP_YEARLY", year=year)), year),
                                   daily.build_material(items), max_tokens=4000)
         body = daily.link_citations(out, [it.url for it in items])
         footer = f"-# 根據 {len(items)} 個月的月總結"

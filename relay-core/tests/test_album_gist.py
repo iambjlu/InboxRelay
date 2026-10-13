@@ -73,6 +73,78 @@ class AlbumTest(unittest.TestCase):
         self.assertTrue(all("只有字、沒有左右位置" in cap for _, cap in captions))   # 圖片分析的 OCR 說明
         self.assertEqual(len(captions), 3)
 
+    def test_album_redo_is_newest_first_recent_only_and_once(self):
+        import tempfile
+        from datetime import datetime
+        from unittest import mock
+        from zoneinfo import ZoneInfo
+        import main as m
+        today = datetime.now(ZoneInfo("Asia/Taipei"))
+        from datetime import timedelta
+        d = lambda n: (today - timedelta(days=n)).strftime("%Y-%m-%d 12:00")
+        recs = [rec(1, mirror="M_old", date=d(200), type="album", enriched=True), rec(2, mirror="M_old", date=d(200), type="album", enriched=True),
+                rec(3, mirror="M_a", date=d(10), type="album", enriched=True), rec(4, mirror="M_a", date=d(10), type="album", enriched=True),
+                rec(5, mirror="M_b", date=d(1), type="album", enriched=True), rec(6, mirror="M_b", date=d(1), type="album", enriched=True),
+                rec(7, mirror="M_one", date=d(1), type="image", enriched=True),                       # 只有一筆：不是相簿
+                rec(8, mirror="M_new", date=d(0), type="album", enriched=False), rec(9, mirror="M_new", date=d(0), type="album", enriched=False)]
+        idx = FakeIndex(recs)
+        submitted, marked = [], []
+
+        class Dirty:
+            async def mark_many(self, days):
+                marked.extend(days)
+
+        async def go():
+            relayer = N(index=idx, enricher=N(submit=lambda keys, mirror, front=False: submitted.append((mirror, front))), dirty=Dirty())
+            with tempfile.TemporaryDirectory() as tmp, mock.patch("paths.data_dir", lambda: Path(tmp)):
+                m.queue_album_redo(N(tz="Asia/Taipei", enrich_backlog=True), relayer)
+                first = list(submitted)
+                m.queue_album_redo(N(tz="Asia/Taipei", enrich_backlog=True), relayer)          # 只做一次
+                await asyncio.sleep(0)
+                return first, list(submitted)
+        first, after = asyncio.run(go())
+        self.assertEqual(first, [("M_a", True), ("M_b", True)])                   # 插隊；由舊到新插 → 最新的 M_b 在最前面最先做；200 天前的、單張的、還沒分析的都不排
+        self.assertEqual(after, first)
+        self.assertEqual(len(marked), 2)                                         # 那兩天標記重新總結
+
+    def test_recap_prompts_carry_person_rule(self):
+        import prompts
+        from recap import daily
+        self.assertIn(prompts.RECAP_RULE, daily.build_prompt("2026-10-12"))
+        self.assertIn(prompts.RECAP_RULE, daily.with_rule("月總結的提示詞"))
+        self.assertIn("你和 X 聊到", prompts.RECAP_RULE)
+        self.assertIn("使用者與〈對方", prompts.CHAT_RULE)
+
+    def test_enricher_front_jobs_run_first_and_queue_duplicate_is_skipped(self):
+        from unittest import mock
+        import activity
+        from enrich.pipeline import Enricher
+
+        async def go():
+            e = Enricher(N(), N(), None, FakeIndex([]), {}, None)
+            order = []
+
+            async def process(job):
+                order.append(job.mirror_url)
+            e.process = process
+
+            async def gate(*a):
+                return None
+            for m in ("A", "B", "C"):
+                e.submit([(-1, 1)], m)
+            e.submit([(-1, 1)], "C", front=True)                    # 插隊；一般佇列裡的 C 之後要略過
+            e.submit([(-1, 1)], "D", front=True)                    # 後插的在更前面
+            with mock.patch.object(activity, "gate", gate), mock.patch("lanes.get", lambda n: None):
+                t = asyncio.create_task(e.run())
+                for _ in range(100):
+                    await asyncio.sleep(0.01)
+                    if e.drained:
+                        break
+                t.cancel()
+            return order
+        self.assertEqual(asyncio.run(go()), ["D", "C", "A", "B"])
+
+
     def test_ocr_caption_explains_markers_only_when_present(self):
         from enrich.pipeline import ocr_caption
         new = ocr_caption("〔左〕你好\n〔右〕在嗎")

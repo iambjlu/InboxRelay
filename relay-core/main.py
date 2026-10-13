@@ -598,34 +598,42 @@ def queue_ocr_redo(cfg, relayer: Relayer) -> None:
         r = e.rec
         if r.enriched and not r.enriched_ocr and is_image_record(r) and useful(r.ocr):
             redo.setdefault(r.mirror, []).append(r.key)
-    for mirror, keys in redo.items():
-        relayer.enricher.submit(keys, mirror)
+    newest = {m: max(relayer.index.get(k).rec.date for k in keys) for m, keys in redo.items()}
+    for mirror in sorted(redo, key=lambda m: newest[m], reverse=True):          # 最近的先做
+        relayer.enricher.submit(redo[mirror], mirror)
     if redo:
         log.info("🔁 %d 則圖片先前分析時沒有圖中文字，已排入重新分析", len(redo))
 
 
+ALBUM_REDO_DAYS = 45      # 相簿重做只做最近這麼多天（更早的相簿重做要花很久；需要的話再調大）
+
+
 def queue_album_redo(cfg, relayer: Relayer) -> None:
     """一次性：以前相簿（同一則鏡像有好幾筆紀錄）的每一張圖，關鍵字與重點是拿「整則相簿所有摘要」做的，會把別張圖的人事物混進來。
-    現在改成每張只看自己的，所以把已分析過的相簿重新分析一次，並標記那幾天重新總結。"""
+    現在改成每張只看自己的，所以把最近 ALBUM_REDO_DAYS 天、已分析過的相簿重新分析（插隊、最新的先做），並標記那幾天重新總結。"""
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
     from paths import data_dir
-    flag = data_dir() / "gist-per-image-v1"
+    flag = data_dir() / "gist-per-image-v2"
     if flag.exists() or relayer.index is None or relayer.enricher is None or not cfg.enrich_backlog:
         return
+    since = (datetime.now(ZoneInfo(cfg.tz)) - timedelta(days=ALBUM_REDO_DAYS)).strftime("%Y-%m-%d")
     groups: dict[str, list] = {}
     for e in relayer.index.entries.values():
         if e.rec.enriched and e.rec.origin != "extra":
             groups.setdefault(e.rec.mirror, []).append(e)
+    albums = [es for es in groups.values()
+              if len(es) >= 2 and any(e.rec.type in ("image", "album") for e in es) and max(e.rec.date for e in es)[:10] >= since]
+    albums.sort(key=lambda es: max(e.rec.date for e in es))                       # 由舊到新插隊 → 最新的排在最前面、最先做
     days: set[str] = set()
-    n = 0
-    for mirror, es in groups.items():
-        if len(es) >= 2 and any(e.rec.type in ("image", "album") for e in es):
-            relayer.enricher.submit([e.rec.key for e in es], mirror)
-            days |= {e.rec.date[:10] for e in es}
-            n += 1
+    for es in albums:
+        relayer.enricher.submit([e.rec.key for e in es], es[0].rec.mirror, front=True)     # 插隊：不用等排在前面的上千則重新分析
+        days |= {e.rec.date[:10] for e in es}
     flag.write_text("done")
     if days and relayer.dirty is not None:
         asyncio.get_running_loop().create_task(relayer.dirty.mark_many(sorted(days)))
-    log.info("🔁 %d 則相簿（涉及 %d 天）的重點要重做（每張圖只看自己的摘要），已排入重新分析", n, len(days))
+    log.info("🔁 最近 %d 天有 %d 則相簿（涉及 %d 天）的重點要重做（每張圖只看自己的摘要，最新的先做），已排入重新分析",
+             ALBUM_REDO_DAYS, len(albums), len(days))
 
 
 def queue_backlog(cfg, relayer: Relayer) -> None:

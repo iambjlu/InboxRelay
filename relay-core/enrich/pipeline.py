@@ -60,6 +60,7 @@ class Enricher:
         self.queue: "asyncio.Queue[EnrichJob]" = asyncio.Queue()
         self._recent: deque[str] = deque(maxlen=3)
         self._queued: set[str] = set()
+        self._skip_once: set[str] = set()         # 已經插隊先做過的鏡像：一般佇列裡那份輪到時略過
         self._front: deque[EnrichJob] = deque()   # 外部 LLM 連不上而退回來的工作：恢復後最先做
         self._posted: list = []                  # 這則工作已經發出去的訊息（連不上時收回，避免重做時重複）
         self._holding = False          # 手上有一則正在做（或在等夜間時段）
@@ -67,11 +68,21 @@ class Enricher:
         self.ocr_worker = None         # OcrWorker：分析圖片前先等這則的圖中文字辨識完（本機 ANE 車道在跑時），當分析的參考
         self.shot_worker = None        # ShotWorker：連結截圖車道（有自己的排程；分析時車道開著就先截圖當輔助）
 
-    def submit(self, keys: list, mirror_url: str) -> None:
+    def submit(self, keys: list, mirror_url: str, front: bool = False) -> None:
+        """排進分析佇列。front=True：插隊到最前面（後面排的在更前面）；這則如果已經在一般佇列裡，輪到時會被略過。"""
+        job = EnrichJob(list(keys), mirror_url)
+        if front:
+            if mirror_url in self._queued:
+                self._skip_once.add(mirror_url)
+            self._queued.add(mirror_url)
+            self._front.appendleft(job)
+            if self.shot_worker is not None:
+                self.shot_worker.submit(mirror_url, front=True)
+            return
         if mirror_url in self._queued:
             return
         self._queued.add(mirror_url)
-        self.queue.put_nowait(EnrichJob(list(keys), mirror_url))
+        self.queue.put_nowait(job)
         if self.shot_worker is not None:
             self.shot_worker.submit(mirror_url)
 
@@ -91,6 +102,10 @@ class Enricher:
                 task, done = None, 0
             from_queue = not self._front
             job = await self.queue.get() if from_queue else self._front.popleft()
+            if from_queue and job.mirror_url in self._skip_once:        # 這則已經插隊做過了
+                self._skip_once.discard(job.mirror_url)
+                self.queue.task_done()
+                continue
             self._holding = True
             self._queued.discard(job.mirror_url)
             try:

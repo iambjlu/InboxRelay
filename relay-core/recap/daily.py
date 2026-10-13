@@ -36,8 +36,13 @@ def build_material(items: list[Item], per_item: int | None = None, max_chars: in
     return "\n".join(lines)
 
 
+def with_rule(prompt: str) -> str:
+    """每日／月／年總結一律加上人稱規則（資料是使用者自己的紀錄；聊天截圖是「你」和對方的對話）。"""
+    return prompt + "\n" + prompts.RECAP_RULE
+
+
 def build_prompt(date: str) -> str:
-    return prompts.render("RECAP_DAILY", date=date)
+    return with_rule(prompts.render("RECAP_DAILY", date=date))
 
 
 _CITE_RE = re.compile(r"\[(\d+(?:\s*[,，、]\s*\d+)*)\]")
