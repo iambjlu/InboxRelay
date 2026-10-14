@@ -382,6 +382,8 @@ async def run(check_only: bool) -> int:
         queue_ocr_redo(cfg, relayer)
         queue_album_redo(cfg, relayer)
         queue_note_redo(cfg, relayer)
+        if relayer.reverse is not None:
+            background.append(asyncio.create_task(relayer.reverse.backfill_forwards()))
         background.append(asyncio.create_task(poll_new_records(relayer)))
 
         async def heartbeat() -> None:

@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 
@@ -73,12 +74,42 @@ class ReverseSync:
             return
         if m.type not in (discord.MessageType.default, discord.MessageType.reply):
             return
-        text = m.clean_content.strip()
-        if not text and not m.attachments:
-            return
+        await self._relay(m)
+
+    async def _relay(self, m: discord.Message) -> int:
+        """把一則 Discord 訊息（含轉發的內容與附件）送到 Telegram 並記錄。回傳送出幾則。"""
+        atts = formatting.atts_of(m)
+        text = formatting.full_text(m, label=False)
+        if not text and not atts:
+            return 0
         async with self.r.lock:
-            sent = await self._send(text, list(m.attachments))
+            sent = await self._send(text, atts)
             await self._record(m, sent)
+        return len(sent)
+
+    async def backfill_forwards(self) -> None:
+        """一次性：#投遞箱鏡像 以前轉發進來的訊息（當時沒有同步）補送到 Telegram，由舊到新。
+        已經有 origin=dc 紀錄的跳過；全部做完才寫旗標，中途停掉下次會接著做。"""
+        from paths import data_dir
+        flag = data_dir() / "reverse-forward-v1"
+        if flag.exists() or not self.cfg.reverse_sync or self.r.index is None:
+            return
+        channel = await self.r.dc.channel(self.cfg.ch_inbox_mirror)
+        n = 0
+        async for m in channel.history(limit=None, oldest_first=True):   # type: ignore[attr-defined]
+            if (not self._mine(m.channel.id, m.author) or m.webhook_id or not getattr(m, "message_snapshots", None)
+                    or m.type not in (discord.MessageType.default, discord.MessageType.reply)):
+                continue
+            if any(e.rec.origin == "dc" for e in self.r.index.by_mirror(m.jump_url)):
+                continue
+            try:
+                n += 1 if await self._relay(m) else 0
+            except Exception:
+                log.exception("補送轉發訊息失敗（Discord %s）", m.id)
+                return                                       # 不寫旗標，下次啟動再接著做
+            await asyncio.sleep(1.5)                          # Telegram 發送頻率限制
+        flag.write_text("done")
+        log.info("🔁 補送過往轉發的訊息到 Telegram：%d 則", n)
 
     async def _send(self, text: str, atts: list) -> list[tuple]:
         """送到 Telegram；回傳 [(tg Message, type, filename, 帶的文字)]。"""
@@ -155,7 +186,7 @@ class ReverseSync:
             bot = r.bot
             changed = False
             # 1) 在 Discord 拿掉的附件 → Telegram 那則也刪掉
-            names = {a.filename for a in m.attachments}
+            names = {a.filename for a in formatting.atts_of(m)}
             for e in list(hits):
                 if e.rec.filename and e.rec.filename not in names:
                     await self._tg_delete(e.rec.tg_chat, e.rec.tg_msg)
@@ -163,7 +194,7 @@ class ReverseSync:
                     hits.remove(e)
                     changed = True
             # 2) 文字改了 → 改 Telegram 的文字／說明
-            new = m.clean_content.strip()
+            new = formatting.full_text(m, label=False)
             if hits:
                 first = hits[0]
                 old = r.text_cache.get(first.rec.key)

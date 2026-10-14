@@ -41,6 +41,7 @@ from zoneinfo import ZoneInfo
 import discord
 
 import activity
+import formatting
 import prompts
 from memory import MEM_TAG, PROMPT_TAG, MemoryStore, unwrap_block, wrap_block
 from recap import daily
@@ -100,21 +101,8 @@ def _is_image(a) -> bool:
     return (a.content_type or "").startswith("image/") or a.filename.lower().endswith(IMAGE_EXT)
 
 
-def _atts(h) -> list:
-    """訊息的附件；轉發的訊息（message_snapshots）內容和附件在快照裡，一併算進來。"""
-    out = list(h.attachments)
-    for snap in getattr(h, "message_snapshots", None) or []:
-        out += list(snap.attachments)
-    return out
-
-
-def _fwd_text(h) -> str:
-    """轉發訊息快照裡的文字，標明是轉發的。沒有轉發就回空字串。"""
-    parts = []
-    for snap in getattr(h, "message_snapshots", None) or []:
-        c = (snap.content or "").strip()
-        parts.append(f"（轉發的訊息）{c}" if c else "（轉發的訊息）")
-    return "\n".join(parts)
+_atts = formatting.atts_of
+_fwd_text = formatting.fwd_text
 
 
 def _mime(a) -> str:

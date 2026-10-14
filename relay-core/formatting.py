@@ -6,6 +6,31 @@ import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+
+def atts_of(m) -> list:
+    """訊息的附件；Discord「轉發」的訊息，內容和附件在 message_snapshots 裡，一併算進來。"""
+    out = list(m.attachments)
+    for snap in getattr(m, "message_snapshots", None) or []:
+        out += list(snap.attachments)
+    return out
+
+
+def fwd_text(m, label: bool = True) -> str:
+    """轉發訊息快照裡的文字（label=True 時標上「（轉發的訊息）」）。沒有轉發就回空字串。"""
+    parts = []
+    for snap in getattr(m, "message_snapshots", None) or []:
+        c = (snap.content or "").strip()
+        if label:
+            parts.append(f"（轉發的訊息）{c}" if c else "（轉發的訊息）")
+        elif c:
+            parts.append(c)
+    return "\n".join(parts)
+
+
+def full_text(m, label: bool = True) -> str:
+    """訊息本身的文字加上轉發內容。"""
+    return "\n".join(x for x in [m.clean_content.strip(), fwd_text(m, label)] if x)
+
 DISCORD_LIMIT = 2000
 TRUNC_SUFFIX = "…（已截斷）"
 # 標頭：「# 2026-10-02-Friday」（舊格式「# 2026-10-02」也認得）

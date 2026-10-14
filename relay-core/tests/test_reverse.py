@@ -81,3 +81,52 @@ class ReverseTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ForwardBackfillTest(unittest.TestCase):
+    def test_forward_relay_and_backfill(self):
+        import discord
+        import tempfile
+        from unittest import mock
+        N = types.SimpleNamespace
+        bot = Bot()
+        cfg = types.SimpleNamespace(tg_inbox_chat_id=-1, reverse_sync=True, ch_inbox_mirror=7, tz="Asia/Taipei")
+        sent_rel = []
+
+        class Lock:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+
+        def fwd(i, content="# 2026-10-12", atts=(), done=False):
+            return N(id=i, channel=N(id=7), author=N(bot=False), webhook_id=None, type=discord.MessageType.default,
+                     clean_content="", attachments=[], jump_url=f"u{i}", message_snapshots=[N(content=content, attachments=list(atts))])
+        plain = N(id=1, channel=N(id=7), author=N(bot=False), webhook_id=None, type=discord.MessageType.default,
+                  clean_content="hi", attachments=[], jump_url="u1", message_snapshots=[])
+        old = fwd(2, atts=[Att("a.png")])
+        done = fwd(3)
+        text_only = fwd(4, atts=[])
+
+        class Hist:
+            def __init__(self, ms): self.ms = ms
+            def __aiter__(self):
+                async def g():
+                    for m in self.ms: yield m
+                return g()
+
+        idx = N(by_mirror=lambda u: [N(rec=N(origin="dc"))] if u == "u3" else [])
+        r = N(bot=bot, cfg=cfg, index=idx, lock=Lock(), dc=N(channel=None))
+
+        async def channel(_):
+            return N(history=lambda **k: Hist([plain, old, done, text_only]))
+        r.dc.channel = channel
+        rs = ReverseSync(r)
+
+        async def rec(m, sent): sent_rel.append((m.id, len(sent)))
+        rs._record = rec
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("paths.data_dir", lambda: Path(tmp)), \
+                mock.patch("asyncio.sleep", new=mock.AsyncMock()):
+            asyncio.run(rs.backfill_forwards())
+            asyncio.run(rs.backfill_forwards())                     # 旗標：只做一次
+        self.assertEqual([c[0] for c in bot.calls], ["photo", "text"])
+        self.assertEqual(bot.calls[0][1], "# 2026-10-12")           # 轉發的文字當第一張圖的說明
+        self.assertEqual([i for i, _ in sent_rel], [2, 4])          # 一般訊息、已同步過的略過
