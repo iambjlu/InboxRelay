@@ -225,19 +225,13 @@ async def run(check_only: bool) -> int:
             aitest = AiTestChannel(cfg, dc, llm)  # type: ignore[arg-type]
 
         if llm:
-            startup.stage("連線外部 LLM", cfg.ai_server)
-            try:
-                models = await asyncio.wait_for(llm.ping(), timeout=15)
-                ok = cfg.ai_model in models
-                ai_status = "✅ 已連線" if ok else "⚠️ 已連線但找不到模型"
-                log.info("外部 LLM 已連線：%s（模型 %s %s）", cfg.ai_server, cfg.ai_model,
-                         "✅" if ok else f"❌ 不在清單：{', '.join(models[:5])}")
-            except Exception as e:
-                ai_status = "❌ 連不上"
-                log.warning("外部 LLM 連不上（%s）：%s；搬移照常，AI 工作留到下次開始時間再試", cfg.ai_server, e)
-                lane = lanes.get("llm")
-                if lane is not None:
-                    lane.go_offline(type(e).__name__)
+            llm_lane = lanes.get("llm")
+            if llm_lane is not None:
+                llm_lane.probe = llm.ping
+            # 第一次連線留到「全部啟動完成後 LLM_FIRST_PING_DELAY 秒」（剛開機時 Tailscale 等網路常常還沒好）；之前 LLM 車道先等著
+            ai_status = "⏳ 啟動完成後連線"
+            if llm_lane is not None:
+                llm_lane.connecting = True
         if llm:
             startup.stage("載入記憶與提示詞")
             from memory import MemoryStore
@@ -439,6 +433,7 @@ async def run(check_only: bool) -> int:
             log.info("📸 連結截圖：%s%s", shot_lane.describe(), "（外部 LLM 等截圖做完才開始）" if cfg.llm_wait_shot else "")
         else:
             lanes.LANES.pop("shot", None)           # 沒開連結截圖：不顯示這條車道
+        server = None
         if ipc.enabled():
             from ocr import OcrWorker
             server = ipc.IpcServer(act, relayer, lambda: recapper, tg, cfg, ai_status, stop)
@@ -486,6 +481,8 @@ async def run(check_only: bool) -> int:
                 if prev_restore:
                     prev_restore()
             restore_console = restore_all
+        if llm:
+            background.append(asyncio.create_task(first_llm_connect(cfg, llm, llm_lane, server)))
         await notify(dc, cfg, online_message(cfg, tg, relayer, mem, recapper, ai_status))
         await stop.wait()
         log.info("收到結束訊號，關閉中…")
@@ -534,6 +531,32 @@ async def notify(dc: DiscordOut, cfg, text: str) -> None:
 def shot_ok() -> bool:
     from enrich.screenshot import available
     return available()
+
+
+LLM_FIRST_PING_DELAY = 10
+
+
+async def first_llm_connect(cfg, llm, lane, server=None) -> None:
+    """全部啟動完成後等 LLM_FIRST_PING_DELAY 秒才第一次連外部 LLM；連不上就交給車道的離線重試（lanes.RETRY_DELAYS）。"""
+    await asyncio.sleep(LLM_FIRST_PING_DELAY)
+    try:
+        models = await asyncio.wait_for(llm.ping(), timeout=15)
+        ok = cfg.ai_model in models
+        status = "✅ 已連線" if ok else "⚠️ 已連線但找不到模型"
+        log.info("外部 LLM 已連線：%s（模型 %s %s）", cfg.ai_server, cfg.ai_model,
+                 "✅" if ok else f"❌ 不在清單：{', '.join(models[:5])}")
+        failed = None
+    except Exception as e:
+        status, failed = "❌ 連不上（自動重試中）", e
+        log.warning("外部 LLM 連不上（%s）：%s；搬移照常，會自動重試，AI 工作先保留", cfg.ai_server, e)
+    if server is not None:
+        server.ai_status = status
+    if lane is not None:
+        lane.connecting = False
+        if failed is not None:
+            lane.go_offline(type(failed).__name__)
+        else:
+            lane.notify()
 
 
 def online_message(cfg, tg, relayer: Relayer, mem, recapper, ai_status: str) -> str:

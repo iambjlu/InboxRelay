@@ -136,3 +136,84 @@ class BlockedTest(unittest.TestCase):
             self.assertTrue(lane.allowed())
             await asyncio.wait_for(lane.gate(), 1)
         asyncio.run(go())
+
+
+class OfflineRetryTest(unittest.TestCase):
+    def test_retries_until_reachable_then_resumes(self):
+        import asyncio
+        from unittest import mock
+        import lanes as L
+
+        async def go():
+            lane = L.Lane("llm", "外部 LLM 工作", "always")
+            tries = []
+
+            async def probe():
+                tries.append(1)
+                if len(tries) < 3:
+                    raise ConnectionError("tailscale not up")
+                return ["m"]
+            lane.probe = probe
+            with mock.patch("asyncio.sleep", new=mock.AsyncMock()):
+                lane.go_offline("APIConnectionError")
+                self.assertTrue(lane.offline)
+                await lane._retrying
+            self.assertEqual(len(tries), 3)
+            self.assertFalse(lane.offline)
+            self.assertTrue(lane._trigger.is_set())              # 原本就該做事 → 立即開始
+        asyncio.run(go())
+
+    def test_gives_up_after_all_delays(self):
+        import asyncio
+        from unittest import mock
+        import lanes as L
+
+        async def go():
+            lane = L.Lane("llm", "外部 LLM 工作", "always")
+            n = []
+
+            async def probe():
+                n.append(1)
+                raise ConnectionError
+            lane.probe = probe
+            with mock.patch("asyncio.sleep", new=mock.AsyncMock()):
+                lane.go_offline()
+                await lane._retrying
+            self.assertEqual(len(n), len(L.RETRY_DELAYS))
+            self.assertTrue(lane.offline)                          # 之後交給原本的排程
+        asyncio.run(go())
+
+
+class FirstConnectTest(unittest.TestCase):
+    def test_waits_then_connects_or_goes_offline(self):
+        import asyncio
+        from types import SimpleNamespace as N
+        from unittest import mock
+        import lanes as L
+        import main as m
+
+        async def go(ok):
+            lane = L.Lane("llm", "外部 LLM 工作", "always")
+            lane.connecting = True
+            self.assertFalse(lane.allowed())
+
+            async def ping():
+                if not ok:
+                    raise ConnectionError
+                return ["mm"]
+            server = N(ai_status="")
+            slept = []
+
+            async def fake_sleep(d): slept.append(d)
+            with mock.patch("asyncio.sleep", new=fake_sleep):
+                await m.first_llm_connect(N(ai_server="s", ai_model="mm"), N(ping=ping), lane, server)
+                if lane._retrying:
+                    lane._retrying.cancel()
+            self.assertEqual(slept[0], 10)                       # 全部啟動後先等 10 秒
+            return lane, server
+        lane, server = asyncio.run(go(True))
+        self.assertTrue(lane.allowed())
+        self.assertIn("已連線", server.ai_status)
+        lane, server = asyncio.run(go(False))
+        self.assertTrue(lane.offline)
+        self.assertFalse(lane.connecting)

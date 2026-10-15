@@ -23,7 +23,8 @@ from zoneinfo import ZoneInfo
 log = logging.getLogger("lanes")
 
 MODES = ("always", "daily", "window", "manual")
-ALWAYS_CHECK_SEC = 600      # 「永遠立即執行」多久檢查一次總結
+ALWAYS_CHECK_SEC = 600
+RETRY_DELAYS = (20, 40, 60, 120, 180, 300, 300, 300, 300)   # 離線後自動重試的間隔（秒），合計約 27 分鐘      # 「永遠立即執行」多久檢查一次總結
 MODE_LABEL = {"always": "永遠立即執行", "daily": "每天自動開始到做完為止",
               "window": "每天自動開始與暫停", "manual": "手動執行"}
 
@@ -52,9 +53,12 @@ class Lane:
         self.manual = False
         self.paused = False
         self.available = True                   # ane：App 沒連上時 False
+        self.connecting = False                 # llm：啟動後還沒做第一次連線（先不開工）
         self.offline = False                    # llm：外部 LLM 連不上 → 這一輪先停，下次開始時間再試
         self.next_start: datetime | None = None
         self.close_at: datetime | None = None
+        self.probe: Callable[[], Awaitable] | None = None   # llm：探測外部 LLM 連不連得上（離線後依 RETRY_DELAYS 重試）
+        self._retrying: asyncio.Task | None = None
         self.blocked_by: Callable[[], bool] | None = None   # 回傳 True＝暫時不能跑（例如 llm 等連結截圖做完）
         self._changed = asyncio.Event()
         self._trigger = asyncio.Event()
@@ -64,7 +68,7 @@ class Lane:
         return datetime.now(self.tz)
 
     def allowed(self) -> bool:
-        return (self.available and not self.paused and not self.offline and (self.mode == "always" or self.open)
+        return (self.available and not self.paused and not self.offline and not self.connecting and (self.mode == "always" or self.open)
                 and not self.blocked)
 
     @property
@@ -99,10 +103,31 @@ class Lane:
                 pass
 
     # ------------------------------------------------------------ 操作
+    async def _retry_probe(self, resume: bool) -> None:
+        """離線後（例如剛開機 Tailscale 還沒連上）在 RETRY_DELAYS 的間隔各探測一次；連上就恢復，並在原本就該做事時立即開始。"""
+        for i, delay in enumerate(RETRY_DELAYS, 1):
+            await asyncio.sleep(delay)
+            if not self.offline:
+                return
+            try:
+                await asyncio.wait_for(self.probe(), timeout=15)    # type: ignore[misc]
+            except Exception as e:
+                log.info("🔌 %s：第 %d／%d 次重試連線外部 LLM 仍失敗（%s）", self.label, i, len(RETRY_DELAYS), type(e).__name__)
+                continue
+            log.info("🔌 %s：外部 LLM 已連上", self.label)
+            self.offline = False
+            self.notify()
+            if resume:
+                self.run_now()
+            return
+
     def go_offline(self, why: str = "") -> None:
         """外部 LLM 連不上：這一輪停下來，積欠的工作都留著，下次開始時間（永遠執行＝10 分鐘後）再試。"""
         if not self.offline:
             self.offline = True
+            if self.probe is not None and (self._retrying is None or self._retrying.done()):
+                resume = self.open or self.mode == "always" or self._trigger.is_set()
+                self._retrying = asyncio.get_running_loop().create_task(self._retry_probe(resume))
             log.warning("🔌 %s：外部 LLM 連不上%s，沒做完的留到%s再試", self.label, f"（{why}）" if why else "",
                         "10 分鐘後" if self.mode == "always" else "下次開始時間")
             self.notify()
@@ -130,6 +155,8 @@ class Lane:
         return True
 
     def describe(self) -> str:
+        if self.connecting:
+            return "等第一次連線外部 LLM"
         if self.blocked:
             return "等連結截圖做完"
         if self.mode == "always":
