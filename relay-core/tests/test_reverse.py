@@ -130,3 +130,37 @@ class ForwardBackfillTest(unittest.TestCase):
         self.assertEqual([c[0] for c in bot.calls], ["photo", "text"])
         self.assertEqual(bot.calls[0][1], "# 2026-10-12")           # 轉發的文字當第一張圖的說明
         self.assertEqual([i for i, _ in sent_rel], [2, 4])          # 一般訊息、已同步過的略過
+
+
+class SweepTest(unittest.TestCase):
+    def test_sweep_deletes_discord_when_telegram_deleted(self):
+        import time
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from unittest import mock
+        N = types.SimpleNamespace
+        now = datetime.now(ZoneInfo("Asia/Taipei"))
+        date = now.strftime("%Y-%m-%d %H:%M")
+        mk = lambda key, origin="dc", mirror="M1": N(rec=N(origin=origin, mirror=mirror, date=date, key=key))
+        es = {(-1, 1): mk((-1, 1)), (-1, 2): mk((-1, 2), mirror="M2"), (-1, 3): mk((-1, 3), origin="live", mirror="M3")}
+        probed, deleted = [], []
+
+        class Prober:
+            async def probe(self, key):
+                probed.append(key); return "deleted" if key == (-1, 1) else "alive"
+
+        async def on_deleted(keys, mirror, all_deleted): deleted.append((keys, mirror, all_deleted))
+        cfg = types.SimpleNamespace(tz="Asia/Taipei", reverse_sync=True)
+
+        async def go():
+            pr = Prober()
+            pr._sem = asyncio.Semaphore(1)
+            rs = ReverseSync(N(cfg=cfg, prober=pr, index=N(entries=es), on_deleted=on_deleted))
+            with mock.patch("asyncio.sleep", new=mock.AsyncMock()):
+                a = await rs.sweep_once()
+                b = await rs.sweep_once()                         # 間隔沒到 → 不再探測
+            return a, b
+        a, b = asyncio.run(go())
+        self.assertEqual((a, b), (1, 0))
+        self.assertEqual(sorted(probed), [(-1, 1), (-1, 2)])      # live 的不在這裡處理
+        self.assertEqual(deleted, [([(-1, 1)], "M1", True)])

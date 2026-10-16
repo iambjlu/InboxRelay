@@ -25,6 +25,8 @@ TG_UPLOAD_MAX = 50 * 1024 * 1024
 TG_PHOTO_MAX = 10 * 1024 * 1024
 CAPTION_MAX = 1024
 TEXT_MAX = 4096
+SWEEP_EVERY_SEC = 300
+SWEEP_TIERS = ((3600, 300), (24 * 3600, 1800), (7 * 24 * 3600, 3 * 3600))    # (訊息年齡上限, 探測間隔) 秒
 PHOTO_EXT = (".jpg", ".jpeg", ".png", ".webp")
 
 
@@ -59,6 +61,7 @@ def chunks(xs: list, n: int = 10) -> list[list]:
 class ReverseSync:
     def __init__(self, relayer) -> None:
         self.r = relayer
+        self._last_probe: dict[str, float] = {}
 
     @property
     def cfg(self):
@@ -239,6 +242,59 @@ class ReverseSync:
                 log.warning("Telegram 編輯失敗（#%s）：%s", mid, ex)
         r.text_cache[e.rec.key] = new
         await r.index.update(e.rec.key, excerpt=records.make_excerpt(new) if new else None)
+
+    # ------------------------------------------------------------------ Telegram 端被刪 → 刪 Discord
+    def _probe_interval(self, age_sec: float) -> float:
+        for limit, every in SWEEP_TIERS:
+            if age_sec < limit:
+                return every
+        return 0                                           # 太舊了不再探測
+
+    async def sweep_once(self, now: float | None = None) -> int:
+        """Telegram 無法通知 bot 訊息被刪，只能定期探測（copyMessage）。原本的刪除同步只在送出後 5 分鐘探測一次，
+        之後在 Telegram 刪掉就永遠不會同步；這裡對 origin=dc 的紀錄依年齡定期再探測（越新越勤），
+        被刪的 → 走 Relayer.on_deleted（整則都被刪就刪掉 Discord 那則）。回傳被刪的紀錄數。"""
+        import time
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        r = self.r
+        if r.prober is None or r.index is None:
+            return 0
+        now = time.time() if now is None else now
+        tz = ZoneInfo(self.cfg.tz)
+        groups: dict[str, list] = {}
+        for e in list(r.index.entries.values()):
+            if e.rec.origin == "dc":
+                groups.setdefault(e.rec.mirror, []).append(e)
+        deleted_total = 0
+        for mirror, es in groups.items():
+            sent = datetime.strptime(es[0].rec.date, "%Y-%m-%d %H:%M").replace(tzinfo=tz).timestamp()
+            every = self._probe_interval(now - sent)
+            if not every or now - self._last_probe.get(mirror, 0) < every:
+                continue
+            self._last_probe[mirror] = now
+            gone = []
+            async with r.prober._sem:
+                for e in es:
+                    if await r.prober.probe(e.rec.key) == "deleted":
+                        gone.append(e.rec.key)
+                    await asyncio.sleep(0.3)
+            if gone:
+                deleted_total += len(gone)
+                await r.on_deleted(gone, mirror, len(gone) == len(es))
+        for m in [m for m in self._last_probe if m not in groups]:
+            del self._last_probe[m]
+        return deleted_total
+
+    async def sweep_loop(self) -> None:
+        while True:
+            await asyncio.sleep(SWEEP_EVERY_SEC)
+            try:
+                await self.sweep_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Telegram 刪除偵測（反向同步）失敗")
 
     # ------------------------------------------------------------------ 刪除
     async def _tg_delete(self, chat: int, mid: int) -> None:
