@@ -23,6 +23,7 @@ from config import Config
 from dc_output import DiscordOut
 from enrich.document import LEGACY_EXT, ext_of, is_supported, summarize_document
 from enrich.image import MIME, is_converted_copy, summarize_image
+from enrich import summaryhome
 from enrich.keywords import extract_keywords
 from enrich.link import embed_preview, find_urls, probe_link, summarize_probed
 from kwindex import KwIndex
@@ -279,11 +280,16 @@ class Enricher:
             shot_urls = [u for k in keys for u in success_links(self.index.get(k).rec.shot)]   # 截圖車道先拍好的
             if shot_urls:
                 lines.append(shot_line(list(dict.fromkeys(shot_urls))))
-            chunks = daily.split_message("\n".join(lines))
-            reply = await mirror.reply(chunks[0], mention_author=False, suppress_embeds=True)
-            self._posted.append(reply)
-            for c in chunks[1:]:
-                self._posted.append(await mirror.channel.send(c, suppress_embeds=True))
+            if summaryhome.can_move(self.dc, cfg, mirror):         # 摘要貼到連結預覽頻道，鏡像只留小箭頭
+                msgs = await summaryhome.post(self.dc, cfg, mirror, "\n".join(lines))
+                self._posted += msgs
+                reply = msgs[0]
+            else:
+                chunks = daily.split_message("\n".join(lines))
+                reply = await mirror.reply(chunks[0], mention_author=False, suppress_embeds=True)
+                self._posted.append(reply)
+                for c in chunks[1:]:
+                    self._posted.append(await mirror.channel.send(c, suppress_embeds=True))
             reply_url = reply.jump_url
             for old in old_replies - {reply_url}:             # 重新分析（舊的是沒有 OCR 時做的）：新回覆發出後才刪舊的
                 await self.dc.delete_by_url(old)

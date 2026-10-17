@@ -376,6 +376,9 @@ async def run(check_only: bool) -> int:
         queue_ocr_redo(cfg, relayer)
         queue_album_redo(cfg, relayer)
         queue_note_redo(cfg, relayer)
+        if relayer.index is not None:
+            from enrich import summaryhome
+            background.append(asyncio.create_task(summaryhome.migrate_recent(dc, cfg, relayer.index)))
         if relayer.reverse is not None:
             background.append(asyncio.create_task(relayer.reverse.backfill_forwards()))
             background.append(asyncio.create_task(relayer.reverse.sweep_loop()))
