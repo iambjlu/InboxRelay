@@ -78,7 +78,7 @@ Source of values: App settings (Keychain for secrets, UserDefaults or synced-fol
 | IGNORE_CERT_ERRORS | ignore_cert | false | |
 | REVERSE_SYNC | reverse_sync | true | Discord mirror posts → Telegram |
 | IMAGE_SUMMARY / DOCUMENT_SUMMARY / KEYWORDS | image_summary / document_summary / keywords | true | |
-| AUDIO_SUMMARY | audio_summary | true | audio files: speech-to-text + summary (needs a speech model on the LLM server); off removes the `audio` lane |
+| AUDIO_SUMMARY | audio_summary | false (opt-in) | audio files: speech-to-text + summary (needs a speech model on the LLM server); off removes the `audio` lane |
 | AUDIO_SCHEDULE / AUDIO_START / AUDIO_END | audio_schedule / audio_start / audio_end | always / 03:30 / 08:00 | `audio` lane schedule (same modes as the other lanes; App settings 「排程」) |
 | AUDIO_STT_MODEL | audio_stt_model | None | speech model id on the server; empty = first model in `/v1/models` whose id contains a `llm.STT_HINTS` word (whisper, parakeet, asr, stt, ...) |
 | DELETE_SYNC / EDIT_SYNC | delete_sync / edit_sync | true | |

@@ -83,7 +83,7 @@ enum SettingCatalog {
         SettingField(key: "SHOT_START", label: "連結截圖開始時間", kind: .time("03:30"), section: "排程"),
         SettingField(key: "SHOT_END", label: "連結截圖暫停時間", kind: .time("08:00"), section: "排程"),
         SettingField(key: "LLM_WAIT_SHOT", label: "外部 LLM 等連結截圖做完才開始", kind: .toggle(true), section: "排程"),
-        SettingField(key: "AUDIO_SUMMARY", label: "音檔轉文字與摘要（需要伺服器載入語音模型）", kind: .toggle(true), section: "功能"),
+        SettingField(key: "AUDIO_SUMMARY", label: "音檔轉文字與摘要（需要伺服器載入語音模型）", kind: .toggle(false), section: "功能"),
         SettingField(key: "LINK_SCREENSHOT", label: "連結截圖", kind: .toggle(false), section: "功能"),
         SettingField(key: "PRIVATE_URLS", label: "內網網址也截圖與摘要", kind: .toggle(true), section: "功能"),
         SettingField(key: "IGNORE_CERT_ERRORS", label: "憑證無效也強制開啟（截圖／摘要）", kind: .toggle(false), section: "功能"),
