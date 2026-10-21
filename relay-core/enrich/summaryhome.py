@@ -17,18 +17,20 @@ from recap import daily
 
 log = logging.getLogger("summaryhome")
 
+ARROW_LABEL = "摘要"
 ARROW_PREFIX = "-# [↗ 摘要]("
 HEAD = "🧾 摘要｜"
 MOVE_DAYS = 7
 FLAG = "summary-home-v1"
 
 
-def put_arrow(content: str, url: str) -> str:
-    """鏡像內容最後放一行摘要箭頭（先清掉舊的，重複執行結果一樣）。"""
-    lines = [ln for ln in (content or "").split("\n") if not ln.startswith(ARROW_PREFIX)]
+def put_arrow(content: str, url: str, label: str = ARROW_LABEL) -> str:
+    """鏡像內容最後放一行小箭頭（同一種 label 先清掉舊的，重複執行結果一樣；摘要、錄音各一行）。"""
+    prefix = f"-# [↗ {label}]("
+    lines = [ln for ln in (content or "").split("\n") if not ln.startswith(prefix)]
     while lines and not lines[-1].strip():
         lines.pop()
-    return "\n".join(lines + [f"{ARROW_PREFIX}<{url}>)"])
+    return "\n".join(lines + [f"{prefix}<{url}>)"])
 
 
 def can_move(dc, cfg, mirror) -> bool:
@@ -42,7 +44,8 @@ def with_head(mirror_url: str, body: str) -> str:
     return f"{HEAD}[↗ 跳到鏡像](<{mirror_url}>)\n{body}"
 
 
-async def post(dc, cfg, mirror, body: str, files: list[tuple[str, bytes]] | None = None, view=None) -> list:
+async def post(dc, cfg, mirror, body: str, files: list[tuple[str, bytes]] | None = None, view=None,
+               label: str = ARROW_LABEL) -> list:
     """把摘要發到預覽頻道（超過 2000 字分多則），鏡像加上箭頭。回傳發出的訊息（第一則在最前面）。
     files（檔名, bytes）和 view（按鈕）只附在第一則。"""
     import io
@@ -55,13 +58,17 @@ async def post(dc, cfg, mirror, body: str, files: list[tuple[str, bytes]] | None
         if i == 0 and view is not None:
             kw["view"] = view
         msgs.append(await ch.send(c, suppress_embeds=True, **kw))      # type: ignore[attr-defined]
-    await set_arrow(mirror, msgs[0].jump_url)
+    await set_arrow(mirror, msgs[0].jump_url, label)
     return msgs
 
 
-async def set_arrow(mirror, url: str) -> bool:
+async def set_arrow(mirror, url: str, label: str = ARROW_LABEL) -> bool:
     try:
-        new = put_arrow(mirror.content, url)
+        try:                                              # 摘要與錄音兩邊可能同時改同一則鏡像：先讀最新內容再改
+            mirror = await mirror.channel.fetch_message(mirror.id)
+        except (discord.HTTPException, AttributeError):
+            pass
+        new = put_arrow(mirror.content, url, label)
         if new == (mirror.content or "") or len(new) > 2000:
             return False
         await mirror.edit(content=new)

@@ -269,9 +269,7 @@ class Relayer:
             e = self.index.get(k)
             if e:
                 dates.add(e.rec.date[:10])
-                if e.rec.reply:
-                    reply_urls.add(e.rec.reply)
-                reply_urls.update((e.rec.shot or "").split())
+                reply_urls.update(records.owned_urls(e.rec))
             await self.index.delete(k)
             self.text_cache.pop(k, None)
         if all_deleted:
@@ -330,7 +328,7 @@ class Relayer:
         if channel_id == getattr(cfg, "ch_extra", None):
             suffix = f"/{message_id}"
             for e in [e for e in self.index.entries.values() if e.rec.mirror.endswith(suffix)]:
-                for u in [e.rec.reply] + (e.rec.shot or "").split():
+                for u in records.owned_urls(e.rec):
                     if u:
                         await self.dc.delete_by_url(u)
                 await self.index.delete(e.rec.key)
@@ -348,7 +346,7 @@ class Relayer:
         if getattr(self, "reverse", None) is not None:
             await self.reverse.on_mirror_deleted(hits)   # 在 Discord 發的訊息被刪 → Telegram 也刪
         for e in hits:
-            for u in [e.rec.reply] + (e.rec.shot or "").split():
+            for u in records.owned_urls(e.rec):
                 if u:
                     await self.dc.delete_by_url(u)
             await self.index.delete(e.rec.key)   # #關鍵字庫 紀錄整筆刪除
@@ -400,12 +398,12 @@ class Relayer:
                 kwargs["attachments"] = [discord.File(io.BytesIO(b), filename=n) for n, b in files]
             files.clear()
         await mirror.edit(**kwargs)
-        for u in [e.rec.reply] + (e.rec.shot or "").split():
+        for u in records.owned_urls(e.rec):
             if u:
                 await self.dc.delete_by_url(u)
         await self.index.update(key, excerpt=records.make_excerpt(piece.text) if piece.text else None,
                                 fid=new_fid or e.rec.fid, kw=None, gist=None, enriched=False, reply=None,
-                                shot=None)
+                                shot=None, audio=None)
         log.info("編輯同步：TG #%s → 已更新鏡像 %s", piece.tg_msg, mirror.id)
         if self.dirty is not None:
             await self.dirty.mark(e.rec.date[:10])

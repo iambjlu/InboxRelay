@@ -212,10 +212,10 @@ class ReverseSync:
             if not changed:
                 return                                   # Discord 只是補上連結預覽之類的，不用處理
             for e in hits:
-                for u in [e.rec.reply] + (e.rec.shot or "").split():
+                for u in records.owned_urls(e.rec):
                     if u:
                         await r.dc.delete_by_url(u)
-                await r.index.update(e.rec.key, kw=None, gist=None, enriched=False, reply=None, shot=None)
+                await r.index.update(e.rec.key, kw=None, gist=None, enriched=False, reply=None, shot=None, audio=None)
             log.info("反向同步：Discord %s 的編輯已同步到 Telegram", m.id)
             if r.dirty is not None and hits:
                 await r.dirty.mark(hits[0].rec.date[:10])

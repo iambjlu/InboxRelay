@@ -258,6 +258,7 @@ def setup(cfg) -> dict[str, Lane]:
     LANES.clear()
     LANES["llm"] = Lane("llm", "外部 LLM 工作", cfg.llm_schedule, cfg.recap_time, cfg.llm_end, cfg.tz)
     LANES["ane"] = Lane("ane", "本機 ANE 文字辨識", cfg.ane_schedule, cfg.ane_start, cfg.ane_end, cfg.tz)
+    LANES["audio"] = Lane("audio", "音檔轉文字與摘要", cfg.audio_schedule, cfg.audio_start, cfg.audio_end, cfg.tz)
     LANES["shot"] = Lane("shot", "連結截圖", cfg.shot_schedule, cfg.shot_start, cfg.shot_end, cfg.tz)
     return LANES
 

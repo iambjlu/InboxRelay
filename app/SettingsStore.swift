@@ -47,6 +47,7 @@ enum SettingCatalog {
         SettingField(key: "DC_CH_CHAT_PROMPT", label: "AI 對話提示詞與記憶", kind: .text, section: "頻道"),
         SettingField(key: "LOCAL_AI_SERVER", label: "OpenAI 相容端點", kind: .text, section: "外部 LLM 設定"),
         SettingField(key: "LOCAL_AI_MODEL", label: "模型名稱", kind: .text, section: "外部 LLM 設定"),
+        SettingField(key: "AUDIO_STT_MODEL", label: "語音轉文字模型（留空＝自動找 whisper 類）", kind: .text, section: "外部 LLM 設定"),
         SettingField(key: "LOCAL_AI_API_KEY", label: "API Key", kind: .secret, section: "外部 LLM 設定"),
         SettingField(key: "LOCAL_AI_IMAGE_SUPPORT", label: "模型支援圖片", kind: .toggle(true), section: "外部 LLM 設定"),
         SettingField(key: "LLM_CONTEXT", label: "Context window", kind: .choice([
@@ -69,6 +70,12 @@ enum SettingCatalog {
                                                 Choice(value: "manual", label: "手動執行")], "always"), section: "排程"),
         SettingField(key: "ANE_START", label: "本機 ANE 開始時間", kind: .time("03:30"), section: "排程"),
         SettingField(key: "ANE_END", label: "本機 ANE 暫停時間", kind: .time("08:00"), section: "排程"),
+        SettingField(key: "AUDIO_SCHEDULE", label: "音檔轉文字與摘要工作時間", kind: .choice([Choice(value: "always", label: "永遠立即執行"),
+                                                Choice(value: "daily", label: "每天自動開始到做完為止"),
+                                                Choice(value: "window", label: "每天自動開始與暫停"),
+                                                Choice(value: "manual", label: "手動執行")], "always"), section: "排程"),
+        SettingField(key: "AUDIO_START", label: "音檔開始時間", kind: .time("03:30"), section: "排程"),
+        SettingField(key: "AUDIO_END", label: "音檔暫停時間", kind: .time("08:00"), section: "排程"),
         SettingField(key: "SHOT_SCHEDULE", label: "連結截圖工作時間", kind: .choice([Choice(value: "always", label: "永遠立即執行"),
                                                 Choice(value: "daily", label: "每天自動開始到做完為止"),
                                                 Choice(value: "window", label: "每天自動開始與暫停"),
@@ -76,6 +83,7 @@ enum SettingCatalog {
         SettingField(key: "SHOT_START", label: "連結截圖開始時間", kind: .time("03:30"), section: "排程"),
         SettingField(key: "SHOT_END", label: "連結截圖暫停時間", kind: .time("08:00"), section: "排程"),
         SettingField(key: "LLM_WAIT_SHOT", label: "外部 LLM 等連結截圖做完才開始", kind: .toggle(true), section: "排程"),
+        SettingField(key: "AUDIO_SUMMARY", label: "音檔轉文字與摘要（需要伺服器載入語音模型）", kind: .toggle(true), section: "功能"),
         SettingField(key: "LINK_SCREENSHOT", label: "連結截圖", kind: .toggle(false), section: "功能"),
         SettingField(key: "PRIVATE_URLS", label: "內網網址也截圖與摘要", kind: .toggle(true), section: "功能"),
         SettingField(key: "IGNORE_CERT_ERRORS", label: "憑證無效也強制開啟（截圖／摘要）", kind: .toggle(false), section: "功能"),
@@ -101,6 +109,8 @@ enum SettingCatalog {
         case "ANE_START": return ["daily", "window"].contains(mode("ANE_SCHEDULE", "always"))
         case "ANE_END": return mode("ANE_SCHEDULE", "always") == "window"
         case "LLM_WAIT_SHOT": return ["1", "true", "yes", "on"].contains((values["LINK_SCREENSHOT"] ?? "").lowercased())
+        case "AUDIO_START": return ["daily", "window"].contains(mode("AUDIO_SCHEDULE", "always"))
+        case "AUDIO_END": return mode("AUDIO_SCHEDULE", "always") == "window"
         case "SHOT_START": return ["daily", "window"].contains(mode("SHOT_SCHEDULE", "always"))
         case "SHOT_END": return mode("SHOT_SCHEDULE", "always") == "window"
         default: return true

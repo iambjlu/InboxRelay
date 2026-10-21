@@ -100,6 +100,9 @@ class Config:
     ane_schedule: str = "always"  # 本機 ANE（圖片文字辨識，在選單列 App 裡跑）
     ane_start: str = "03:30"
     ane_end: str = "08:00"
+    audio_schedule: str = "always"  # 音檔轉文字與摘要（獨立車道）
+    audio_start: str = "03:30"
+    audio_end: str = "08:00"
     shot_schedule: str = "always"  # 連結截圖（獨立車道，預設永遠立即執行）
     shot_start: str = "03:30"
     shot_end: str = "08:00"
@@ -198,6 +201,9 @@ def load() -> Config:
         ane_schedule=(e.get("ANE_SCHEDULE") or "always").strip(),
         ane_start=(e.get("ANE_START") or "03:30").strip(),
         ane_end=(e.get("ANE_END") or "08:00").strip(),
+        audio_schedule=(e.get("AUDIO_SCHEDULE") or "always").strip(),
+        audio_start=(e.get("AUDIO_START") or "03:30").strip(),
+        audio_end=(e.get("AUDIO_END") or "08:00").strip(),
         shot_schedule=(e.get("SHOT_SCHEDULE") or "always").strip(),
         shot_start=(e.get("SHOT_START") or "03:30").strip(),
         shot_end=(e.get("SHOT_END") or "08:00").strip(),

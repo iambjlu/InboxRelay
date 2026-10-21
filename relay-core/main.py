@@ -440,6 +440,23 @@ async def run(check_only: bool) -> int:
             log.info("📸 連結截圖：%s%s", shot_lane.describe(), "（外部 LLM 等截圖做完才開始）" if cfg.llm_wait_shot else "")
         else:
             lanes.LANES.pop("shot", None)           # 沒開連結截圖：不顯示這條車道
+        audio_worker = None
+        audio_lane = lanes.get("audio")
+        if llm and cfg.audio_summary and relayer.index is not None and relayer.enricher is not None:
+            from enrich.audioworker import AudioWorker
+            audio_worker = AudioWorker(relayer, llm)
+            relayer.enricher.audio_worker = audio_worker           # 分析完一則鏡像 → 有音檔就排進音檔車道
+            audio_lane.probe = llm.ping
+            audio_lane.connecting = True                           # 和外部 LLM 一樣，啟動完成後才開始
+            if recapper is not None:
+                recapper.waits.append(lambda: audio_worker.drained)    # 總結一律等音檔做完（含摘要、逐字稿）
+            audio_worker.scan_index()
+            background.append(asyncio.create_task(audio_worker.run()))
+            background.append(asyncio.create_task(lanes.run_lane(
+                audio_lane, drained=lambda: audio_worker.drained, cycle=audio_worker.cycle)))
+            log.info("🎙️ 音檔轉文字與摘要：%s", audio_lane.describe())
+        else:
+            lanes.LANES.pop("audio", None)
         server = None
         if ipc.enabled():
             from ocr import OcrWorker
@@ -447,6 +464,7 @@ async def run(check_only: bool) -> int:
             relayer.ocr = OcrWorker(dc, relayer.index, ipc.emit)
             server.ocr = relayer.ocr
             server.shot = shot_worker
+            server.audio = audio_worker
             if relayer.enricher is not None:
                 relayer.enricher.on_link_images = relayer.ocr.submit
                 relayer.enricher.ocr_worker = relayer.ocr
@@ -489,7 +507,7 @@ async def run(check_only: bool) -> int:
                     prev_restore()
             restore_console = restore_all
         if llm:
-            background.append(asyncio.create_task(first_llm_connect(cfg, llm, llm_lane, server)))
+            background.append(asyncio.create_task(first_llm_connect(cfg, llm, llm_lane, server, also=[audio_lane] if audio_worker else [])))
         await notify(dc, cfg, online_message(cfg, tg, relayer, mem, recapper, ai_status))
         await stop.wait()
         log.info("收到結束訊號，關閉中…")
@@ -543,7 +561,7 @@ def shot_ok() -> bool:
 LLM_FIRST_PING_DELAY = 10
 
 
-async def first_llm_connect(cfg, llm, lane, server=None) -> None:
+async def first_llm_connect(cfg, llm, lane, server=None, also=()) -> None:
     """全部啟動完成後等 LLM_FIRST_PING_DELAY 秒才第一次連外部 LLM；連不上就交給車道的離線重試（lanes.RETRY_DELAYS）。"""
     await asyncio.sleep(LLM_FIRST_PING_DELAY)
     try:
@@ -558,12 +576,13 @@ async def first_llm_connect(cfg, llm, lane, server=None) -> None:
         log.warning("外部 LLM 連不上（%s）：%s；搬移照常，會自動重試，AI 工作先保留", cfg.ai_server, e)
     if server is not None:
         server.ai_status = status
-    if lane is not None:
-        lane.connecting = False
-        if failed is not None:
-            lane.go_offline(type(failed).__name__)
-        else:
-            lane.notify()
+    for ln in [lane, *also]:
+        if ln is not None:
+            ln.connecting = False
+            if failed is not None:
+                ln.go_offline(type(failed).__name__)
+            else:
+                ln.notify()
 
 
 def online_message(cfg, tg, relayer: Relayer, mem, recapper, ai_status: str) -> str:

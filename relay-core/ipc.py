@@ -3,7 +3,7 @@
 
 - 啟動時環境變數 INBOXRELAY_IPC=1 才啟用。
 - App → 核心：stdin 每行一個 JSON：
-  {"type": "lane", "lane": "llm|ane|shot", "action": "run_now|pause|resume"}、{"type": "hello", "ocr": true}、
+  {"type": "lane", "lane": "llm|ane|audio|shot", "action": "run_now|pause|resume"}、{"type": "hello", "ocr": true}、
   {"type": "ocr_result", "id": 1, "text": "…", "ms": 120}、{"type": "llm_test", "id": 1, "server", "model", "key"}、{"type": "diag", "on": true|false}、{"type": "stop"}；
   舊指令 recap_now／pause／resume 仍可用（＝外部 LLM 車道）。
 - 核心 → App：stdout 每行一個 JSON：狀態（type=status，每 2 秒、有變化才送）、
@@ -46,6 +46,7 @@ class IpcServer:
         self.stop_event = stop_event
         self._last = ""
         self.ocr = None            # ocr.OcrWorker
+        self.audio = None          # enrich.audioworker.AudioWorker
         self.shot = None           # enrich.shotworker.ShotWorker
 
     def status(self) -> dict:
@@ -79,6 +80,8 @@ class IpcServer:
                 backlog = r.enricher.backlog if r.enricher else 0
             elif name == "shot":
                 backlog = self.shot.backlog if self.shot else 0
+            elif name == "audio":
+                backlog = self.audio.backlog if self.audio else 0
             else:
                 backlog = self.ocr.backlog if self.ocr else 0
             out[name] = {

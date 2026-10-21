@@ -26,6 +26,7 @@ class KwRecord:
     fid: str | None = None       # Telegram file_unique_id（編輯同步判斷附件是否被換掉）
     reply: str | None = None     # AI 摘要回覆的 Discord 連結（刪除同步時一併刪）
     shot: str | None = None      # 連結截圖貼文的 Discord 連結（可多個，以空白分隔）
+    audio: str | None = None     # 音檔摘要訊息的 Discord 連結；「-」＝這個音檔不用（再）處理（歌曲、沒有語音、失敗太多次）
     kw: str | None = None
     gist: str | None = None
     excerpt: str | None = None
@@ -78,6 +79,12 @@ def flat_ocr(ocr: str | None) -> str:
     return " ".join(" ".join(x.split()) for x in ocr.replace(OCR_NL, "\n").splitlines() if x.strip())
 
 
+def owned_urls(r: KwRecord) -> list[str]:
+    """這筆紀錄帶出去的 Discord 訊息（AI 摘要回覆、截圖貼文、音檔摘要）：刪除同步／重新分析時要一併刪掉。"""
+    out = [r.reply] + (r.shot or "").split() + [r.audio]
+    return [u for u in out if u and u != "-"]
+
+
 def _head_lines(r: KwRecord) -> list[str]:
     lines = [
         PREFIX,
@@ -88,7 +95,7 @@ def _head_lines(r: KwRecord) -> list[str]:
         f"type: {r.type}",
         f"mirror: {r.mirror}",
     ]
-    for k in ("src", "filename", "fid", "reply", "shot", "img", "kw", "gist"):
+    for k in ("src", "filename", "fid", "reply", "shot", "audio", "img", "kw", "gist"):
         v = getattr(r, k)
         if v:
             lines.append(f"{k}: {one_line(v)}")
@@ -171,6 +178,7 @@ def from_dict(d: dict[str, str]) -> KwRecord:
         fid=d.get("fid") or None,
         reply=d.get("reply") or None,
         shot=d.get("shot") or None,
+        audio=d.get("audio") or None,
         img=d.get("img") or None,
         kw=d.get("kw") or None,
         gist=d.get("gist") or None,

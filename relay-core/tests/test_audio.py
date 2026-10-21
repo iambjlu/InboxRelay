@@ -76,3 +76,99 @@ class AudioTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WorkerTest(unittest.TestCase):
+    def _setup(self, llm, with_model=True):
+        import records
+        from enrich.audioworker import AudioWorker
+        try:
+            from test_m4 import FakeIndex, FakeMsg, rec
+        except ImportError:
+            from tests.test_m4 import FakeIndex, FakeMsg, rec
+
+        class Att:
+            def __init__(self, name):
+                self.filename, self.size, self.content_type = name, 1000, "audio/mp4"
+
+            async def read(self):
+                return b"audio"
+        mirror = FakeMsg("# 2026-10-02\n", [Att("meeting.m4a"), Att("song.mp3")])
+        seen = {}
+        orig = mirror.reply
+
+        async def reply(text, **kw):
+            seen["kw"] = kw
+            return await orig(text, **kw)
+        mirror.reply = reply
+        url = "https://discord.com/channels/1/2/3"
+        idx = FakeIndex([rec(1, type="file", filename="meeting.m4a", excerpt="開會錄音"),
+                         rec(2, type="file", filename="song.mp3")])
+
+        async def fetch(u): return mirror
+        marks = []
+
+        async def mark(d): marks.append(d)
+        relayer = N(cfg=N(keywords=True, audio_stt_model=None, ch_screenshot=None), dc=N(fetch_by_url=fetch),
+                    index=idx, dirty=N(mark=mark))
+        return (lambda: AudioWorker(relayer, llm)), mirror, idx, seen, marks, url
+
+    def test_process_summarises_marks_records_and_skips_songs(self):
+        class L(FakeLLM):
+            async def transcribe(self, name, data, model):
+                return "歌詞啦啦啦 啦啦啦 副歌副歌副歌 重複重複重複" if name == "song.mp3" else "今天開會討論預算，決議下週五前交報告。"
+
+            async def chat(self, prompt, data=None, **k):
+                if "歌曲" in prompt and "說話" in prompt:
+                    return "歌曲" if "歌詞" in (data or "") else "說話"
+                if "JSON" in prompt:
+                    return '{"kw": ["預算"], "gist": "開會討論預算"}'
+                return "- 討論預算\n- 下週五交報告"
+        mk, mirror, idx, seen, marks, url = self._setup(L())
+        box = {}
+
+        async def go():
+            box["w"] = w = mk()
+            return await w.process(url)
+        self.assertEqual(asyncio.run(go()), "ok")
+        w = box["w"]
+        text = mirror.replies[0]
+        self.assertIn("🎙️ meeting.m4a", text)
+        self.assertIn("🎙️ song.mp3", text)
+        self.assertIn("歌曲", text)
+        self.assertEqual([f.filename for f in seen["kw"]["files"]], ["meeting.m4a.txt"])      # 只有說話的有逐字稿
+        self.assertIsNotNone(seen["kw"]["view"])
+        r1, r2 = idx.entries[(-1, 1)].rec, idx.entries[(-1, 2)].rec
+        self.assertTrue(r1.audio and r2.audio)                                                  # 都標記處理過
+        self.assertEqual(r1.gist, "開會討論預算")                                               # 說話的更新重點
+        self.assertEqual(marks, ["2026-10-02"])                                                 # 那天要重新總結
+        self.assertTrue(w.drained)
+        self.assertFalse(any(w.needs(e) for e in idx.entries.values()))
+
+    def test_no_model_leaves_records_pending(self):
+        mk, mirror, idx, seen, marks, url = self._setup(FakeLLM(model=None))
+
+        async def go():
+            w = mk()
+            return w, await w.process(url)
+        w, res = asyncio.run(go())
+        self.assertEqual(res, "nomodel")
+        self.assertFalse(mirror.replies)
+        self.assertTrue(all(w.needs(e) for e in idx.entries.values()))
+
+    def test_consider_queues_only_unprocessed(self):
+        mk, mirror, idx, seen, marks, url = self._setup(FakeLLM())
+        import dataclasses
+
+        async def go():
+            w = mk()
+            w.consider(url)
+            first = (list(w.queue), w.drained)
+            for e in idx.entries.values():
+                e.rec = dataclasses.replace(e.rec, audio="-")
+            w.queue.clear(); w._queued.clear()
+            w.consider(url)
+            return first, w.drained
+        first, drained = asyncio.run(go())
+        self.assertEqual(first, ([url], False))
+        self.assertTrue(drained)

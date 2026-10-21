@@ -82,7 +82,7 @@ async def run_extra(cfg, dc, path: str, date_from: str | None, date_to: str | No
             same += 1
             continue
         if old is not None:                                 # 內容變了 → 刪掉舊的貼文與紀錄
-            for u in [old.rec.mirror, old.rec.reply] + (old.rec.shot or "").split():
+            for u in [old.rec.mirror] + records.owned_urls(old.rec):
                 if u:
                     await dc.delete_by_url(u)
             await index.delete(key)
