@@ -14,6 +14,7 @@ from mdtable import tables_to_bullets
 
 log = logging.getLogger("llm")
 
+STT_HINTS = ("whisper", "parakeet", "asr", "stt", "voxtral", "sensevoice", "paraformer", "speech")
 _THINK_RE = re.compile(r"<think>.*?</think>", re.S)
 # 模型把思考直接寫在正文裡（沒有 <think> 標籤）時的開頭
 _LEAK_RE = re.compile(r"^\s*(Here'?s a thinking process|Here is a thinking process|Thinking Process|Thinking process|思考過程)", re.I)
@@ -87,6 +88,25 @@ class LLM:
         if use_memory and self.memory.strip():
             return base + prompts.render("MEMORY_WRAP", memory=self.memory.strip())
         return base
+
+    async def stt_model(self, preferred: str | None = None) -> str | None:
+        """語音轉文字模型：指定的優先，否則從伺服器模型清單找名稱像語音模型的（whisper、parakeet、asr…）。沒有回 None。"""
+        models = [m.id for m in (await self.client.models.list()).data]
+        if preferred:
+            return preferred if preferred in models else None
+        for m in models:
+            if any(h in m.lower() for h in STT_HINTS):
+                return m
+        return None
+
+    async def transcribe(self, name: str, data: bytes, model: str) -> str:
+        """語音轉文字（OpenAI 相容 /audio/transcriptions）。和聊天共用同一把鎖（模型一次只做一件事）。"""
+        while self._interactive_waiting:                 # 有人在 AI 對話 → 背景工作先讓
+            await asyncio.sleep(0.3)
+        async with self._lock:
+            resp = await self.client.audio.transcriptions.create(
+                model=model, file=(name, data), response_format="json", timeout=3600)
+        return (getattr(resp, "text", "") or "").strip()
 
     async def ping(self) -> list[str]:
         models = await self.client.models.list()

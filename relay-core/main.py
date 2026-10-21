@@ -312,6 +312,9 @@ async def run(check_only: bool) -> int:
             dc.add_message_handler(relayer.reverse.on_message)
             dc.add_edit_handler(relayer.reverse.on_edit)
             log.info("反向同步已啟用：在 #投遞箱鏡像 發的訊息會同步到 Telegram（含編輯、刪除）")
+        if llm:                                         # 音檔摘要上的「詳細整理」按鈕（持久；App 重開後仍有效）
+            from enrich.audiobutton import AudioNotes, NotesView
+            dc.client.add_view(NotesView(AudioNotes(relayer, llm, dc, cfg).on_click))
         # AI 進度訊息放在 #投遞箱鏡像 最下面（有新進度就發新的、刪舊的）；舊版放的頻道也一併清掉殘留
         progress_channel = await dc.channel(cfg.ch_inbox_mirror)
         for cid in {cfg.ch_inbox_mirror, cfg.ch_screenshot, cfg.ch_keywords} - {None}:

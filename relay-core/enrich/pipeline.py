@@ -23,7 +23,8 @@ from config import Config
 from dc_output import DiscordOut
 from enrich.document import LEGACY_EXT, ext_of, is_supported, summarize_document
 from enrich.image import MIME, is_converted_copy, summarize_image
-from enrich import summaryhome
+from enrich import audio, summaryhome
+from enrich.audiobutton import NotesView
 from enrich.keywords import extract_keywords
 from enrich.link import embed_preview, find_urls, probe_link, summarize_probed
 from kwindex import KwIndex
@@ -141,6 +142,24 @@ class Enricher:
                 if from_queue:
                     self.queue.task_done()
 
+    async def _old_transcripts(self, reply_urls: set) -> dict[str, str]:
+        """之前這則鏡像分析時留下的逐字稿（摘要訊息的 .txt 附件）：檔名 → 內容。重新分析時不用再轉一次語音。"""
+        if not hasattr(self, "_tx_cache"):
+            self._tx_cache = {}
+        key = tuple(sorted(reply_urls))
+        if key not in self._tx_cache:
+            out: dict[str, str] = {}
+            for u in key:
+                try:
+                    m = await self.dc.fetch_by_url(u)
+                    for att in (m.attachments if m is not None else []):
+                        if att.filename.lower().endswith(".txt") and att.size <= 1_000_000:
+                            out[att.filename[:-4]] = (await att.read()).decode("utf-8", errors="replace")
+                except Exception:
+                    log.warning("讀取舊逐字稿失敗：%s", u, exc_info=True)
+            self._tx_cache = {key: out}                     # 只留最近一份，用完即丟
+        return self._tx_cache[key]
+
     async def _undo_posted(self) -> None:
         for m in reversed(self._posted):
             try:
@@ -243,6 +262,8 @@ class Enricher:
                 activity.step()
         shot_posts.clear()
 
+        transcripts: dict[str, bytes] = {}                          # 音檔逐字稿 → 摘要訊息的附件
+        old_replies = {self.index.get(k).rec.reply for k in keys if self.index.get(k) and self.index.get(k).rec.reply}
         att_keys: dict[str, list] = {}                              # 附件檔名 → 對應的紀錄 key（相簿裡每張圖各對各的）
         for ent, att in match_attachments(self.index.by_mirror(job.mirror_url), list(mirror.attachments),
                                           mirror.content or ""):
@@ -262,6 +283,15 @@ class Enricher:
                     caption = f"{caption}\n{ocr_caption(ocr_txt)}"
                 parts.append((f"🖼️ {name}", await summarize_image(self.llm, data, name, caption)))
                 part_owner.append(("att", name))
+            elif not is_img and cfg.audio_summary and audio.is_audio(name, a.content_type):
+                data = await a.read()
+                res = await audio.analyze_audio(self.llm, cfg, name, data,
+                                                known=(await self._old_transcripts(old_replies)).get(name))
+                data = b""
+                parts.append((f"🎙️ {name}", res.summary))
+                part_owner.append(("att", name))
+                if res.transcript:
+                    transcripts[audio.transcript_name(name)] = res.transcript.encode()
             elif not is_img and cfg.document_summary and (is_supported(name) or ext_of(name) in LEGACY_EXT):
                 data = await a.read()
                 parts.append((f"📄 {name}", await summarize_document(self.llm, name, data)))
@@ -270,7 +300,6 @@ class Enricher:
             activity.step()
 
         reply_url = None
-        old_replies = {self.index.get(k).rec.reply for k in keys if self.index.get(k) and self.index.get(k).rec.reply}
         if parts:
             lines: list[str] = []
             for title, s in parts:
@@ -281,12 +310,18 @@ class Enricher:
             if shot_urls:
                 lines.append(shot_line(list(dict.fromkeys(shot_urls))))
             if summaryhome.can_move(self.dc, cfg, mirror):         # 摘要貼到連結預覽頻道，鏡像只留小箭頭
-                msgs = await summaryhome.post(self.dc, cfg, mirror, "\n".join(lines))
+                msgs = await summaryhome.post(self.dc, cfg, mirror, "\n".join(lines), list(transcripts.items()),
+                                              NotesView() if transcripts else None)
                 self._posted += msgs
                 reply = msgs[0]
             else:
                 chunks = daily.split_message("\n".join(lines))
-                reply = await mirror.reply(chunks[0], mention_author=False, suppress_embeds=True)
+                kw = {}
+                if transcripts:
+                    import io
+                    kw = {"files": [discord.File(io.BytesIO(b), filename=n) for n, b in transcripts.items()],
+                          "view": NotesView()}
+                reply = await mirror.reply(chunks[0], mention_author=False, suppress_embeds=True, **kw)
                 self._posted.append(reply)
                 for c in chunks[1:]:
                     self._posted.append(await mirror.channel.send(c, suppress_embeds=True))

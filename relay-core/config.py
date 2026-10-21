@@ -82,6 +82,8 @@ class Config:
     memory_hard_mb: float = 1000    # 連續超過就重新啟動（App 管理時）
     image_summary: bool = True
     document_summary: bool = True
+    audio_summary: bool = True       # 音檔：語音轉文字＋摘要（需要 oMLX 載入語音模型）
+    audio_stt_model: str | None = None   # 指定語音模型；留空＝從伺服器模型清單自動找 whisper 類
     keywords: bool = True
     delete_sync: bool = True
     edit_sync: bool = True
@@ -178,6 +180,8 @@ def load() -> Config:
         memory_hard_mb=float(e.get("MEMORY_HARD_MB") or 1000),
         image_summary=_bool("IMAGE_SUMMARY", True),
         document_summary=_bool("DOCUMENT_SUMMARY", True),
+        audio_summary=_bool("AUDIO_SUMMARY", True),
+        audio_stt_model=(e.get("AUDIO_STT_MODEL") or "").strip() or None,
         keywords=_bool("KEYWORDS", True),
         delete_sync=_bool("DELETE_SYNC", True),
         edit_sync=_bool("EDIT_SYNC", True),

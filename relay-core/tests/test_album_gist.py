@@ -73,6 +73,52 @@ class AlbumTest(unittest.TestCase):
         self.assertTrue(all("只有字、沒有左右位置" in cap for _, cap in captions))   # 圖片分析的 OCR 說明
         self.assertEqual(len(captions), 3)
 
+    def test_audio_attachment_gets_summary_transcript_and_button(self):
+        from enrich.pipeline import Enricher
+
+        class AAtt(Att):
+            def __init__(self):
+                super().__init__("meeting.m4a", b"audio-bytes")
+                self.content_type = "audio/mp4"
+
+        class LLM3:
+            image_support = True
+            memory = ""
+
+            async def stt_model(self, preferred=None):
+                return "whisper-large-v3"
+
+            async def transcribe(self, name, data, model):
+                return "今天開會討論預算，決議下週五前交報告，請大家準時。"
+
+            async def chat(self, prompt, data=None, **k):
+                if "歌曲" in prompt and "說話" in prompt:
+                    return "說話"
+                if "JSON" in prompt:
+                    return '{"kw": ["預算"], "gist": "開會討論預算"}'
+                return "- 討論預算\n- 下週五交報告"
+        mirror = FakeMsg("# 2026-10-02\n", [AAtt()])
+        seen = {}
+        orig = mirror.reply
+
+        async def reply(text, **kw):
+            seen["kw"] = kw
+            return await orig(text, **kw)
+        mirror.reply = reply
+        idx = FakeIndex([rec(1, type="file", filename="meeting.m4a")])
+        dc = N(fetch_by_url=lambda u: _aret(mirror))
+        cfg = N(link_summary=True, image_summary=True, document_summary=True, audio_summary=True, audio_stt_model=None,
+                keywords=True, link_screenshot=False, ch_screenshot=None)
+
+        async def go():
+            e = Enricher(cfg, dc, LLM3(), idx, {}, None)
+            await e.process(N(keys=[(-1, 1)], mirror_url="https://discord.com/channels/1/2/3"))
+        asyncio.run(go())
+        self.assertIn("🎙️ meeting.m4a", mirror.replies[0])
+        self.assertIn("討論預算", mirror.replies[0])
+        self.assertEqual([f.filename for f in seen["kw"]["files"]], ["meeting.m4a.txt"])   # 逐字稿存成附件
+        self.assertIsNotNone(seen["kw"]["view"])                                          # 詳細整理按鈕
+
     def test_album_redo_is_newest_first_recent_only_and_once(self):
         import tempfile
         from datetime import datetime

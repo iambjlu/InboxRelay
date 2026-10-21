@@ -42,12 +42,19 @@ def with_head(mirror_url: str, body: str) -> str:
     return f"{HEAD}[↗ 跳到鏡像](<{mirror_url}>)\n{body}"
 
 
-async def post(dc, cfg, mirror, body: str) -> list:
-    """把摘要發到預覽頻道（超過 2000 字分多則），鏡像加上箭頭。回傳發出的訊息（第一則在最前面）。"""
+async def post(dc, cfg, mirror, body: str, files: list[tuple[str, bytes]] | None = None, view=None) -> list:
+    """把摘要發到預覽頻道（超過 2000 字分多則），鏡像加上箭頭。回傳發出的訊息（第一則在最前面）。
+    files（檔名, bytes）和 view（按鈕）只附在第一則。"""
+    import io
     ch = await dc.channel(cfg.ch_screenshot)
     msgs = []
-    for c in daily.split_message(with_head(mirror.jump_url, body)):
-        msgs.append(await ch.send(c, suppress_embeds=True))      # type: ignore[attr-defined]
+    for i, c in enumerate(daily.split_message(with_head(mirror.jump_url, body))):
+        kw = {}
+        if i == 0 and files:
+            kw["files"] = [discord.File(io.BytesIO(b), filename=n) for n, b in files]
+        if i == 0 and view is not None:
+            kw["view"] = view
+        msgs.append(await ch.send(c, suppress_embeds=True, **kw))      # type: ignore[attr-defined]
     await set_arrow(mirror, msgs[0].jump_url)
     return msgs
 

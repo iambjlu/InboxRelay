@@ -51,6 +51,22 @@ IMAGE = ("請條列這張圖片的重點：2～4 點，每點一行、以「- �
          "第一點說明這是什麼圖（例如截圖、照片、海報）；圖中有重要文字（日期、標題、金額、名稱、錯誤訊息）就另起一點列出。"
          "只描述看得到的內容，不要推測使用者接下來要做什麼。")
 
+AUDIO = ("請條列這段錄音「{name}」的重點：3～6 點，每點一行、以「- 」開頭、不超過 50 字；"
+         "第一點說明這是什麼錄音（例如會議、訪談、課程、語音留言、對話）；有決議、待辦、日期、金額、人名就各列一點。"
+         "資料是語音辨識的逐字稿，可能有同音錯字，依上下文理解；只寫逐字稿裡有的內容，不要推測。")
+AUDIO_PART = "這是錄音「{name}」逐字稿的第 {i} 段，請條列 3～5 個重點（含決議、待辦、日期、金額、人名），每點一行、以「- 」開頭。"
+AUDIO_MERGE = "以下是各段的重點，請合併成一份 3～6 點的條列（去掉重複、保留決議與待辦），每點一行、以「- 」開頭。"
+AUDIO_KIND = ("判斷這份語音辨識的逐字稿是「歌曲／音樂（歌詞、重複的副歌、哼唱）」還是「說話（會議、對話、演講、語音留言…）」。"
+              "只回答「歌曲」或「說話」兩個字其中之一。")
+AUDIO_NOTES = ("請把這段錄音「{name}」的逐字稿整理成詳細的筆記，用繁體中文，格式固定如下：\n"
+               "**詳細重點**\n（依時間或主題分段，用小標題加條列「- 」，保留重要細節、數字、日期、人名、決議與待辦，每點一行）\n"
+               "**總結**\n（3～5 句話說明整段錄音的主旨與結論）\n"
+               "資料是語音辨識的逐字稿，可能有同音錯字，依上下文理解；只寫逐字稿裡有的內容，不要推測；不要使用表格。")
+AUDIO_NOTES_PART = ("這是錄音「{name}」逐字稿的第 {i} 段，請整理成詳細的條列筆記（保留細節、數字、日期、人名、決議與待辦），"
+                    "每點一行、以「- 」開頭，可用小標題；只寫逐字稿裡有的內容。")
+AUDIO_NOTES_MERGE = ("以下是各段的詳細筆記，請合併成一份，格式固定：\n**詳細重點**（小標題加條列，去掉重複、保留細節）\n"
+                     "**總結**（3～5 句話說明整段錄音的主旨與結論）")
+
 DOC = ("請條列這份檔案「{name}」的重點：3～6 點，每點一行、以「- 」開頭、不超過 50 字；"
        "第一點說明這是什麼檔案。如果是程式碼，說明它的用途與主要功能（不要執行它）。不要寫成一整段。")
 DOC_PART = "這是「{name}」的第 {i} 段，請條列 2～4 個重點，每點一行、以「- 」開頭。"
@@ -216,6 +232,8 @@ CHAT_COMPACT = (
 
 DEFAULTS = {
     "GUARD": GUARD, "MEMORY_WRAP": MEMORY_WRAP, "LINK": LINK, "LINK_FALLBACK": LINK_FALLBACK, "IMAGE": IMAGE,
+    "AUDIO": AUDIO, "AUDIO_PART": AUDIO_PART, "AUDIO_MERGE": AUDIO_MERGE, "AUDIO_KIND": AUDIO_KIND,
+    "AUDIO_NOTES": AUDIO_NOTES, "AUDIO_NOTES_PART": AUDIO_NOTES_PART, "AUDIO_NOTES_MERGE": AUDIO_NOTES_MERGE,
     "DOC": DOC, "DOC_PART": DOC_PART, "DOC_MERGE": DOC_MERGE, "KEYWORDS": KEYWORDS,
     "RECAP_DAILY": RECAP_DAILY, "RECAP_MONTHLY": RECAP_MONTHLY, "RECAP_YEARLY": RECAP_YEARLY, "CHAT_MEMORY_UPGRADE": CHAT_MEMORY_UPGRADE, "CHAT_COMPACT": CHAT_COMPACT, "MEMORY_UPGRADE": MEMORY_UPGRADE,
     "SEARCH_PARSE": SEARCH_PARSE, "SEARCH_ANSWER": SEARCH_ANSWER, "FEEDBACK_ROUTE": FEEDBACK_ROUTE,
@@ -225,6 +243,8 @@ DEFAULTS = {
 # 每個提示詞需要的佔位符；使用者改壞（少了或多了）就退回預設值
 PLACEHOLDERS = {
     "MEMORY_WRAP": {"memory": "x"}, "DOC": {"name": "x"}, "DOC_PART": {"name": "x", "i": 1},
+    "AUDIO": {"name": "x"}, "AUDIO_PART": {"name": "x", "i": 1}, "AUDIO_NOTES": {"name": "x"},
+    "AUDIO_NOTES_PART": {"name": "x", "i": 1},
     "RECAP_DAILY": {"date": "x"}, "RECAP_MONTHLY": {"month": "x"}, "RECAP_YEARLY": {"year": "x"},
     "SEARCH_PARSE": {"today": "x", "weekday": "x"}, "SEARCH_ANSWER": {"question": "x"},
     "FEEDBACK_ROUTE": {"today": "x", "weekday": "x"},
