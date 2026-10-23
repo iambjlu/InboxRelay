@@ -440,6 +440,13 @@ struct SettingsView: View {
                     }
                     .disabled(!core.canRestart)
                     .keyboardShortcut("s", modifiers: .command)
+                    Button("只儲存（下次啟動套用）") {
+                        settings.save()
+                        message = core.isRunning
+                            ? "已儲存，核心下次啟動時才會套用（目前執行中的核心不受影響）"
+                            : "已儲存，下次啟動核心時套用"
+                    }
+                    .keyboardShortcut("s", modifiers: [.command, .shift])
                     Spacer()
                     Button(role: .destructive) { confirmRecapReset(core) } label: {
                         Label("清空並重新總結", systemImage: "arrow.counterclockwise")
