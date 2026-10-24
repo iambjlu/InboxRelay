@@ -354,8 +354,9 @@ async def run(check_only: bool) -> int:
             recapper, rc = None, None
         llm_lane = lanes.get("llm")
         enr = relayer.enricher
+        links_busy = [False]                       # 補做連結摘要還沒做完：llm 車道這一輪不能先結束，否則它會卡在 gate 等下個排程
         background.append(asyncio.create_task(lanes.run_lane(
-            llm_lane, drained=lambda: enr is None or enr.drained,
+            llm_lane, drained=lambda: enr is None or (enr.drained and not links_busy[0]),
             cycle=recapper.cycle if recapper is not None else None)))
         log.info("🚦 外部 LLM 工作：%s；本機 ANE 文字辨識：%s（搜尋、實驗頻道等互動隨時可用）",
                  llm_lane.describe(), lanes.get("ane").describe())
@@ -485,10 +486,14 @@ async def run(check_only: bool) -> int:
         if relayer.enricher is not None:
             async def _refresh_links() -> None:
                 from enrich.refresh import refresh_links
-                while not relayer.enricher.drained:          # 新訊息的分析先做完
-                    await asyncio.sleep(30)
-                await refresh_links(dc, llm, relayer.index, cfg,
-                                    relayer.ocr.submit if relayer.ocr is not None else None)
+                try:
+                    while not relayer.enricher.drained:          # 新訊息的分析先做完
+                        await asyncio.sleep(30)
+                    await refresh_links(dc, llm, relayer.index, cfg,
+                                        relayer.ocr.submit if relayer.ocr is not None else None)
+                finally:
+                    links_busy[0] = False
+            links_busy[0] = True
             background.append(asyncio.create_task(_refresh_links()))
         else:
             ane_lane.available = False
