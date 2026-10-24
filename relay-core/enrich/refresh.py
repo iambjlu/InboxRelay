@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 
@@ -118,6 +119,22 @@ async def refresh_one(dc, llm, index, cfg, reply_url: str, entries) -> tuple[boo
     return True, img_urls
 
 
+_task = None            # 正在跑的 refresh_links（按「跳過」時取消）
+
+
+def request_skip() -> bool:
+    """跳過積欠的補做連結摘要：取消正在跑的那一輪，並寫下完成旗標，以後不再補做。回傳是否有東西被取消。"""
+    from paths import data_dir
+    try:
+        (data_dir() / FLAG).write_text("done\n")
+    except OSError:
+        pass
+    if _task is not None and not _task.done():
+        _task.cancel()
+        return True
+    return False
+
+
 async def refresh_links(dc, llm, index, cfg, on_link_images=None) -> None:
     from paths import data_dir
     flag = data_dir() / FLAG
@@ -128,10 +145,13 @@ async def refresh_links(dc, llm, index, cfg, on_link_images=None) -> None:
         if e.rec.reply and e.rec.excerpt and "http" in e.rec.excerpt:
             groups.setdefault(e.rec.reply, []).append(e)
     if groups:
-        await activity.gate()
-        task = activity.start("補做連結摘要", total=len(groups))
+        global _task
+        _task = asyncio.current_task()
+        task = None
         fixed = 0
         try:
+            await activity.gate()
+            task = activity.start("補做連結摘要", total=len(groups))
             for reply_url, ents in groups.items():
                 await activity.gate()
                 task.set(detail=ents[0].rec.date)
@@ -156,8 +176,15 @@ async def refresh_links(dc, llm, index, cfg, on_link_images=None) -> None:
                         log.exception("補做連結摘要失敗：%s", reply_url)
                     break
                 task.advance()
+        except asyncio.CancelledError:
+            if not flag.exists():                  # 不是按「跳過」造成的取消（例如關閉核心）：照常往外丟
+                raise
+            log.info("補做連結摘要：已依要求跳過（更新 %d 則）", fixed)
+            return
         finally:
-            activity.finish(task, f"更新 {fixed} 則")
+            _task = None
+            if task is not None:
+                activity.finish(task, f"更新 {fixed} 則")
         log.info("補做連結摘要完成：更新 %d 則（檢查 %d 則）", fixed, len(groups))
     try:
         flag.write_text("done\n")

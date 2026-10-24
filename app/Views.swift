@@ -174,6 +174,8 @@ struct LaneRow: View {
 
 struct TaskRows: View {
     let tasks: [CoreTask]
+    var onSkipLinks: (() -> Void)? = nil          // 補做連結摘要那一列的「跳過」
+    @State private var confirmSkip = false
 
     var body: some View {
         if tasks.isEmpty {
@@ -181,13 +183,27 @@ struct TaskRows: View {
         } else {
             ForEach(tasks, id: \.self) { t in
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(t.line).font(.callout).lineLimit(2)
+                    HStack(alignment: .firstTextBaseline) {
+                        Text(t.line).font(.callout).lineLimit(2)
+                        if t.label == "補做連結摘要", onSkipLinks != nil {
+                            Spacer()
+                            Button("跳過") { confirmSkip = true }
+                                .controlSize(.small)
+                                .help("放棄積欠的連結摘要補做（以後也不再補做）")
+                        }
+                    }
                     if let p = t.progress {
                         ProgressView(value: min(max(p, 0), 1))
                     } else {
                         ProgressView().controlSize(.small)
                     }
                 }
+            }
+            .confirmationDialog("跳過積欠的連結摘要？", isPresented: $confirmSkip) {
+                Button("跳過，不再補做", role: .destructive) { onSkipLinks?() }
+                Button("取消", role: .cancel) {}
+            } message: {
+                Text("已補做的不受影響，剩下的不會再重做。")
             }
         }
     }
@@ -217,7 +233,7 @@ struct MenuContent: View {
 
             // 目前工作（有才顯示）
             if !core.status.tasks.isEmpty {
-                VStack(alignment: .leading, spacing: 8) { TaskRows(tasks: core.status.tasks) }
+                VStack(alignment: .leading, spacing: 8) { TaskRows(tasks: core.status.tasks, onSkipLinks: { core.skipLinkRefresh() }) }
                     .padding(10)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
@@ -310,7 +326,7 @@ struct DashboardView: View {
             VStack(alignment: .leading, spacing: 14) {
                 StateBadge(core: core)
                 GroupBox("目前工作") {
-                    VStack(alignment: .leading, spacing: 8) { TaskRows(tasks: core.status.tasks) }
+                    VStack(alignment: .leading, spacing: 8) { TaskRows(tasks: core.status.tasks, onSkipLinks: { core.skipLinkRefresh() }) }
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 GroupBox("背景工作") {

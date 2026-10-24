@@ -205,6 +205,11 @@ final class CoreController: ObservableObject {
         sendAny(["type": "lane", "lane": name, "action": "run_now"])
     }
 
+    /// 跳過積欠的補做連結摘要（核心取消進行中的那一輪，並不再補做）
+    func skipLinkRefresh() {
+        sendAny(["type": "skip_link_refresh"])
+    }
+
     func laneToggle(_ name: String) {
         guard canToggle(name), let l = lane(name) else { return }
         lock("toggle_\(name)")

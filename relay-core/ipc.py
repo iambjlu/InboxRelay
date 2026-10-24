@@ -4,7 +4,7 @@
 - 啟動時環境變數 INBOXRELAY_IPC=1 才啟用。
 - App → 核心：stdin 每行一個 JSON：
   {"type": "lane", "lane": "llm|ane|audio|shot", "action": "run_now|pause|resume"}、{"type": "hello", "ocr": true}、
-  {"type": "ocr_result", "id": 1, "text": "…", "ms": 120}、{"type": "llm_test", "id": 1, "server", "model", "key"}、{"type": "diag", "on": true|false}、{"type": "stop"}；
+  {"type": "ocr_result", "id": 1, "text": "…", "ms": 120}、{"type": "llm_test", "id": 1, "server", "model", "key"}、{"type": "diag", "on": true|false}、{"type": "skip_link_refresh"}（跳過積欠的補做連結摘要）、{"type": "stop"}；
   舊指令 recap_now／pause／resume 仍可用（＝外部 LLM 車道）。
 - 核心 → App：stdout 每行一個 JSON：狀態（type=status，每 2 秒、有變化才送）、
   文字辨識請求 {"type": "ocr_request", "id": 1, "url": "…", "name": "a.jpg"}、
@@ -137,6 +137,10 @@ class IpcServer:
                         log.info("🧾 App 要求外部 LLM 立即執行（分析＋總結）")
                 elif lane.run_now():
                     log.info("🔤 App 要求%s立即執行", lane.label)
+        elif t == "skip_link_refresh":
+            from enrich import refresh
+            log.info("⏭ App 要求跳過積欠的補做連結摘要（%s）", "已取消進行中的工作" if refresh.request_skip() else "旗標已寫入")
+            return
         elif t == "diag":
             import diag
             diag.set_enabled(bool(cmd.get("on")))
