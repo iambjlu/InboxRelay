@@ -20,6 +20,8 @@ from enrich.link import embed_preview, find_urls, probe_link, summarize_probed
 log = logging.getLogger("enrich.refresh")
 
 FLAG = "link-refresh-v1"
+TRIED = "link-refresh-tried.txt"     # 已經處理過（不管有沒有成功）的回覆連結，一行一個：重開程式不會再從頭做
+FLUSH_EVERY = 20
 LIMIT = 2000
 _TITLE = re.compile(r"^\*\*(?:🔗|🖼️) (\S+)\*\*$")
 
@@ -144,6 +146,24 @@ async def refresh_links(dc, llm, index, cfg, on_link_images=None) -> None:
     for e in list(index.entries.values()):
         if e.rec.reply and e.rec.excerpt and "http" in e.rec.excerpt:
             groups.setdefault(e.rec.reply, []).append(e)
+    tried: set[str] = set()
+    try:
+        tried = set((data_dir() / TRIED).read_text().split())
+    except OSError:
+        pass
+    groups = {k: v for k, v in groups.items() if k not in tried}
+    pending_write: list[str] = []
+
+    def flush() -> None:
+        if not pending_write:
+            return
+        try:
+            with open(data_dir() / TRIED, "a") as f:
+                f.write("\n".join(pending_write) + "\n")
+        except OSError:
+            pass
+        pending_write.clear()
+
     if groups:
         global _task
         _task = asyncio.current_task()
@@ -175,6 +195,9 @@ async def refresh_links(dc, llm, index, cfg, on_link_images=None) -> None:
                             continue
                         log.exception("補做連結摘要失敗：%s", reply_url)
                     break
+                pending_write.append(reply_url)
+                if len(pending_write) >= FLUSH_EVERY:
+                    flush()
                 task.advance()
         except asyncio.CancelledError:
             if not flag.exists():                  # 不是按「跳過」造成的取消（例如關閉核心）：照常往外丟
@@ -182,6 +205,7 @@ async def refresh_links(dc, llm, index, cfg, on_link_images=None) -> None:
             log.info("補做連結摘要：已依要求跳過（更新 %d 則）", fixed)
             return
         finally:
+            flush()
             _task = None
             if task is not None:
                 activity.finish(task, f"更新 {fixed} 則")
