@@ -58,6 +58,7 @@ class Lane:
         self.next_start: datetime | None = None
         self.close_at: datetime | None = None
         self.probe: Callable[[], Awaitable] | None = None   # llm：探測外部 LLM 連不連得上（離線後依 RETRY_DELAYS 重試）
+        self.on_online: Callable[[], object] | None = None  # llm：離線後重試連上時通知（更新「已上線」訊息的 LLM 狀態）
         self._retrying: asyncio.Task | None = None
         self.blocked_by: Callable[[], bool] | None = None   # 回傳 True＝暫時不能跑（例如 llm 等連結截圖做完）
         self._changed = asyncio.Event()
@@ -116,6 +117,8 @@ class Lane:
                 continue
             log.info("🔌 %s：外部 LLM 已連上", self.label)
             self.offline = False
+            if self.on_online is not None:
+                self.on_online()
             self.notify()
             if resume:
                 self.run_now()

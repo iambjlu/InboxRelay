@@ -511,9 +511,26 @@ async def run(check_only: bool) -> int:
                 if prev_restore:
                     prev_restore()
             restore_console = restore_all
+        online = {"msg": None, "status": ai_status}          # 「已上線」訊息；外部 LLM 連線結果出來後把「⏳ 啟動完成後連線」改成實際狀態
+
+        async def update_online(status: str) -> None:
+            online["status"] = status
+            if server is not None:
+                server.ai_status = status
+            if online["msg"] is None:
+                return                                        # 訊息還沒發出：發出後會用最新狀態補改
+            try:
+                await online["msg"].edit(content=online_message(cfg, tg, relayer, mem, recapper, status)[:2000])
+            except Exception as e:
+                log.warning("更新上線訊息的外部 LLM 狀態失敗：%s", e)
+
         if llm:
-            background.append(asyncio.create_task(first_llm_connect(cfg, llm, llm_lane, server, also=[audio_lane] if audio_worker else [])))
-        await notify(dc, cfg, online_message(cfg, tg, relayer, mem, recapper, ai_status))
+            llm_lane.on_online = lambda: asyncio.get_running_loop().create_task(update_online("✅ 已連線"))
+            background.append(asyncio.create_task(first_llm_connect(cfg, llm, llm_lane, server, also=[audio_lane] if audio_worker else [],
+                                                                    on_status=update_online)))
+        online["msg"] = await notify(dc, cfg, online_message(cfg, tg, relayer, mem, recapper, ai_status))
+        if online["msg"] is not None and online["status"] != ai_status:
+            await update_online(online["status"])
         await stop.wait()
         log.info("收到結束訊號，關閉中…")
         import os
@@ -548,14 +565,15 @@ async def run(check_only: bool) -> int:
         await dc.close()
 
 
-async def notify(dc: DiscordOut, cfg, text: str) -> None:
-    """發到「通知與互動」頻道；失敗不影響主流程。"""
+async def notify(dc: DiscordOut, cfg, text: str):
+    """發到「通知與互動」頻道；失敗不影響主流程。回傳發出的訊息（沒發或失敗是 None）。"""
     if not cfg.ch_notify:
-        return
+        return None
     try:
-        await dc.send(cfg.ch_notify, text, retries=1)
+        return await dc.send(cfg.ch_notify, text, retries=1)
     except Exception as e:
         log.warning("發送通知失敗：%s", e)
+        return None
 
 
 def shot_ok() -> bool:
@@ -566,7 +584,7 @@ def shot_ok() -> bool:
 LLM_FIRST_PING_DELAY = 10
 
 
-async def first_llm_connect(cfg, llm, lane, server=None, also=()) -> None:
+async def first_llm_connect(cfg, llm, lane, server=None, also=(), on_status=None) -> None:
     """全部啟動完成後等 LLM_FIRST_PING_DELAY 秒才第一次連外部 LLM；連不上就交給車道的離線重試（lanes.RETRY_DELAYS）。"""
     await asyncio.sleep(LLM_FIRST_PING_DELAY)
     try:
@@ -579,7 +597,9 @@ async def first_llm_connect(cfg, llm, lane, server=None, also=()) -> None:
     except Exception as e:
         status, failed = "❌ 連不上（自動重試中）", e
         log.warning("外部 LLM 連不上（%s）：%s；搬移照常，會自動重試，AI 工作先保留", cfg.ai_server, e)
-    if server is not None:
+    if on_status is not None:
+        await on_status(status)
+    elif server is not None:
         server.ai_status = status
     for ln in [lane, *also]:
         if ln is not None:
