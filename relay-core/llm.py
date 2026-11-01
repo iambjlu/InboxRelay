@@ -100,7 +100,12 @@ class LLM:
         return None
 
     async def transcribe(self, name: str, data: bytes, model: str) -> str:
-        """語音轉文字（OpenAI 相容 /audio/transcriptions）。和聊天共用同一把鎖（模型一次只做一件事）。"""
+        """語音轉文字（OpenAI 相容 /audio/transcriptions）。音檔車道暫停時立刻中斷，繼續後重做。"""
+        import lanes
+        return await lanes.interruptible("audio", lambda: self._transcribe_once(name, data, model))
+
+    async def _transcribe_once(self, name: str, data: bytes, model: str) -> str:
+        """和聊天共用同一把鎖（模型一次只做一件事）。"""
         while self._interactive_waiting:                 # 有人在 AI 對話 → 背景工作先讓
             await asyncio.sleep(0.3)
         async with self._lock:
@@ -115,6 +120,15 @@ class LLM:
     async def chat(self, prompt: str, data: str | None = None, image: bytes | None = None,
                    image_mime: str = "image/jpeg", max_tokens: int = 800, thinking: bool = False,
                    use_memory: bool = True) -> str:
+        import activity
+        if activity.bound() is None:               # 互動（搜尋、測試頻道等）不受暫停影響
+            return await self._chat_once(prompt, data, image, image_mime, max_tokens, thinking, use_memory)
+        import lanes                                # 背景工作：外部 LLM 車道暫停時立刻中斷連線，繼續後重做
+        return await lanes.interruptible("llm", lambda: self._chat_once(
+            prompt, data, image, image_mime, max_tokens, thinking, use_memory))
+
+    async def _chat_once(self, prompt: str, data: str | None, image: bytes | None,
+                         image_mime: str, max_tokens: int, thinking: bool, use_memory: bool) -> str:
         user_text = prompt if data is None else f"{prompt}\n\n<data>\n{data}\n</data>"
         if image is not None:
             b64 = base64.b64encode(image).decode()

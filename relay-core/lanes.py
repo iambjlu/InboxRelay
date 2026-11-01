@@ -52,6 +52,9 @@ class Lane:
         self.open = self.mode == "always"
         self.manual = False
         self.paused = False
+        self.resume_at: datetime | None = None  # 暫停到這個時間自動繼續；None＝手動繼續
+        self.resume_on_launch = False           # 「暫停：下次打開 App 時繼續」（App 重開、核心重啟時由 App 決定是否還原暫停）
+        self._paused_evt = asyncio.Event()      # 暫停中＝set，interruptible 靠它立刻中斷進行中的請求
         self.available = True                   # ane：App 沒連上時 False
         self.connecting = False                 # llm：啟動後還沒做第一次連線（先不開工）
         self.offline = False                    # llm：外部 LLM 連不上 → 這一輪先停，下次開始時間再試
@@ -68,7 +71,13 @@ class Lane:
     def now(self) -> datetime:
         return datetime.now(self.tz)
 
+    def _auto_resume(self) -> None:
+        if self.paused and self.resume_at is not None and self.now() >= self.resume_at:
+            log.info("⏰ 預定的繼續時間到了：%s", self.label)
+            self.resume()
+
     def allowed(self) -> bool:
+        self._auto_resume()
         return (self.available and not self.paused and not self.offline and not self.connecting and (self.mode == "always" or self.open)
                 and not self.blocked)
 
@@ -77,6 +86,7 @@ class Lane:
         """paused／running（可以跑）／waiting（等時間）／unavailable。"""
         if not self.available:
             return "unavailable"
+        self._auto_resume()
         if self.paused:
             return "paused"
         if self.offline:
@@ -98,10 +108,48 @@ class Lane:
         """背景工作在每個項目之前呼叫：暫停中或不在執行時段就在這裡等。"""
         while not self.allowed():
             self._changed.clear()
+            timeout = 60.0
+            if self.paused and self.resume_at is not None:      # 暫停到指定時間：到點就醒來繼續
+                timeout = min(timeout, max((self.resume_at - self.now()).total_seconds(), 0.5))
             try:
-                await asyncio.wait_for(self._changed.wait(), timeout=60)
+                await asyncio.wait_for(self._changed.wait(), timeout=timeout)
             except asyncio.TimeoutError:
                 pass
+
+    async def interruptible(self, op: Callable[[], Awaitable]):
+        """執行 op；執行中若被暫停就立刻取消它（連線中斷），在原地等到繼續後整個重做（已完成的項目不受影響）。"""
+        while True:
+            while self.paused:                  # 暫停中不開始新請求
+                await self.gate_paused()
+            work = asyncio.ensure_future(op())
+            stopper = asyncio.ensure_future(self._paused_evt.wait())
+            try:
+                await asyncio.wait({work, stopper}, return_when=asyncio.FIRST_COMPLETED)
+            except asyncio.CancelledError:
+                work.cancel()
+                stopper.cancel()
+                raise
+            stopper.cancel()
+            if work.done():
+                return work.result()
+            work.cancel()                       # 因暫停而中斷：丟掉這次請求，繼續後重做
+            try:
+                await work
+            except (asyncio.CancelledError, Exception):
+                pass
+            log.info("⏸  %s 暫停：已中斷進行中的連線，繼續後從這一項重做", self.label)
+
+    async def gate_paused(self) -> None:
+        """等到不再暫停（含預定的繼續時間）。"""
+        self._changed.clear()
+        timeout = 60.0
+        if self.resume_at is not None:
+            timeout = min(timeout, max((self.resume_at - self.now()).total_seconds(), 0.5))
+        try:
+            await asyncio.wait_for(self._changed.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
+        self._auto_resume()
 
     # ------------------------------------------------------------ 操作
     async def _retry_probe(self, resume: bool) -> None:
@@ -135,16 +183,38 @@ class Lane:
                         "10 分鐘後" if self.mode == "always" else "下次開始時間")
             self.notify()
 
-    def pause(self) -> None:
+    def pause(self, until: datetime | None = None, on_launch: bool = False) -> None:
+        """暫停（進行中的連線立刻中斷）。until＝到點自動繼續；on_launch＝下次打開 App 時繼續；都沒有＝手動繼續。
+        已經暫停時再呼叫＝改暫停方式。"""
+        self.resume_at, self.resume_on_launch = until, on_launch
         if not self.paused:
             self.paused = True
-            log.info("⏸  已暫停：%s", self.label)
+            self._paused_evt.set()
+            log.info("⏸  已暫停：%s（%s）", self.label, self.pause_note())
+        else:
+            log.info("⏸  暫停方式改為：%s（%s）", self.label, self.pause_note())
+        self.notify()
 
     def resume(self) -> None:
         if self.paused:
             self.paused = False
+            self.resume_at, self.resume_on_launch = None, False
+            self._paused_evt.clear()
             log.info("▶️  繼續：%s", self.label)
             self.notify()
+
+    def pause_note(self) -> str:
+        if self.resume_on_launch:
+            return "下次打開 App 時繼續"
+        if self.resume_at is not None:
+            return f"{self.resume_at.strftime('%m/%d %H:%M')} 自動繼續"
+        return "手動繼續"
+
+    def next_schedule_start(self) -> datetime | None:
+        """下次排程開始時間（永遠立即執行／手動執行＝None）。"""
+        if self.mode in ("daily", "window"):
+            return self._next(self.start, self.now())
+        return None
 
     def run_now(self) -> bool:
         """立即執行：不管排程，馬上開始做到完（暫停中會一併繼續）。已在排隊回傳 False。"""
@@ -251,6 +321,14 @@ async def run_lane(lane: Lane, drained: Callable[[], bool],
                 lane.open, lane.manual, lane.close_at = False, False, None
                 log.info("🚦 %s 結束（%s）", lane.label, reason or "中斷")
             lane.notify()
+
+
+async def interruptible(lane_name: str, op: Callable[[], Awaitable]):
+    """該車道存在才套用暫停中斷；否則直接執行。"""
+    lane = LANES.get(lane_name)
+    if lane is None:
+        return await op()
+    return await lane.interruptible(op)
 
 
 # ------------------------------------------------------------ 全域

@@ -3,7 +3,7 @@
 
 - 啟動時環境變數 INBOXRELAY_IPC=1 才啟用。
 - App → 核心：stdin 每行一個 JSON：
-  {"type": "lane", "lane": "llm|ane|audio|shot", "action": "run_now|pause|resume"}、{"type": "hello", "ocr": true}、
+  {"type": "lane", "lane": "llm|ane|audio|shot", "action": "run_now|pause|resume"}（pause 可帶 "until": epoch 秒＝到點自動繼續、"on_launch": true＝下次打開 App 時繼續；已暫停時再送＝改暫停方式）、{"type": "hello", "ocr": true}、
   {"type": "ocr_result", "id": 1, "text": "…", "ms": 120}、{"type": "llm_test", "id": 1, "server", "model", "key"}、{"type": "diag", "on": true|false}、{"type": "skip_link_refresh"}（跳過積欠的補做連結摘要）、{"type": "stop"}；
   舊指令 recap_now／pause／resume 仍可用（＝外部 LLM 車道）。
 - 核心 → App：stdout 每行一個 JSON：狀態（type=status，每 2 秒、有變化才送）、
@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime
 
 import lanes
 import logging
@@ -87,6 +88,10 @@ class IpcServer:
             out[name] = {
                 "label": lane.label, "mode": lane.mode, "state": lane.state, "describe": lane.describe(),
                 "queued": lane.queued, "backlog": backlog,
+                "pause_note": lane.pause_note() if lane.paused else "",
+                "resume_at": lane.resume_at.timestamp() if lane.paused and lane.resume_at else 0,
+                "resume_on_launch": lane.paused and lane.resume_on_launch,
+                "next_schedule": lane.next_schedule_start().timestamp() if lane.next_schedule_start() else 0,
                 "next_start": lane.next_start.strftime("%m/%d %H:%M") if lane.next_start and lane.state in ("waiting", "offline") else "",
             }
         return out
@@ -126,7 +131,10 @@ class IpcServer:
             if lane is None:
                 return
             if action == "pause":
-                lane.pause()
+                until = None
+                if isinstance(cmd.get("until"), (int, float)):
+                    until = datetime.fromtimestamp(float(cmd["until"]), lane.tz)
+                lane.pause(until=until, on_launch=bool(cmd.get("on_launch")))
             elif action == "resume":
                 lane.resume()
             elif action == "run_now":

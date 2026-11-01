@@ -10,6 +10,40 @@ import lanes  # noqa: E402
 
 
 class LaneTest(unittest.TestCase):
+    def test_pause_interrupts_and_auto_resume(self):
+        async def go():
+            a = lanes.Lane("llm", "外部 LLM 工作", "always")
+            calls = []
+
+            async def op():
+                calls.append(1)
+                await asyncio.sleep(0.3)
+                return "ok"
+
+            t = asyncio.create_task(a.interruptible(op))
+            await asyncio.sleep(0.05)
+            a.pause()                                  # 進行中的請求立刻被取消
+            await asyncio.sleep(0.1)
+            self.assertFalse(t.done())
+            self.assertEqual(len(calls), 1)
+            a.resume()                                 # 繼續後整個重做
+            self.assertEqual(await asyncio.wait_for(t, 2), "ok")
+            self.assertEqual(len(calls), 2)
+
+            a.pause(until=a.now() + timedelta(seconds=0.2))   # 暫停到指定時間：到點自動繼續
+            self.assertEqual(a.state, "paused")
+            await asyncio.wait_for(a.gate(), 3)
+            self.assertEqual(a.state, "running")
+            self.assertFalse(a.paused)
+
+            a.pause(on_launch=True)
+            self.assertEqual(a.pause_note(), "下次打開 App 時繼續")
+            a.pause()                                  # 已暫停時再呼叫＝改成手動繼續
+            self.assertEqual(a.pause_note(), "手動繼續")
+            a.resume()
+            self.assertIsNone(a.resume_at)
+        asyncio.run(go())
+
     def test_modes_and_gate(self):
         async def go():
             a = lanes.Lane("llm", "外部 LLM 工作", "always")

@@ -121,11 +121,7 @@ struct LaneRow: View {
                 }
                 .help(core.runTitle(name) + "｜" + core.runHelp(name))
                 .disabled(!core.canRun(name))
-                Button { core.laneToggle(name) } label: {
-                    Image(systemName: l?.state == "paused" ? "play.fill" : "pause.fill").frame(width: 22, height: 22)
-                }
-                .help(core.toggleHelp(name))
-                .disabled(!core.canToggle(name))
+                LanePauseMenu(core: core, name: name)
             }
             .buttonStyle(.borderless)
             .font(.system(size: 13))
@@ -165,10 +161,86 @@ struct LaneRow: View {
         case "offline":
             return (l.next_start.isEmpty ? "連不上，下次開始時間再試" : "連不上，\(l.next_start) 再試") + " · " + left
         case "paused":
-            return left + " · 按 ▶︎ 繼續"
+            return left + " · " + (l.pause_note.isEmpty ? "按 ▶︎ 繼續" : l.pause_note)
         default:
             return l.backlog > 0 ? left + " · " + l.describe : l.describe
         }
+    }
+}
+
+/// 車道的暫停／繼續：暫停時立刻中斷進行中的連線；暫停中選單第一項是「繼續」，其餘可改暫停方式
+struct LanePauseMenu: View {
+    @ObservedObject var core: CoreController
+    let name: String
+    @State private var showDelay = false
+    @State private var delayMode = true          // true＝一段時間，false＝到指定時間
+
+    @ViewBuilder private var items: some View {
+        let l = core.lane(name)
+        let paused = l?.state == "paused"
+        if paused {
+            Button { core.laneResume(name) } label: { Label("繼續", systemImage: "play.fill") }
+            Divider()
+        }
+        let manual = paused && (l?.resume_at ?? 0) == 0 && l?.resume_on_launch != true      // 目前就是「手動繼續」的暫停
+        if !manual {
+            Button { core.lanePause(name) } label: { Label(paused ? "暫停：手動繼續" : "暫停", systemImage: "pause.fill") }
+        }
+        if !(paused && l?.resume_on_launch == true) {
+            Button { core.lanePause(name, onLaunch: true) } label: { Label("暫停：下次打開 App 時繼續", systemImage: "power") }
+        }
+        if let n = l?.next_schedule, n > 0 {       // 沒設定排程時整項不出現
+            Button { core.lanePause(name, until: Date(timeIntervalSince1970: n)) } label: { Label("暫停：下次排程時間繼續", systemImage: "calendar.badge.clock") }
+        }
+        Button { delayMode = true; showDelay = true } label: { Label("暫停：一段時間…", systemImage: "timer") }
+        Button { delayMode = false; showDelay = true } label: { Label("暫停：到指定時間繼續…", systemImage: "clock.arrow.circlepath") }
+    }
+
+    var body: some View {
+        let l = core.lane(name)
+        Menu { items } label: {
+            Image(systemName: l?.state == "paused" ? "play.fill" : "pause.fill").frame(width: 22, height: 22)
+        }
+        .menuStyle(.borderlessButton).menuIndicator(.hidden)
+        .fixedSize()
+        .help(l?.state == "paused" ? (l?.pause_note ?? "") + "；展開選單可繼續或修改暫停方式" : core.toggleHelp(name))
+        .disabled(!core.canToggle(name))
+        .sheet(isPresented: $showDelay) { LaneDelaySheet(core: core, name: name, byDuration: delayMode) }
+    }
+}
+
+/// 暫停一段時間／到指定時間繼續
+struct LaneDelaySheet: View {
+    @ObservedObject var core: CoreController
+    let name: String
+    let byDuration: Bool
+    @Environment(\.dismiss) private var dismiss
+    @State private var hours = 1
+    @State private var minutes = 0
+    @State private var at = Date().addingTimeInterval(3600)
+
+    private var target: Date { byDuration ? Date().addingTimeInterval(Double(hours * 60 + minutes) * 60) : at }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text(byDuration ? "暫停一段時間" : "暫停到指定時間繼續").font(.headline)
+            if byDuration {
+                HStack(spacing: 16) {
+                    Stepper("\(hours) 小時", value: $hours, in: 0...48)
+                    Stepper("\(minutes) 分鐘", value: $minutes, in: 0...55, step: 5)
+                }
+            } else {
+                DatePicker("繼續時間", selection: $at, in: Date()..., displayedComponents: [.date, .hourAndMinute])
+            }
+            Text("立刻中斷進行中的模型連線，\(target.formatted(date: .abbreviated, time: .shortened)) 自動繼續。").font(.caption).foregroundStyle(.secondary)
+            HStack {
+                Spacer()
+                Button("取消") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("暫停") { core.lanePause(name, until: target); dismiss() }
+                    .keyboardShortcut(.defaultAction).disabled(byDuration && hours == 0 && minutes == 0)
+            }
+        }
+        .padding(20).frame(width: 420)
     }
 }
 

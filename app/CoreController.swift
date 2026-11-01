@@ -19,6 +19,10 @@ struct LaneStatus: Codable, Hashable {
     var queued: Bool = false
     var backlog: Int = 0
     var next_start: String = ""
+    var pause_note: String = ""         // 暫停中：「手動繼續」「下次打開 App 時繼續」「11/03 08:00 自動繼續」
+    var resume_at: Double = 0           // 暫停到這個時間自動繼續（epoch 秒；0＝沒有）
+    var resume_on_launch: Bool = false
+    var next_schedule: Double = 0       // 下次排程開始時間（epoch 秒；0＝沒有排程）
 }
 
 /// 核心啟動中回報的進度（見 relay-core/startup.py）
@@ -56,6 +60,8 @@ final class CoreController: ObservableObject {
     @Published var logs: [String] = []
     /// 啟動中的進度（核心開始送一般狀態列後就是 nil）
     @Published var startup: StartupInfo? = nil
+    private var pausesRestored = false          // 這次核心啟動後是否已還原過暫停
+    private var restoredPaused = Set<String>()
     private var instantPending = CommandLine.arguments.contains("--instant")   // 啟動後立即執行 LLM 與 OCR 車道一次
     @Published var lastError: String = ""
     /// 設定頁「測試連線」：nil＝沒在測；結果由核心回傳
@@ -212,8 +218,51 @@ final class CoreController: ObservableObject {
 
     func laneToggle(_ name: String) {
         guard canToggle(name), let l = lane(name) else { return }
+        if l.state == "paused" { laneResume(name) } else { lanePause(name) }
+    }
+
+    /// 暫停（進行中的連線立刻中斷）：until＝到點自動繼續；onLaunch＝下次打開 App 時繼續；都沒有＝手動繼續。已暫停時再呼叫＝改暫停方式。
+    func lanePause(_ name: String, until: Date? = nil, onLaunch: Bool = false) {
+        guard isRunning, pendingAction == nil, lane(name) != nil else { return }
         lock("toggle_\(name)")
-        sendAny(["type": "lane", "lane": name, "action": l.state == "paused" ? "resume" : "pause"])
+        var msg: [String: Any] = ["type": "lane", "lane": name, "action": "pause"]
+        if let u = until { msg["until"] = u.timeIntervalSince1970 }
+        if onLaunch { msg["on_launch"] = true }
+        sendAny(msg)
+        savePause(name, until: until, onLaunch: onLaunch)
+    }
+
+    func laneResume(_ name: String) {
+        guard isRunning, pendingAction == nil else { return }
+        lock("toggle_\(name)")
+        sendAny(["type": "lane", "lane": name, "action": "resume"])
+        UserDefaults.standard.removeObject(forKey: "lanePause.\(name)")
+    }
+
+    // MARK: 暫停狀態保存（核心重啟後還原；暫停選項見 PauseMenu）
+    private func savePause(_ name: String, until: Date?, onLaunch: Bool) {
+        UserDefaults.standard.set(["until": until?.timeIntervalSince1970 ?? 0, "onLaunch": onLaunch] as [String: Any],
+                                  forKey: "lanePause.\(name)")
+    }
+
+    /// 核心剛啟動後的第一個狀態：還原上次的暫停。「下次打開 App 時繼續」與已過期的預定時間直接丟掉。回傳還原了哪些車道。
+    private func restorePauses(_ lanes: [String: LaneStatus]) -> Set<String> {
+        var restored = Set<String>()
+        let d = UserDefaults.standard
+        for name in lanes.keys {
+            guard let rec = d.dictionary(forKey: "lanePause.\(name)") else { continue }
+            d.removeObject(forKey: "lanePause.\(name)")
+            let until = (rec["until"] as? Double) ?? 0
+            if (rec["onLaunch"] as? Bool) == true { continue }
+            if until > 0 && until <= Date().timeIntervalSince1970 { continue }
+            var msg: [String: Any] = ["type": "lane", "lane": name, "action": "pause"]
+            if until > 0 { msg["until"] = until }
+            sendAny(msg)
+            savePause(name, until: until > 0 ? Date(timeIntervalSince1970: until) : nil, onLaunch: false)
+            restored.insert(name)
+            appendLog("— 還原上次的暫停：\(lanes[name]?.label ?? name) —")
+        }
+        return restored
     }
 
     /// 用設定頁目前填的值測試外部 LLM（不必先儲存、重啟）。核心沒在跑就直接說明。
@@ -359,6 +408,8 @@ final class CoreController: ObservableObject {
         do {
             try p.run()
             process = p
+            pausesRestored = false
+            restoredPaused = []
             stdinPipe = inPipe
             state = .starting
             lastError = ""
@@ -438,10 +489,14 @@ final class CoreController: ObservableObject {
                 if pendingAction != "restart" { pendingAction = nil }   // 核心回報新狀態 → 解鎖
                 startup = nil                                              // 開始送一般狀態列＝啟動完成
                 status = obj
-                if instantPending, let lanes = obj.lanes, lanes["llm"] != nil,
+                if !pausesRestored, let lanes = obj.lanes, lanes["llm"] != nil {
+                    pausesRestored = true
+                    restoredPaused = restorePauses(lanes)
+                }
+                if instantPending, pausesRestored, let lanes = obj.lanes, lanes["llm"] != nil,
                    let ane = lanes["ane"], ane.state != "unavailable" {
                     instantPending = false
-                    for name in ["llm", "ane", "audio", "shot"] where lanes[name] != nil {
+                    for name in ["llm", "ane", "audio", "shot"] where lanes[name] != nil && !restoredPaused.contains(name) {   // 還原成暫停的不叫起來
                         sendAny(["type": "lane", "lane": name, "action": "run_now"])
                     }
                 }
